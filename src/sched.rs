@@ -19,6 +19,19 @@ const MAX_THREADS: usize = 32;
 const MAX_CPUS: usize = 16;
 const FUTEX_BUCKETS: usize = 16;
 
+/// CFS Layer-3 tunables. Linux's defaults for ≤8 tasks, lightly
+/// adjusted for Tyn's ~19-thread ERTS workload.
+
+/// Target scheduling latency — every runnable thread runs at least
+/// once within this window.
+const SCHED_LATENCY_NS: u64 = 6_000_000; // 6 ms
+
+/// Minimum vruntime delta that justifies preempting the current
+/// thread when another wakes up. Prevents wake-storm context-switch
+/// thrash; Linux uses 2.5 ms but we want tighter responsiveness
+/// because ERTS uses futex_wake heavily for inter-scheduler signalling.
+const WAKEUP_GRANULARITY_NS: u64 = 1_000_000; // 1 ms
+
 /// Thread state
 #[derive(Clone, Copy, PartialEq)]
 enum State {
@@ -328,6 +341,76 @@ unsafe fn pop_min_vruntime(cpu: usize) -> Option<u32> {
         }
     }
     q.remove(best_idx)
+}
+
+/// Layer 3 — route a freshly-woken `tid` onto `target_cpu`'s run
+/// queue with wake-up preemption semantics:
+///   1. Floor the woken thread's vruntime at `min_vruntime -
+///      SCHED_LATENCY_NS` so a long sleeper can't monopolise the CPU.
+///   2. If the woken thread's vruntime is at least
+///      WAKEUP_GRANULARITY_NS less than the currently-running
+///      thread's, push to the FRONT of the queue and set
+///      NEED_RESCHED for that CPU — the target reschedules at the
+///      next interrupt return / syscall exit.
+///   3. Otherwise push to the back as a normal enqueue.
+///
+/// Deduplicates against the existing queue contents so concurrent
+/// wakers/watchdog rescues don't queue the same tid twice.
+///
+/// Caller must NOT hold the target CPU's queue lock. Takes it
+/// internally. THREAD_LOCK SHOULD be held to keep the woken thread's
+/// vruntime stable across the floor write.
+unsafe fn wakeup_enqueue(tid: u32, target_cpu: u32) {
+    let target = target_cpu as usize;
+    if target >= MAX_CPUS { return; }
+    let _qlock = CPU_QUEUE_LOCKS[target].lock();
+
+    // Already queued? Some other waker beat us — nothing to do.
+    if CPU_QUEUES[target].queue.iter().any(|&t| t == tid) {
+        return;
+    }
+
+    // min_vruntime of the destination CPU: current (if any) plus
+    // everything queued.
+    let mut min_v = u64::MAX;
+    if let Some(cur) = CPU_QUEUES[target].current {
+        if let Some(t) = THREADS[cur as usize].as_ref() {
+            min_v = min_v.min(t.vruntime_ns);
+        }
+    }
+    for &qt in CPU_QUEUES[target].queue.iter() {
+        if let Some(t) = THREADS[qt as usize].as_ref() {
+            min_v = min_v.min(t.vruntime_ns);
+        }
+    }
+    let min_v = if min_v == u64::MAX { 0 } else { min_v };
+
+    // Apply the floor and read back the woken thread's vruntime.
+    let woken_v = match THREADS[tid as usize].as_mut() {
+        Some(t) => {
+            let floor = min_v.saturating_sub(SCHED_LATENCY_NS);
+            if t.vruntime_ns < floor {
+                t.vruntime_ns = floor;
+            }
+            t.vruntime_ns
+        }
+        None => return,
+    };
+
+    // Preemption check.
+    let cur_v = CPU_QUEUES[target].current
+        .and_then(|cur| THREADS[cur as usize].as_ref().map(|t| t.vruntime_ns));
+    let preempt = match cur_v {
+        Some(cv) => woken_v.saturating_add(WAKEUP_GRANULARITY_NS) < cv,
+        None     => true, // target CPU is idle — always preempt
+    };
+
+    if preempt {
+        CPU_QUEUES[target].queue.push_front(tid);
+        NEED_RESCHED[target].store(true, Ordering::Release);
+    } else {
+        CPU_QUEUES[target].queue.push_back(tid);
+    }
 }
 
 // --- Public API ---
@@ -869,33 +952,34 @@ pub fn futex_wake(addr: u64, count: u32) -> i64 {
     unsafe {
         for i in 0..MAX_THREADS {
             if woken >= count as i64 { break; }
-            if let Some(thread) = THREADS[i].as_mut() {
-                if thread.state == State::Blocked && thread.futex_addr == addr {
+            let (woken_tid, target_cpu) = match THREADS[i].as_mut() {
+                Some(thread) if thread.state == State::Blocked
+                    && thread.futex_addr == addr => {
                     thread.state = State::Ready;
                     thread.futex_addr = 0;
                     thread.blocked_since_ns = 0;
-                    woken += 1;
-                    static WAKE_LOG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-                    let wc = WAKE_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                    if wc < 30 {
-                        crate::serial_println!("[wake] tid={} addr={:#x}", thread.tid, addr);
-                    }
-
-                    // Unified queue: ALWAYS push the woken thread to its
-                    // home CPU's run queue. The idle loop's only source of
-                    // truth is the queue — no side-channel tracking.
-                    let target_cpu = thread.home_cpu;
                     thread.in_idle_ctx = false;
-                    {
-                        let _qlock = CPU_QUEUE_LOCKS[target_cpu as usize].lock();
-                        CPU_QUEUES[target_cpu as usize].queue.push_back(thread.tid);
-                    }
-                    // Always IPI the target CPU if it's not us — ensures the CPU
-                    // wakes from hlt and picks up the queued thread promptly.
-                    if target_cpu != current_cpu() {
-                        crate::apic::send_ipi(target_cpu as u8);
-                    }
+                    (thread.tid, thread.home_cpu)
                 }
+                _ => continue,
+            };
+            woken += 1;
+            static WAKE_LOG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+            let wc = WAKE_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if wc < 30 {
+                crate::serial_println!("[wake] tid={} addr={:#x}", woken_tid, addr);
+            }
+
+            // Layer-3 routing: vruntime floor + preempt-if-lower vs the
+            // current thread on the target CPU. Pushes front + sets
+            // NEED_RESCHED on preempt, push_back otherwise.
+            wakeup_enqueue(woken_tid, target_cpu);
+            // Always IPI a remote target — wakes it from hlt so the
+            // idle loop picks up the queued thread promptly, and makes
+            // the running thread's next interrupt-return / syscall-exit
+            // observe NEED_RESCHED.
+            if target_cpu != current_cpu() {
+                crate::apic::send_ipi(target_cpu as u8);
             }
         }
         // Wake-before-wait: if no waiter was found, leave a pending wake at
@@ -995,14 +1079,10 @@ pub fn watchdog_wake() {
                         thread.wait_deadline_ns = 0;
                         thread.blocked_since_ns = 0;
                         let tid = thread.tid;
-                        let target_cpu = thread.home_cpu as usize;
-                        if target_cpu < MAX_CPUS {
-                            let _qlock = CPU_QUEUE_LOCKS[target_cpu].lock();
-                            if !CPU_QUEUES[target_cpu].queue.iter().any(|&t| t == tid) {
-                                CPU_QUEUES[target_cpu].queue.push_back(tid);
-                            }
-                        }
-                        if target_cpu != current_cpu() as usize {
+                        let target_cpu = thread.home_cpu;
+                        // Layer-3 routing (dedups inside).
+                        wakeup_enqueue(tid, target_cpu);
+                        if target_cpu as usize != current_cpu() as usize {
                             crate::apic::send_ipi(target_cpu as u8);
                         }
 
