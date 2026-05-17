@@ -19,19 +19,6 @@ const MAX_THREADS: usize = 32;
 const MAX_CPUS: usize = 16;
 const FUTEX_BUCKETS: usize = 16;
 
-/// CFS Layer-3 tunables. Linux's defaults for ≤8 tasks, lightly
-/// adjusted for Tyn's ~19-thread ERTS workload.
-
-/// Target scheduling latency — every runnable thread runs at least
-/// once within this window.
-const SCHED_LATENCY_NS: u64 = 6_000_000; // 6 ms
-
-/// Minimum vruntime delta that justifies preempting the current
-/// thread when another wakes up. Prevents wake-storm context-switch
-/// thrash; Linux uses 2.5 ms but we want tighter responsiveness
-/// because ERTS uses futex_wake heavily for inter-scheduler signalling.
-const WAKEUP_GRANULARITY_NS: u64 = 1_000_000; // 1 ms
-
 /// Thread state
 #[derive(Clone, Copy, PartialEq)]
 enum State {
@@ -115,17 +102,6 @@ struct Thread {
     /// for longer than `BLOCKED_RESCUE_NS` is force-rescued as a spurious
     /// wakeup. See `watchdog_wake` and directions/BOOT_STALL_TSE.md.
     blocked_since_ns: u64,
-    /// Total CPU time consumed by this thread, in nanoseconds. Updated
-    /// every time the thread stops running (yield / block / preempt) by
-    /// adding `monotonic_ns() - last_scheduled_ns`. Used by Layer 2+ of
-    /// the CFS-style scheduler: pick the thread with the lowest vruntime,
-    /// so threads that have been sleeping get priority over threads that
-    /// have been running. See directions/SCHEDULER.md.
-    vruntime_ns: u64,
-    /// `monotonic_ns()` snapshot taken when this thread most recently
-    /// started running on a CPU. 0 when the thread has never run yet.
-    /// Used together with `vruntime_ns` for the run-time accounting.
-    last_scheduled_ns: u64,
 }
 
 /// Per-CPU run queue.
@@ -277,142 +253,6 @@ fn current_cpu() -> u32 {
     }
 }
 
-/// Account elapsed run-time on a thread that's about to stop running.
-/// Layer 1 of the CFS-style scheduler (see directions/SCHEDULER.md):
-/// adds `now - last_scheduled_ns` to the thread's `vruntime_ns`. Safe to
-/// call multiple times — `last_scheduled_ns == 0` means "hasn't started
-/// running" and the delta is treated as 0.
-///
-/// No-op if `tid` is out of range or the slot is None. Caller must hold
-/// THREAD_LOCK or otherwise serialize against concurrent thread mutators.
-fn account_stop_running(tid: u32) {
-    let now = crate::syscall::monotonic_ns();
-    unsafe {
-        let idx = tid as usize;
-        if idx < MAX_THREADS {
-            if let Some(t) = THREADS[idx].as_mut() {
-                if t.last_scheduled_ns != 0 {
-                    t.vruntime_ns = t.vruntime_ns.saturating_add(
-                        now.saturating_sub(t.last_scheduled_ns));
-                }
-                t.last_scheduled_ns = 0;
-            }
-        }
-    }
-}
-
-/// Stamp `now` on a thread that's about to start running. Pair with
-/// `account_stop_running` on the next transition off-CPU.
-fn account_start_running(tid: u32) {
-    let now = crate::syscall::monotonic_ns();
-    unsafe {
-        let idx = tid as usize;
-        if idx < MAX_THREADS {
-            if let Some(t) = THREADS[idx].as_mut() {
-                t.last_scheduled_ns = now;
-            }
-        }
-    }
-}
-
-/// Pick the runnable tid in `cpu`'s queue with the lowest `vruntime_ns`
-/// and remove it. Caller must hold `CPU_QUEUE_LOCKS[cpu]`. Ties go to
-/// the earliest queue position, preserving FIFO order for threads that
-/// haven't yet diverged.
-///
-/// This is the Layer-2 replacement for `pop_front()` — naturally
-/// favours threads that have been sleeping (their vruntime didn't
-/// advance) over threads that have been running continuously.
-unsafe fn pop_min_vruntime(cpu: usize) -> Option<u32> {
-    let q = &mut CPU_QUEUES[cpu].queue;
-    if q.is_empty() {
-        return None;
-    }
-    let mut best_idx = 0usize;
-    let mut best_v = u64::MAX;
-    for (i, &tid) in q.iter().enumerate() {
-        let v = THREADS[tid as usize]
-            .as_ref()
-            .map(|t| t.vruntime_ns)
-            .unwrap_or(u64::MAX);
-        if v < best_v {
-            best_v = v;
-            best_idx = i;
-        }
-    }
-    q.remove(best_idx)
-}
-
-/// Layer 3 — route a freshly-woken `tid` onto `target_cpu`'s run
-/// queue with wake-up preemption semantics:
-///   1. Floor the woken thread's vruntime at `min_vruntime -
-///      SCHED_LATENCY_NS` so a long sleeper can't monopolise the CPU.
-///   2. If the woken thread's vruntime is at least
-///      WAKEUP_GRANULARITY_NS less than the currently-running
-///      thread's, push to the FRONT of the queue and set
-///      NEED_RESCHED for that CPU — the target reschedules at the
-///      next interrupt return / syscall exit.
-///   3. Otherwise push to the back as a normal enqueue.
-///
-/// Deduplicates against the existing queue contents so concurrent
-/// wakers/watchdog rescues don't queue the same tid twice.
-///
-/// Caller must NOT hold the target CPU's queue lock. Takes it
-/// internally. THREAD_LOCK SHOULD be held to keep the woken thread's
-/// vruntime stable across the floor write.
-unsafe fn wakeup_enqueue(tid: u32, target_cpu: u32) {
-    let target = target_cpu as usize;
-    if target >= MAX_CPUS { return; }
-    let _qlock = CPU_QUEUE_LOCKS[target].lock();
-
-    // Already queued? Some other waker beat us — nothing to do.
-    if CPU_QUEUES[target].queue.iter().any(|&t| t == tid) {
-        return;
-    }
-
-    // min_vruntime of the destination CPU: current (if any) plus
-    // everything queued.
-    let mut min_v = u64::MAX;
-    if let Some(cur) = CPU_QUEUES[target].current {
-        if let Some(t) = THREADS[cur as usize].as_ref() {
-            min_v = min_v.min(t.vruntime_ns);
-        }
-    }
-    for &qt in CPU_QUEUES[target].queue.iter() {
-        if let Some(t) = THREADS[qt as usize].as_ref() {
-            min_v = min_v.min(t.vruntime_ns);
-        }
-    }
-    let min_v = if min_v == u64::MAX { 0 } else { min_v };
-
-    // Apply the floor and read back the woken thread's vruntime.
-    let woken_v = match THREADS[tid as usize].as_mut() {
-        Some(t) => {
-            let floor = min_v.saturating_sub(SCHED_LATENCY_NS);
-            if t.vruntime_ns < floor {
-                t.vruntime_ns = floor;
-            }
-            t.vruntime_ns
-        }
-        None => return,
-    };
-
-    // Preemption check.
-    let cur_v = CPU_QUEUES[target].current
-        .and_then(|cur| THREADS[cur as usize].as_ref().map(|t| t.vruntime_ns));
-    let preempt = match cur_v {
-        Some(cv) => woken_v.saturating_add(WAKEUP_GRANULARITY_NS) < cv,
-        None     => true, // target CPU is idle — always preempt
-    };
-
-    if preempt {
-        CPU_QUEUES[target].queue.push_front(tid);
-        NEED_RESCHED[target].store(true, Ordering::Release);
-    } else {
-        CPU_QUEUES[target].queue.push_back(tid);
-    }
-}
-
 // --- Public API ---
 
 /// Initialize the scheduler. Call once on BSP.
@@ -435,7 +275,7 @@ extern "C" fn cpu_idle_loop() -> ! {
         // No side channel — single source of truth for what to run next.
         let next = {
             let _qlock = CPU_QUEUE_LOCKS[cpu].lock();
-            unsafe { pop_min_vruntime(cpu) }
+            unsafe { CPU_QUEUES[cpu].queue.pop_front() }
         };
         if let Some(next_tid) = next {
             let _qlock = CPU_QUEUE_LOCKS[cpu].lock();
@@ -448,14 +288,12 @@ extern "C" fn cpu_idle_loop() -> ! {
                 unsafe {
                     crate::syscall::set_current_kernel_stack(next.kernel_stack_top);
                     drop(_qlock);
-                    account_start_running(next_tid);
                     // Switch to the new thread. When it yields, we return here.
                     context_switch(
                         &raw mut IDLE_CTX[cpu] as *mut ThreadCtx,
                         &raw const next.ctx as *const ThreadCtx,
                     );
-                    // Back from the new thread — account for the time it ran.
-                    account_stop_running(next_tid);
+                    // Back from the new thread — release any pending unlock
                     release_pending_unlock(cpu);
                     let _q = CPU_QUEUE_LOCKS[cpu].lock();
                     CPU_QUEUES[cpu].current = None;
@@ -510,13 +348,10 @@ pub fn init(num_cpus: usize) {
             wait_deadline_ns: 0,
             wait_timed_out: false,
             blocked_since_ns: 0,
-            vruntime_ns: 0,
-            last_scheduled_ns: 0,
         });
         CPU_QUEUES[0].current = Some(0);
         CPU_QUEUES[0].idle = false;
     }
-    account_start_running(0);
 }
 
 /// Create a new thread (called from sys_clone).
@@ -582,8 +417,6 @@ pub fn spawn(fn_ptr: u64, stack: u64, tls: u64, child_tid: u64) -> u32 {
             wait_deadline_ns: 0,
             wait_timed_out: false,
             blocked_since_ns: 0,
-            vruntime_ns: 0,
-            last_scheduled_ns: 0,
         });
     }
 
@@ -646,7 +479,7 @@ pub fn yield_current() {
                 None => {
                     // No current thread — this CPU is idle.
                     // If there's a thread in the queue, start running it directly.
-                    if let Some(next_tid) = pop_min_vruntime(cpu) {
+                    if let Some(next_tid) = CPU_QUEUES[cpu].queue.pop_front() {
                         CPU_QUEUES[cpu].current = Some(next_tid);
                         CPU_QUEUES[cpu].idle = false;
 
@@ -704,7 +537,7 @@ pub fn yield_current() {
                 }
             };
 
-            let next_tid = match pop_min_vruntime(cpu) {
+            let next_tid = match CPU_QUEUES[cpu].queue.pop_front() {
                 Some(t) => t,
                 None => return,
             };
@@ -725,8 +558,6 @@ pub fn yield_current() {
         if c < 10 {
             crate::serial::raw_str(b"[yield] switching\n");
         }
-        account_stop_running(cur_idx as u32);
-        account_start_running(next_idx as u32);
         unsafe {
             crate::syscall::set_current_kernel_stack(next_kstack);
 
@@ -738,8 +569,6 @@ pub fn yield_current() {
                 // After context_switch returns to us, release any pending
                 // futex unlock from the thread that switched TO us.
                 release_pending_unlock(current_cpu() as usize);
-                // Account for the time we just started running again.
-                account_start_running(cur_idx as u32);
             }
         }
     }
@@ -848,7 +677,7 @@ pub fn futex_wait_until(addr: u64, val: u32, deadline: Option<u64>) -> i64 {
     {
         let _qlock = CPU_QUEUE_LOCKS[cpu].lock();
         unsafe {
-            let next_tid = pop_min_vruntime(cpu);
+            let next_tid = CPU_QUEUES[cpu].queue.pop_front();
             match next_tid {
                 Some(next) => {
                     CPU_QUEUES[cpu].current = Some(next);
@@ -874,8 +703,6 @@ pub fn futex_wait_until(addr: u64, val: u32, deadline: Option<u64>) -> i64 {
 
     match switch_info {
         Some((next_idx, kstack)) => {
-            account_stop_running(blocked_tid as u32);
-            account_start_running(next_idx as u32);
             unsafe {
                 crate::syscall::set_current_kernel_stack(kstack);
                 if let (Some(cur), Some(nxt)) = (THREADS[blocked_tid].as_mut(), THREADS[next_idx].as_ref()) {
@@ -888,8 +715,6 @@ pub fn futex_wait_until(addr: u64, val: u32, deadline: Option<u64>) -> i64 {
             // We were resumed after a wake. Release any pending unlock from
             // the thread that switched TO us before it switched away.
             release_pending_unlock(current_cpu() as usize);
-            // Account for our resumed run.
-            account_start_running(blocked_tid as u32);
             // If we were woken because of a deadline timeout (watchdog set
             // wait_timed_out), report ETIMEDOUT so ERTS's ethr_event_twait
             // returns to the scheduler and lets it advance the timer wheel.
@@ -909,7 +734,6 @@ pub fn futex_wait_until(addr: u64, val: u32, deadline: Option<u64>) -> i64 {
             // side-channel tracking is needed — when futex_wake runs, it
             // pushes this thread to the queue and the idle loop picks it up.
             let cpu = current_cpu() as usize;
-            account_stop_running(blocked_tid as u32);
             unsafe {
                 if let Some(thread) = THREADS[blocked_tid].as_mut() {
                     context_switch(
@@ -920,7 +744,6 @@ pub fn futex_wait_until(addr: u64, val: u32, deadline: Option<u64>) -> i64 {
                 // We were woken and context_switched back. Release any
                 // pending unlock from the cpu_idle_loop side, then return 0.
                 release_pending_unlock(current_cpu() as usize);
-                account_start_running(blocked_tid as u32);
                 if let Some(t) = THREADS[blocked_tid].as_mut() {
                     let to = t.wait_timed_out;
                     t.wait_timed_out = false;
@@ -952,34 +775,33 @@ pub fn futex_wake(addr: u64, count: u32) -> i64 {
     unsafe {
         for i in 0..MAX_THREADS {
             if woken >= count as i64 { break; }
-            let (woken_tid, target_cpu) = match THREADS[i].as_mut() {
-                Some(thread) if thread.state == State::Blocked
-                    && thread.futex_addr == addr => {
+            if let Some(thread) = THREADS[i].as_mut() {
+                if thread.state == State::Blocked && thread.futex_addr == addr {
                     thread.state = State::Ready;
                     thread.futex_addr = 0;
                     thread.blocked_since_ns = 0;
-                    thread.in_idle_ctx = false;
-                    (thread.tid, thread.home_cpu)
-                }
-                _ => continue,
-            };
-            woken += 1;
-            static WAKE_LOG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-            let wc = WAKE_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            if wc < 30 {
-                crate::serial_println!("[wake] tid={} addr={:#x}", woken_tid, addr);
-            }
+                    woken += 1;
+                    static WAKE_LOG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+                    let wc = WAKE_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    if wc < 30 {
+                        crate::serial_println!("[wake] tid={} addr={:#x}", thread.tid, addr);
+                    }
 
-            // Layer-3 routing: vruntime floor + preempt-if-lower vs the
-            // current thread on the target CPU. Pushes front + sets
-            // NEED_RESCHED on preempt, push_back otherwise.
-            wakeup_enqueue(woken_tid, target_cpu);
-            // Always IPI a remote target — wakes it from hlt so the
-            // idle loop picks up the queued thread promptly, and makes
-            // the running thread's next interrupt-return / syscall-exit
-            // observe NEED_RESCHED.
-            if target_cpu != current_cpu() {
-                crate::apic::send_ipi(target_cpu as u8);
+                    // Unified queue: ALWAYS push the woken thread to its
+                    // home CPU's run queue. The idle loop's only source of
+                    // truth is the queue — no side-channel tracking.
+                    let target_cpu = thread.home_cpu;
+                    thread.in_idle_ctx = false;
+                    {
+                        let _qlock = CPU_QUEUE_LOCKS[target_cpu as usize].lock();
+                        CPU_QUEUES[target_cpu as usize].queue.push_back(thread.tid);
+                    }
+                    // Always IPI the target CPU if it's not us — ensures the CPU
+                    // wakes from hlt and picks up the queued thread promptly.
+                    if target_cpu != current_cpu() {
+                        crate::apic::send_ipi(target_cpu as u8);
+                    }
+                }
             }
         }
         // Wake-before-wait: if no waiter was found, leave a pending wake at
@@ -1079,10 +901,14 @@ pub fn watchdog_wake() {
                         thread.wait_deadline_ns = 0;
                         thread.blocked_since_ns = 0;
                         let tid = thread.tid;
-                        let target_cpu = thread.home_cpu;
-                        // Layer-3 routing (dedups inside).
-                        wakeup_enqueue(tid, target_cpu);
-                        if target_cpu as usize != current_cpu() as usize {
+                        let target_cpu = thread.home_cpu as usize;
+                        if target_cpu < MAX_CPUS {
+                            let _qlock = CPU_QUEUE_LOCKS[target_cpu].lock();
+                            if !CPU_QUEUES[target_cpu].queue.iter().any(|&t| t == tid) {
+                                CPU_QUEUES[target_cpu].queue.push_back(tid);
+                            }
+                        }
+                        if target_cpu != current_cpu() as usize {
                             crate::apic::send_ipi(target_cpu as u8);
                         }
 
