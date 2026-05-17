@@ -102,6 +102,17 @@ struct Thread {
     /// for longer than `BLOCKED_RESCUE_NS` is force-rescued as a spurious
     /// wakeup. See `watchdog_wake` and directions/BOOT_STALL_TSE.md.
     blocked_since_ns: u64,
+    /// Total CPU time consumed by this thread, in nanoseconds. Updated
+    /// every time the thread stops running (yield / block / preempt) by
+    /// adding `monotonic_ns() - last_scheduled_ns`. Used by Layer 2+ of
+    /// the CFS-style scheduler: pick the thread with the lowest vruntime,
+    /// so threads that have been sleeping get priority over threads that
+    /// have been running. See directions/SCHEDULER.md.
+    vruntime_ns: u64,
+    /// `monotonic_ns()` snapshot taken when this thread most recently
+    /// started running on a CPU. 0 when the thread has never run yet.
+    /// Used together with `vruntime_ns` for the run-time accounting.
+    last_scheduled_ns: u64,
 }
 
 /// Per-CPU run queue.
@@ -253,6 +264,72 @@ fn current_cpu() -> u32 {
     }
 }
 
+/// Account elapsed run-time on a thread that's about to stop running.
+/// Layer 1 of the CFS-style scheduler (see directions/SCHEDULER.md):
+/// adds `now - last_scheduled_ns` to the thread's `vruntime_ns`. Safe to
+/// call multiple times — `last_scheduled_ns == 0` means "hasn't started
+/// running" and the delta is treated as 0.
+///
+/// No-op if `tid` is out of range or the slot is None. Caller must hold
+/// THREAD_LOCK or otherwise serialize against concurrent thread mutators.
+fn account_stop_running(tid: u32) {
+    let now = crate::syscall::monotonic_ns();
+    unsafe {
+        let idx = tid as usize;
+        if idx < MAX_THREADS {
+            if let Some(t) = THREADS[idx].as_mut() {
+                if t.last_scheduled_ns != 0 {
+                    t.vruntime_ns = t.vruntime_ns.saturating_add(
+                        now.saturating_sub(t.last_scheduled_ns));
+                }
+                t.last_scheduled_ns = 0;
+            }
+        }
+    }
+}
+
+/// Stamp `now` on a thread that's about to start running. Pair with
+/// `account_stop_running` on the next transition off-CPU.
+fn account_start_running(tid: u32) {
+    let now = crate::syscall::monotonic_ns();
+    unsafe {
+        let idx = tid as usize;
+        if idx < MAX_THREADS {
+            if let Some(t) = THREADS[idx].as_mut() {
+                t.last_scheduled_ns = now;
+            }
+        }
+    }
+}
+
+/// Pick the runnable tid in `cpu`'s queue with the lowest `vruntime_ns`
+/// and remove it. Caller must hold `CPU_QUEUE_LOCKS[cpu]`. Ties go to
+/// the earliest queue position, preserving FIFO order for threads that
+/// haven't yet diverged.
+///
+/// This is the Layer-2 replacement for `pop_front()` — naturally
+/// favours threads that have been sleeping (their vruntime didn't
+/// advance) over threads that have been running continuously.
+unsafe fn pop_min_vruntime(cpu: usize) -> Option<u32> {
+    let q = &mut CPU_QUEUES[cpu].queue;
+    if q.is_empty() {
+        return None;
+    }
+    let mut best_idx = 0usize;
+    let mut best_v = u64::MAX;
+    for (i, &tid) in q.iter().enumerate() {
+        let v = THREADS[tid as usize]
+            .as_ref()
+            .map(|t| t.vruntime_ns)
+            .unwrap_or(u64::MAX);
+        if v < best_v {
+            best_v = v;
+            best_idx = i;
+        }
+    }
+    q.remove(best_idx)
+}
+
 // --- Public API ---
 
 /// Initialize the scheduler. Call once on BSP.
@@ -275,7 +352,7 @@ extern "C" fn cpu_idle_loop() -> ! {
         // No side channel — single source of truth for what to run next.
         let next = {
             let _qlock = CPU_QUEUE_LOCKS[cpu].lock();
-            unsafe { CPU_QUEUES[cpu].queue.pop_front() }
+            unsafe { pop_min_vruntime(cpu) }
         };
         if let Some(next_tid) = next {
             let _qlock = CPU_QUEUE_LOCKS[cpu].lock();
@@ -288,12 +365,14 @@ extern "C" fn cpu_idle_loop() -> ! {
                 unsafe {
                     crate::syscall::set_current_kernel_stack(next.kernel_stack_top);
                     drop(_qlock);
+                    account_start_running(next_tid);
                     // Switch to the new thread. When it yields, we return here.
                     context_switch(
                         &raw mut IDLE_CTX[cpu] as *mut ThreadCtx,
                         &raw const next.ctx as *const ThreadCtx,
                     );
-                    // Back from the new thread — release any pending unlock
+                    // Back from the new thread — account for the time it ran.
+                    account_stop_running(next_tid);
                     release_pending_unlock(cpu);
                     let _q = CPU_QUEUE_LOCKS[cpu].lock();
                     CPU_QUEUES[cpu].current = None;
@@ -348,10 +427,13 @@ pub fn init(num_cpus: usize) {
             wait_deadline_ns: 0,
             wait_timed_out: false,
             blocked_since_ns: 0,
+            vruntime_ns: 0,
+            last_scheduled_ns: 0,
         });
         CPU_QUEUES[0].current = Some(0);
         CPU_QUEUES[0].idle = false;
     }
+    account_start_running(0);
 }
 
 /// Create a new thread (called from sys_clone).
@@ -417,6 +499,8 @@ pub fn spawn(fn_ptr: u64, stack: u64, tls: u64, child_tid: u64) -> u32 {
             wait_deadline_ns: 0,
             wait_timed_out: false,
             blocked_since_ns: 0,
+            vruntime_ns: 0,
+            last_scheduled_ns: 0,
         });
     }
 
@@ -479,7 +563,7 @@ pub fn yield_current() {
                 None => {
                     // No current thread — this CPU is idle.
                     // If there's a thread in the queue, start running it directly.
-                    if let Some(next_tid) = CPU_QUEUES[cpu].queue.pop_front() {
+                    if let Some(next_tid) = pop_min_vruntime(cpu) {
                         CPU_QUEUES[cpu].current = Some(next_tid);
                         CPU_QUEUES[cpu].idle = false;
 
@@ -537,7 +621,7 @@ pub fn yield_current() {
                 }
             };
 
-            let next_tid = match CPU_QUEUES[cpu].queue.pop_front() {
+            let next_tid = match pop_min_vruntime(cpu) {
                 Some(t) => t,
                 None => return,
             };
@@ -558,6 +642,8 @@ pub fn yield_current() {
         if c < 10 {
             crate::serial::raw_str(b"[yield] switching\n");
         }
+        account_stop_running(cur_idx as u32);
+        account_start_running(next_idx as u32);
         unsafe {
             crate::syscall::set_current_kernel_stack(next_kstack);
 
@@ -569,6 +655,8 @@ pub fn yield_current() {
                 // After context_switch returns to us, release any pending
                 // futex unlock from the thread that switched TO us.
                 release_pending_unlock(current_cpu() as usize);
+                // Account for the time we just started running again.
+                account_start_running(cur_idx as u32);
             }
         }
     }
@@ -677,7 +765,7 @@ pub fn futex_wait_until(addr: u64, val: u32, deadline: Option<u64>) -> i64 {
     {
         let _qlock = CPU_QUEUE_LOCKS[cpu].lock();
         unsafe {
-            let next_tid = CPU_QUEUES[cpu].queue.pop_front();
+            let next_tid = pop_min_vruntime(cpu);
             match next_tid {
                 Some(next) => {
                     CPU_QUEUES[cpu].current = Some(next);
@@ -703,6 +791,8 @@ pub fn futex_wait_until(addr: u64, val: u32, deadline: Option<u64>) -> i64 {
 
     match switch_info {
         Some((next_idx, kstack)) => {
+            account_stop_running(blocked_tid as u32);
+            account_start_running(next_idx as u32);
             unsafe {
                 crate::syscall::set_current_kernel_stack(kstack);
                 if let (Some(cur), Some(nxt)) = (THREADS[blocked_tid].as_mut(), THREADS[next_idx].as_ref()) {
@@ -715,6 +805,8 @@ pub fn futex_wait_until(addr: u64, val: u32, deadline: Option<u64>) -> i64 {
             // We were resumed after a wake. Release any pending unlock from
             // the thread that switched TO us before it switched away.
             release_pending_unlock(current_cpu() as usize);
+            // Account for our resumed run.
+            account_start_running(blocked_tid as u32);
             // If we were woken because of a deadline timeout (watchdog set
             // wait_timed_out), report ETIMEDOUT so ERTS's ethr_event_twait
             // returns to the scheduler and lets it advance the timer wheel.
@@ -734,6 +826,7 @@ pub fn futex_wait_until(addr: u64, val: u32, deadline: Option<u64>) -> i64 {
             // side-channel tracking is needed — when futex_wake runs, it
             // pushes this thread to the queue and the idle loop picks it up.
             let cpu = current_cpu() as usize;
+            account_stop_running(blocked_tid as u32);
             unsafe {
                 if let Some(thread) = THREADS[blocked_tid].as_mut() {
                     context_switch(
@@ -744,6 +837,7 @@ pub fn futex_wait_until(addr: u64, val: u32, deadline: Option<u64>) -> i64 {
                 // We were woken and context_switched back. Release any
                 // pending unlock from the cpu_idle_loop side, then return 0.
                 release_pending_unlock(current_cpu() as usize);
+                account_start_running(blocked_tid as u32);
                 if let Some(t) = THREADS[blocked_tid].as_mut() {
                     let to = t.wait_timed_out;
                     t.wait_timed_out = false;
