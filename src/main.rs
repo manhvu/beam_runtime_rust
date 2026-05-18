@@ -126,6 +126,18 @@ extern "C" fn main(_mbi: *const u8) -> ! {
             b"/otp/erts-15.2.7/bin/beam.smp\0",
             b"-S\0", b"2:2\0",
             b"-A\0", b"1\0",
+            // Raise ERTS process and port limits. Defaults can be as
+            // low as 256 (+Q) in some minimal builds; with ~50 ports
+            // used at boot this caps usable connections to ~200. Each
+            // gen_tcp:accept allocates a port; Bandit spawns a process
+            // per connection — both need headroom for sustained load.
+            // (beam.smp accepts only `-`-prefixed flags directly; the
+            // `+P` / `+Q` form is the erlexec convention. See
+            // erts/emulator/beam/erl_init.c line ~1349 — the parser
+            // calls erts_usage() and exits on any non-`-` argv[i].)
+            // See directions/STRESS_TEST.md for the 200-wall finding.
+            b"-P\0", b"65536\0",
+            b"-Q\0", b"65536\0",
             b"--\0",
             b"-root\0", b"/otp\0",
             b"-bindir\0", b"/otp/erts-15.2.7/bin\0",
@@ -193,7 +205,7 @@ extern "C" fn main(_mbi: *const u8) -> ! {
             // §B3 Phoenix bisection #1: Bandit with Router directly (skip Endpoint middleware)
             b"-eval\0", b"application:ensure_all_started(telemetry), {ok,_}='Elixir.Bandit':start_link([{plug,'Elixir.TynHelloWeb.Router'},{port,8080},{scheme,http}]), io:format(\"phoenix_listening~n\"), receive _ -> ok after 60000 -> ok end.\0",
         ];
-        let mut arg_ptrs = [0u64; 20];
+        let mut arg_ptrs = [0u64; 24];
         for (i, arg) in args.iter().enumerate() {
             sp -= 2048; // must fit longest arg (diagnostic eval strings can be 1500+ bytes)
             core::ptr::copy_nonoverlapping(arg.as_ptr(), sp as *mut u8, arg.len());
