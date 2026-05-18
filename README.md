@@ -33,7 +33,7 @@ The BEAM already has its own process model, scheduler, memory management, and di
 │  BEAM Host Interface (Rust)             │
 │  ~50 Linux syscalls emulated            │
 ├─────────────────────────────────────────┤
-│  Tyn Kernel (Rust, ~6,300 LOC)          │
+│  Tyn Kernel (Rust, ~6,900 LOC)          │
 │  SMP · Memory · Networking · VFS · I/O  │
 ├─────────────────────────────────────────┤
 │  KVM / QEMU / Cloud Hypervisor          │
@@ -85,7 +85,7 @@ Where things stand on KVM (host: AWS Xeon 6975P-C):
 
 - **Image size:** 49 MB bootable image — ~4× smaller than Alpine + Elixir + Phoenix (~190 MB)
 - **Cold boot to serving HTTP:** ~7 s on KVM (kernel → BEAM handoff in ~430 ms; rest is OTP startup)
-- **Reliability:** 30/32 cold-boot trials, each routing a curl request through Phoenix.Router + Bandit + Plug. The two failures are a long-known ERTS thread-progress registration race (`managed=4/5`) where one of the 5 startup threads doesn't register and schedulers wait forever — kernel-side futex/scheduler bug, not Phoenix-specific. Phoenix is no less reliable than Bandit-only; the original 14/16 number was a measurement artifact (the readiness marker `phoenix_listening\n` gets interleaved with kernel debug output and a strict `grep -q` missed it on otherwise-successful boots)
+- **Cold-boot reliability:** ~83 % across 64-trial sweeps (small early samples ran as high as 30/32). Each trial routes a curl request through Phoenix.Router + Bandit + Plug. The ~17 % failures are an ERTS thread-progress registration race (`managed=4/5`) where one of the 5 startup threads doesn't register and schedulers wait forever — kernel-side futex/scheduler bug, not Phoenix-specific. Phoenix is no less reliable than Bandit-only; the original 14/16 number was a measurement artifact (the readiness marker `phoenix_listening\n` gets interleaved with kernel debug output and a strict `grep -q` missed it on otherwise-successful boots)
 - **Sustained load:** **1000/1000 sequential HTTP requests** to the Phoenix demo in a single boot, no failures. Earlier runs walled around request ~200 due to socket fds wrapping past 1000 and silently getting routed to the VFS read path (the `is_vfs_fd` heuristic was `fd >= 1000`, colliding with the monotonic socket-fd allocator). Fixed by routing reads via the real `OPEN_FILES` table and recycling socket fds within the 500+ range so they never approach the `FD_SETSIZE` (1024) bitmap limit
 - **Runtime memory:** ~400 MB host RSS — ~6× an Alpine container due to ERTS allocator pool defaults (demand paging landed; allocator tuning is next)
 
@@ -113,8 +113,8 @@ The switch happens automatically after ERTS finishes loading boot modules. Norma
 
 ### What's next
 
-- **Phoenix** — Bandit + Plug works; Phoenix on top should "just work" subject to compiling its dependency tree against the same OTP/Elixir as the cpio
-- **Concurrent-burst load** — sequential request handling is rock-solid; under a 5-simultaneous-curl burst, 2/5 succeed and 3 get `Connection reset by peer`. This is a smoltcp backpressure / connection-sup limit, not a kernel bug — see [MESSAGE_DELIVERY.md §B2.22](MESSAGE_DELIVERY.md)
+- **Boot reliability** — the ~17 % cold-boot stall (an ERTS thread-progress registration race surfacing under our scheduler) is unrelated to the sustained-load work above and remains the largest open quality gap. CFS-style scheduler and red-zone trampoline experiments have been ruled out
+- **Concurrent-burst load** — sequential requests are now solid (1000/1000). Concurrent bursts go through an 8-slot smoltcp listener pool ([`b523785`](../../commit/b523785)); not yet stress-verified end-to-end on a fresh run
 - **BEAM JIT** — BeamAsm support (requires IST-safe preemption for clone child stacks)
 - **Interactive shell** — IEx/Erlang shell with full stdin support
 
