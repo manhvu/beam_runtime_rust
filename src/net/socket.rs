@@ -72,6 +72,15 @@ struct Socket {
 static SOCKETS: spin::Mutex<Vec<Socket>> = spin::Mutex::new(Vec::new());
 static NEXT_SOCK_FD: AtomicI32 = AtomicI32::new(SOCK_FD_BASE);
 
+/// Closed-socket fd freelist. Each socket::close() pushes the fd
+/// back; alloc_fd() pops one before bumping NEXT_SOCK_FD. Keeps the
+/// active fd range proportional to peak simultaneous open count
+/// instead of growing without bound — important so socket fds stay
+/// below 1024, the FD_SETSIZE / fd_set bitmap limit used by musl
+/// and various ERTS internals. Past fd 1023 those bitmaps silently
+/// overflow, killing acceptors without visible errors.
+static RECYCLED_FDS: spin::Mutex<Vec<i32>> = spin::Mutex::new(Vec::new());
+
 /// TCP handles whose userspace fd has been closed but whose smoltcp
 /// state machine has not yet reached `Closed`. `tcp::Socket::close()`
 /// only requests the close — it sets the state to `FinWait1` /
@@ -107,6 +116,11 @@ fn with_socket<R>(fd: i32, f: impl FnOnce(&mut Socket) -> R) -> Option<R> {
 }
 
 fn alloc_fd() -> i32 {
+    // Try the freelist first so closed-socket fd numbers get recycled
+    // instead of monotonically climbing past FD_SETSIZE (1024).
+    if let Some(fd) = RECYCLED_FDS.lock().pop() {
+        return fd;
+    }
     NEXT_SOCK_FD.fetch_add(1, Ordering::Relaxed)
 }
 
@@ -684,6 +698,10 @@ pub fn close(fd: i32) {
     let Some(idx) = sockets.iter().position(|s| s.fd == fd) else { return };
     let sock = sockets.remove(idx);
     drop(sockets);
+    // Return the fd number to the freelist so the next alloc_fd()
+    // reuses it. Keeps the active fd range bounded by peak open
+    // count instead of growing monotonically past FD_SETSIZE (1024).
+    RECYCLED_FDS.lock().push(fd);
     crate::net::with_net(|net| {
         match sock.sock_type {
             SockType::TcpStream => {

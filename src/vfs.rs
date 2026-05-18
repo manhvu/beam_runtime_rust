@@ -238,8 +238,16 @@ pub fn close(fd: i32) -> i64 {
 }
 
 /// Check if an fd belongs to the VFS.
+///
+/// Looks up the actual OPEN_FILES table instead of using the old
+/// `fd >= 1000` heuristic — that heuristic mis-routed socket fds to
+/// VFS once the monotonic socket allocator (SOCK_FD_BASE = 500)
+/// wrapped past 1000 after ~500 accepts, silently dropping reads on
+/// those connections. See directions/FD_TABLE.md for the stress-test
+/// wall this caused.
 pub fn is_vfs_fd(fd: i32) -> bool {
-    fd >= 1000
+    let files = OPEN_FILES.lock();
+    files.iter().any(|slot| matches!(slot, Some(f) if f.fd == fd))
 }
 
 /// Initialize and log archive stats.
