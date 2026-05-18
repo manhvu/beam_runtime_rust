@@ -72,6 +72,19 @@ struct Socket {
 static SOCKETS: spin::Mutex<Vec<Socket>> = spin::Mutex::new(Vec::new());
 static NEXT_SOCK_FD: AtomicI32 = AtomicI32::new(SOCK_FD_BASE);
 
+/// TCP handles whose userspace fd has been closed but whose smoltcp
+/// state machine has not yet reached `Closed`. `tcp::Socket::close()`
+/// only requests the close — it sets the state to `FinWait1` /
+/// `LastAck` and lets the next `Interface::poll()` actually transmit
+/// the FIN. Removing the handle from the `SocketSet` before that poll
+/// drops the in-flight FIN, leaving the remote half-open and the host
+/// hostfwd in CLOSE_WAIT. So we defer the `SocketSet::remove()` until
+/// `gc_closed_handles()` observes the state has reached `Closed`.
+///
+/// Lock order: SOCKETS → CLOSING_HANDLES → NET_LOCK.
+static CLOSING_HANDLES: spin::Mutex<Vec<SocketHandle>> =
+    spin::Mutex::new(Vec::new());
+
 /// Check if an fd is a socket fd.
 pub fn is_socket_fd(fd: i32) -> bool {
     SOCKETS.lock().iter().any(|s| s.fd == fd)
@@ -650,23 +663,35 @@ pub fn any_socket_ready() -> bool {
 
 /// Close a socket fd.
 ///
-/// Removes the socket from the table under the SOCKETS lock, then
-/// hands it to smoltcp under NET_LOCK. Holding both locks while
-/// calling tcp.close() avoids leaving a half-removed entry visible
-/// to other CPUs.
+/// Removes the socket from the SOCKETS table immediately so future
+/// fd-keyed syscalls return EBADF. The smoltcp handle disposition
+/// depends on the socket type:
+///
+/// * `TcpStream`: smoltcp's `tcp::Socket::close()` only requests the
+///   close — the FIN is sent on the next `Interface::poll()` and the
+///   state machine then needs the remote's FIN/ACK before reaching
+///   `Closed`. Removing the handle now would drop the in-flight FIN
+///   and leak the connection on the remote side. So we park the
+///   handle in `CLOSING_HANDLES` and let `gc_closed_handles()` (run
+///   from `NetState::poll()`) remove it once the state machine has
+///   actually finished.
+/// * `TcpListener`: in `Listen` state, `close()` transitions straight
+///   to `Closed` (no peer to coordinate with), so removal is safe
+///   immediately. Same for every spare in the listener pool.
+/// * `UdpDgram`: no connection state — instant removal.
 pub fn close(fd: i32) {
     let mut sockets = SOCKETS.lock();
     let Some(idx) = sockets.iter().position(|s| s.fd == fd) else { return };
     let sock = sockets.remove(idx);
+    drop(sockets);
     crate::net::with_net(|net| {
         match sock.sock_type {
             SockType::TcpStream => {
                 let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
                 tcp.close();
-                net.sockets.remove(sock.handle);
+                CLOSING_HANDLES.lock().push(sock.handle);
             }
             SockType::TcpListener => {
-                // Listener pool: take down every slot.
                 let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
                 tcp.close();
                 net.sockets.remove(sock.handle);
@@ -682,5 +707,35 @@ pub fn close(fd: i32) {
             }
         }
     });
+}
+
+/// Reap TCP handles whose state machine has finished. Runs from
+/// `NetState::poll()` after `iface.poll()` so any handles that
+/// transitioned during this poll get freed in the same cycle.
+///
+/// We reap both `Closed` (fully torn down) AND `TimeWait` (waiting
+/// out 2×MSL). For short-lived HTTP connections, holding sockets
+/// through the full 2×MSL bloats the `SocketSet` and slows every
+/// subsequent `iface.poll()` linearly with the number of handles.
+/// Skipping `TimeWait` is a minor RFC-793 deviation (it protects
+/// against delayed duplicate segments from the previous incarnation
+/// of the 4-tuple) and is the standard server-side trade-off; the
+/// previous version that reaped only `Closed` dropped throughput to
+/// ~1 req/s under sustained load because TIME_WAIT sockets piled up.
+///
+/// Caller holds NET_LOCK (via `with_net`).
+pub fn gc_closed_handles(net: &mut crate::net::NetState) {
+    let mut closing = CLOSING_HANDLES.lock();
+    let mut i = 0;
+    while i < closing.len() {
+        let h = closing[i];
+        let state = net.sockets.get::<tcp::Socket>(h).state();
+        if state == tcp::State::Closed || state == tcp::State::TimeWait {
+            net.sockets.remove(h);
+            closing.swap_remove(i);
+        } else {
+            i += 1;
+        }
+    }
 }
 

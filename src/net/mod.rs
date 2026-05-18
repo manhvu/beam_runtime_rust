@@ -27,6 +27,11 @@ impl NetState {
         self.device.drain_completed_tx();
         let now = self.now();
         self.iface.poll(now, &mut self.device, &mut self.sockets);
+        // Reap any deferred-close TCP handles whose state machine has
+        // reached `Closed` (either through full FIN/ACK exchange or
+        // TIME_WAIT timeout). Without this, `socket::close()` would
+        // leak every closed connection into `SocketSet`.
+        socket::gc_closed_handles(self);
     }
 
     fn now(&self) -> Instant {
