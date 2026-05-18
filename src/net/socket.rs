@@ -706,6 +706,13 @@ pub fn close(fd: i32) {
         match sock.sock_type {
             SockType::TcpStream => {
                 let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
+                // Clean FIN close. Tried abort() to reap the handle
+                // immediately and keep the SocketSet small, but Bandit
+                // treats the resulting RST as a connection error and
+                // burns time on supervisor-tree handling — measured
+                // throughput dropped ~50% (5.3 -> 2.5 req/s on
+                // sequential 1000). Stick with FIN; the larger
+                // SocketSet is the lesser cost.
                 tcp.close();
                 CLOSING_HANDLES.lock().push(sock.handle);
             }

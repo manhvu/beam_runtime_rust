@@ -537,7 +537,16 @@ fn syscall_dispatch_inner(
             // a4 is *timeval — if non-NULL, sleep for that duration.
             // ERTS uses select(0, NULL, NULL, NULL, &t) as a precise sleep;
             // without honoring the timeout, ERTS spins in a tight loop.
-            crate::net::poll();
+            //
+            // Only poll the network stack if the caller actually passed
+            // fds to watch (nfds > 0). For the ERTS sleep pattern
+            // (nfds=0) we'd be iterating every socket in the SocketSet
+            // on a syscall that has nothing to do with the network —
+            // an O(N) cost paid roughly once per scheduler tick.
+            let nfds = a0 as i32;
+            if nfds > 0 {
+                crate::net::poll();
+            }
             let timeout_ptr = _a4 as *const u64;
             let target_ns = if !timeout_ptr.is_null() {
                 let tv_sec = unsafe { *timeout_ptr };
