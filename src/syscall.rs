@@ -447,9 +447,14 @@ fn syscall_dispatch_inner(
         SYS_PRLIMIT64 => sys_prlimit64(a2 as *const u8, a3 as *mut u8),
         SYS_OPEN | SYS_OPENAT => sys_open(a0, a1, nr),
         SYS_CLOSE => {
-            crate::vfs::close(a0 as i32);
-            crate::pipe::close(a0 as i32);
-            crate::net::socket::close(a0 as i32);
+            let fd = a0 as i32;
+            // Drop any epoll registrations BEFORE closing the fd so
+            // any concurrent epoll_wait can't observe an entry whose
+            // socket has been torn down.
+            epoll_drop_fd(fd);
+            crate::vfs::close(fd);
+            crate::pipe::close(fd);
+            crate::net::socket::close(fd);
             crate::net::poll(); // flush FIN
             0
         }
@@ -1277,12 +1282,31 @@ fn sys_clone(flags: u64, stack: u64, parent_tid: u64, child_tid: u64, tls: u64) 
 /// Epoll fd registration table. ERTS calls epoll_ctl(epfd, ADD, fd, &event)
 /// where event.data is what we should return when fd becomes ready.
 /// We track (fd, data) pairs so epoll_wait can return the correct user data.
-const EPOLL_MAX: usize = 64;
+const EPOLL_MAX: usize = 1024;
 #[derive(Copy, Clone)]
 struct EpollEntry { fd: i32, data: u64, events: u32 }
 static mut EPOLL_TABLE: [EpollEntry; EPOLL_MAX] =
     [EpollEntry { fd: -1, data: 0, events: 0 }; EPOLL_MAX];
 static EPOLL_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
+/// Clear all EPOLL_TABLE entries referencing `fd`. Called from
+/// sys_close so closing a socket implicitly removes it from any
+/// epoll set — otherwise stale entries pile up (Bandit-style
+/// process-exit teardown closes fds without first issuing
+/// epoll_ctl(DEL)) and the table fills, after which new
+/// registrations silently fail.
+pub fn epoll_drop_fd(fd: i32) {
+    let _g = EPOLL_LOCK.lock();
+    unsafe {
+        for e in EPOLL_TABLE.iter_mut() {
+            if e.fd == fd {
+                e.fd = -1;
+                e.data = 0;
+                e.events = 0;
+            }
+        }
+    }
+}
 
 fn sys_epoll_ctl(op: i32, fd: i32, event_ptr: u64) -> i64 {
     {
