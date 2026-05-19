@@ -74,6 +74,22 @@ $ curl http://localhost:5566/
 Hello from Phoenix on Tyn!
 ```
 
+A TCP eval shell ships alongside the Phoenix demo. Connect from the host and poke a running BEAM:
+
+```
+$ nc localhost 5567
+Tyn eval shell - OTP 27, ERTS 15.2.7
+Expressions end in '.'   Disconnect to exit.
+>> erlang:system_info(process_count).
+351
+>> 'Elixir.System':version().
+<<"1.18.3">>
+>> X = lists:seq(1, 5).
+[1,2,3,4,5]
+>> lists:sum(X).
+15
+```
+
 - OTP 27 ERTS boots with up to 8 CPUs, loads 200+ .beam files from in-memory VFS
 - Full OTP kernel application starts — supervision trees, code_server, logger
 - **Phoenix 1.8** routes through `use TynHelloWeb, :router` (Bandit fronts the Phoenix Router directly; the full `Phoenix.Endpoint` middleware stack would also work given `secret_key_base` etc., but the Router is the minimum demo)
@@ -93,6 +109,7 @@ Where things stand on KVM (host: AWS Xeon 6975P-C):
 
 - **8-way SMP** — ACPI/MADT CPU discovery, APIC timer calibration, AP trampoline (16→64 bit), per-CPU GDT/TSS/IST, GS_BASE per-CPU syscall data, IPI wakeup, preemptive user-mode scheduling
 - **TCP networking** — `gen_tcp:listen/accept/send/close` end-to-end, POSIX socket layer → smoltcp TCP/IP → virtio-net PCI → QEMU → host
+- **Live eval shell** — `nc` into a running BEAM and evaluate Erlang or Elixir expressions; bindings persist per session, multi-line input is buffered until the parser accepts it (`src/erl/tcp_shell.erl`)
 - **Elixir** — Elixir 1.18.3 .beam files load and execute on OTP 27
 - **~50 Linux syscalls** — mmap, read, write, open, stat, pipe, ppoll, futex, clone, epoll, select, readv, ...
 - **VFS** — cpio newc archive with OTP kernel/stdlib .beam files + optional Elixir
@@ -116,7 +133,7 @@ The switch happens automatically after ERTS finishes loading boot modules. Norma
 - **Boot reliability** — down from ~17 % to ~8 % after the watchdog / clone-TID protocol fixes; remaining variance looks like cold-cache timing, not a deterministic race
 - **Concurrent-burst load** — sequential 1000/1000 is solid; N≥5 concurrent curls cap at ~2 successful regardless of kernel-side mitigations (verified by exhaustive instrumentation: listener pool, smoltcp, accept logic, ERTS/Bandit all process what arrives). The bottleneck is host-side packet drops at the QEMU TAP / bridge forwarding layer under burst — environmental tuning territory, not kernel work. Realistic concurrent benchmarks need a separate-machine driver instead of host-loopback
 - **BEAM JIT** — BeamAsm support (requires IST-safe preemption for clone child stacks)
-- **Interactive shell** — IEx/Erlang shell with full stdin support
+- **Full IEx** — the current eval shell handles single expressions per session; line editing, history, and the real IEx group leader still need stdin I/O server work
 
 ## Building & Running
 
@@ -142,7 +159,7 @@ qemu-system-x86_64 \
   -m 2560M -machine q35 -cpu host -enable-kvm -smp 8 \
   -nographic -no-reboot -serial mon:stdio \
   -device virtio-net-pci,netdev=net0,disable-legacy=on,disable-modern=off \
-  -netdev user,id=net0,hostfwd=tcp::5555-:8080
+  -netdev user,id=net0,hostfwd=tcp::5555-:8080,hostfwd=tcp::5567-:9090
 ```
 
 ### Test the Bandit demo from host
