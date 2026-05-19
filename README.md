@@ -6,7 +6,7 @@ No Linux. No POSIX. Just your Erlang/Elixir/Gleam code on bare metal.
 
 ## What is Tyn?
 
-Tyn is a unikernel — a single-purpose operating system kernel that hosts one thing: the BEAM virtual machine. It replaces the entire Linux stack with ~6,300 lines of Rust, targeting KVM/QEMU cloud deployments.
+Tyn is a unikernel — a single-purpose operating system kernel that hosts one thing: the BEAM virtual machine. It replaces the entire Linux stack with ~7,000 lines of Rust, targeting KVM/QEMU cloud deployments.
 
 The BEAM already has its own process model, scheduler, memory management, and distribution protocol. A general-purpose OS kernel underneath duplicates much of what the BEAM provides natively. Tyn explores what happens when you remove that redundancy and give BEAM a purpose-built host.
 
@@ -33,7 +33,7 @@ The BEAM already has its own process model, scheduler, memory management, and di
 │  BEAM Host Interface (Rust)             │
 │  ~50 Linux syscalls emulated            │
 ├─────────────────────────────────────────┤
-│  Tyn Kernel (Rust, ~6,900 LOC)          │
+│  Tyn Kernel (Rust, ~7,000 LOC)          │
 │  SMP · Memory · Networking · VFS · I/O  │
 ├─────────────────────────────────────────┤
 │  KVM / QEMU / Cloud Hypervisor          │
@@ -85,7 +85,7 @@ Where things stand on KVM (host: AWS Xeon 6975P-C):
 
 - **Image size:** 49 MB bootable image — ~4× smaller than Alpine + Elixir + Phoenix (~190 MB)
 - **Cold boot to serving HTTP:** ~7 s on KVM (kernel → BEAM handoff in ~430 ms; rest is OTP startup)
-- **Cold-boot reliability:** ~83 % across 64-trial sweeps (small early samples ran as high as 30/32). Each trial routes a curl request through Phoenix.Router + Bandit + Plug. The ~17 % failures are an ERTS thread-progress registration race (`managed=4/5`) where one of the 5 startup threads doesn't register and schedulers wait forever — kernel-side futex/scheduler bug, not Phoenix-specific. Phoenix is no less reliable than Bandit-only; the original 14/16 number was a measurement artifact (the readiness marker `phoenix_listening\n` gets interleaved with kernel debug output and a strict `grep -q` missed it on otherwise-successful boots)
+- **Cold-boot reliability:** ~92 % across 64-trial sweeps. Each trial routes a curl request through Phoenix.Router + Bandit + Plug. Up from a long-standing ~83 % baseline after two protocol-safety fixes: (1) the timer-context watchdog no longer mutates thread state directly — it now sets per-thread atomic rescue flags that `process_rescues()` drains from non-interrupt scheduler points under the same lock order as `futex_wake`; and (2) `sys_clone` now writes `CLONE_PARENT_SETTID` / `CLONE_CHILD_SETTID` pointers and `home_cpu` BEFORE queueing the child, closing a window where the child could run on another CPU and observe a stale TID slot. The remaining ~8 % cluster at the start of a fresh test loop and look like cold-cache timing variance rather than a single deterministic race
 - **Sustained load:** **1000/1000 sequential HTTP requests** to the Phoenix demo in a single boot, no failures. Earlier runs walled around request ~200 due to socket fds wrapping past 1000 and silently getting routed to the VFS read path (the `is_vfs_fd` heuristic was `fd >= 1000`, colliding with the monotonic socket-fd allocator). Fixed by routing reads via the real `OPEN_FILES` table and recycling socket fds within the 500+ range so they never approach the `FD_SETSIZE` (1024) bitmap limit
 - **Runtime memory:** ~400 MB host RSS — ~6× an Alpine container due to ERTS allocator pool defaults (demand paging landed; allocator tuning is next)
 
@@ -113,8 +113,8 @@ The switch happens automatically after ERTS finishes loading boot modules. Norma
 
 ### What's next
 
-- **Boot reliability** — the ~17 % cold-boot stall (an ERTS thread-progress registration race surfacing under our scheduler) is unrelated to the sustained-load work above and remains the largest open quality gap. CFS-style scheduler and red-zone trampoline experiments have been ruled out
-- **Concurrent-burst load** — sequential requests are now solid (1000/1000). Concurrent bursts go through an 8-slot smoltcp listener pool ([`b523785`](../../commit/b523785)); not yet stress-verified end-to-end on a fresh run
+- **Boot reliability** — down from ~17 % to ~8 % after the watchdog / clone-TID protocol fixes; remaining variance looks like cold-cache timing, not a deterministic race
+- **Concurrent-burst load** — sequential 1000/1000 is solid; N≥5 concurrent curls cap at ~2 successful regardless of kernel-side mitigations (verified by exhaustive instrumentation: listener pool, smoltcp, accept logic, ERTS/Bandit all process what arrives). The bottleneck is host-side packet drops at the QEMU TAP / bridge forwarding layer under burst — environmental tuning territory, not kernel work. Realistic concurrent benchmarks need a separate-machine driver instead of host-loopback
 - **BEAM JIT** — BeamAsm support (requires IST-safe preemption for clone child stacks)
 - **Interactive shell** — IEx/Erlang shell with full stdin support
 
