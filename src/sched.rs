@@ -267,6 +267,11 @@ extern "C" fn cpu_idle_loop() -> ! {
         // context_switch back here may hand off a fresh lock.
         release_pending_unlock(cpu);
 
+        // Drain any rescue requests the timer-context watchdog set
+        // since we last looked. We hold no locks here, so it's safe
+        // to take the futex / thread / queue locks the rescue needs.
+        process_rescues();
+
         x86_64::instructions::interrupts::enable();
         x86_64::instructions::hlt();
 
@@ -356,7 +361,19 @@ pub fn init(num_cpus: usize) {
 
 /// Create a new thread (called from sys_clone).
 /// `clone_rip` and `clone_r9` are the parent's RCX and R9 at syscall entry.
-pub fn spawn(fn_ptr: u64, stack: u64, tls: u64, child_tid: u64) -> u32 {
+/// Create a new thread. Writes `parent_tid` and `child_tid` user-memory
+/// pointers (per the `clone(2)` CLONE_PARENT_SETTID / CLONE_CHILD_SETTID
+/// flags in `clone_flags`) BEFORE queueing the thread, so the child
+/// can never run on another CPU and observe a TID slot that hasn't
+/// been written yet.
+pub fn spawn(
+    fn_ptr: u64,
+    stack: u64,
+    tls: u64,
+    child_tid: u64,
+    parent_tid: u64,
+    clone_flags: u64,
+) -> u32 {
     // Read parent's RCX (return RIP) and R9 (fn for musl __clone child path)
     // from per-CPU GS data — safe even when both CPUs are in syscall handlers.
     let (clone_r9, clone_rip) = crate::syscall::get_clone_regs();
@@ -440,15 +457,32 @@ pub fn spawn(fn_ptr: u64, stack: u64, tls: u64, child_tid: u64) -> u32 {
         }
     }
 
-    {
-        let _qlock = CPU_QUEUE_LOCKS[best_cpu as usize].lock();
-        unsafe { CPU_QUEUES[best_cpu as usize].queue.push_back(tid); }
-    }
-    // Record home CPU for futex_wake routing
+    // Record home CPU BEFORE making the thread runnable so a
+    // cross-CPU futex_wake routes correctly from the first scheduling
+    // tick. (Was previously set after the push_back, leaving a brief
+    // window where home_cpu=0.)
     unsafe {
         if let Some(t) = THREADS[tid as usize].as_mut() {
             t.home_cpu = best_cpu;
         }
+    }
+
+    // CLONE_PARENT_SETTID / CLONE_CHILD_SETTID: write the new TID to
+    // the user pointers BEFORE we make the child runnable. Without
+    // this ordering the child could run on another CPU (via the IPI
+    // below) and observe the slot still holding its pre-clone value.
+    const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+    const CLONE_CHILD_SETTID: u64  = 0x0100_0000;
+    if (clone_flags & CLONE_PARENT_SETTID) != 0 && parent_tid != 0 {
+        unsafe { *(parent_tid as *mut u32) = tid; }
+    }
+    if (clone_flags & CLONE_CHILD_SETTID) != 0 && child_tid != 0 {
+        unsafe { *(child_tid as *mut u32) = tid; }
+    }
+
+    {
+        let _qlock = CPU_QUEUE_LOCKS[best_cpu as usize].lock();
+        unsafe { CPU_QUEUES[best_cpu as usize].queue.push_back(tid); }
     }
 
     // If the target CPU is idle, send IPI to wake it
@@ -466,6 +500,9 @@ pub fn spawn(fn_ptr: u64, stack: u64, tls: u64, child_tid: u64) -> u32 {
 
 /// Yield the current CPU to the next runnable thread.
 pub fn yield_current() {
+    // Drain any rescue requests before we take the per-CPU queue
+    // lock. Safe from syscall context — we hold no locks here.
+    process_rescues();
 
     let cpu = current_cpu() as usize;
 
@@ -827,99 +864,131 @@ static NEED_RESCHED: [AtomicBool; MAX_CPUS] = {
     [F; MAX_CPUS]
 };
 
+/// Per-thread "rescue requested" flag. Set by the watchdog (which runs
+/// in timer-interrupt context and therefore cannot safely acquire the
+/// futex / thread / queue locks). Drained by `process_rescues()` at
+/// safe scheduler points (idle loop, yield_current, check_resched).
+///
+/// Previously the watchdog mutated thread state and pushed to the run
+/// queue directly from interrupt context. That races against
+/// `futex_wait`'s lock-handoff protocol (bucket lock spans the
+/// wait→sleep transition) and `futex_wake`'s state mutation: the
+/// watchdog could double-queue a thread, observe a Blocked thread
+/// mid-context_switch, or interrupt a pending unlock handoff and
+/// leave the bucket lock orphaned.
+static RESCUE_REQUESTED: [AtomicBool; MAX_THREADS] = {
+    const F: AtomicBool = AtomicBool::new(false);
+    [F; MAX_THREADS]
+};
+
 /// Periodically wake blocked threads (watchdog). Called every ~1 second.
 /// This handles missed futex_wake events where a thread wrote 0 to a lock
 /// before the waiter called futex_wait, causing a permanent block.
 pub fn watchdog_wake() {
-    static WD_CHECKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-    let check_num = WD_CHECKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    // Skip the lock — the watchdog runs in timer interrupt context.
-    // It only reads thread state and sets state=Ready, which is safe
-    // because state is only checked via read_volatile in the idle loop.
-    // Using try_lock deadlocks when futex_wake holds the lock on the same CPU.
+    // Runs in timer-interrupt context — no locks held, no mutation
+    // allowed on shared state. Only sets `RESCUE_REQUESTED[i]` for
+    // threads whose condition would warrant a rescue; the actual
+    // state transition is performed by `process_rescues()` from a
+    // safe scheduler point (idle loop / yield / syscall exit) where
+    // it can take the futex / thread / queue locks in the same order
+    // as `futex_wake`.
     let now_ns = crate::syscall::monotonic_ns();
     unsafe {
         for i in 0..MAX_THREADS {
-            if let Some(thread) = THREADS[i].as_mut() {
-                if thread.state == State::Blocked {
-                    // Check if the futex value changed (lock was released)
-                    let current = (*(thread.futex_addr as *const AtomicU32)).load(Ordering::SeqCst);
-                    if check_num < 1 {
-                        crate::serial_println!("[wd] tid={} addr={:#x} val={:#x} cur={:#x}",
-                            thread.tid, thread.futex_addr, thread.futex_val, current);
-                    }
-                    // With the lock-handoff protocol in futex_wait, real wakes
-                    // are never lost — the bucket lock spans the wait→sleep
-                    // transition. The watchdog is a backstop only for
-                    // genuine value-changed-without-wake bugs and for the
-                    // expiration of timed waits (FUTEX_WAIT with a timespec
-                    // — used by ethr_event_twait to drive ERTS's timer
-                    // wheel). Without the timeout branch, `receive after N`
-                    // and gen_server:call timeouts never fire.
-                    let timed_out = thread.wait_deadline_ns != 0
-                        && now_ns >= thread.wait_deadline_ns;
-                    // Stall safety net: rescue any thread that has been on
-                    // an infinite wait (no deadline) for longer than
-                    // BLOCKED_RESCUE_NS. A baseline ≈ 17% of Phoenix boots
-                    // stall here on some kind of ERTS-internal wake-loss
-                    // race (we hypothesized a userspace ethr_event_set/
-                    // reset overwrite — see directions/BOOT_STALL_TSE.md
-                    // — but a targeted ERTS patch derived from that
-                    // hypothesis did NOT unblock the analogous JIT stall
-                    // and showed only a statistically-inconclusive
-                    // improvement for non-JIT; see
-                    // directions/ERTS_PATCH.md for the negative result).
-                    // Whatever the cause, ERTS's TSE event loop tolerates
-                    // spurious wakeups (it re-checks the event value and
-                    // re-waits if needed), so a forced rescue here is
-                    // indistinguishable from a spurious wake. The measured
-                    // improvement is modest — pooled across 192 trials,
-                    // 166/192 ≈ 86.5% (vs 82.8% baseline, 95% CI ~[82,90]%
-                    // overlaps baseline) — but the rescue caps stall
-                    // duration at ≈ 5 s in the cases that would otherwise
-                    // hang for the full test timeout.
-                    const BLOCKED_RESCUE_NS: u64 = 5_000_000_000; // 5 s
-                    let stale = thread.wait_deadline_ns == 0
-                        && thread.blocked_since_ns != 0
-                        && now_ns >= thread.blocked_since_ns + BLOCKED_RESCUE_NS;
-                    let force = false;
-                    if current != thread.futex_val || force || timed_out || stale {
-                        // Value changed or force-wake timeout.
-                        // Set state=Ready AND push to home_cpu's queue.
-                        // The idle loop only pulls from the queue, so
-                        // setting state alone leaves the thread orphaned
-                        // (Ready but not queued, never picked up). Dedup
-                        // by checking `contains` so a concurrent real
-                        // futex_wake racing the watchdog doesn't queue
-                        // the same tid twice.
-                        thread.state = State::Ready;
-                        let addr = thread.futex_addr;
-                        thread.futex_addr = 0;
-                        if timed_out {
-                            thread.wait_timed_out = true;
-                        }
-                        thread.wait_deadline_ns = 0;
-                        thread.blocked_since_ns = 0;
-                        let tid = thread.tid;
-                        let target_cpu = thread.home_cpu as usize;
-                        if target_cpu < MAX_CPUS {
-                            let _qlock = CPU_QUEUE_LOCKS[target_cpu].lock();
-                            if !CPU_QUEUES[target_cpu].queue.iter().any(|&t| t == tid) {
-                                CPU_QUEUES[target_cpu].queue.push_back(tid);
-                            }
-                        }
-                        if target_cpu != current_cpu() as usize {
-                            crate::apic::send_ipi(target_cpu as u8);
-                        }
+            // Snapshot read — interrupt context, no locks.
+            let Some(thread) = THREADS[i].as_ref() else { continue };
+            if thread.state != State::Blocked { continue; }
+            if thread.futex_addr == 0 { continue; }
 
-                        static WD_LOG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-                        let c = WD_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                        if c < 5 {
-                            crate::serial_println!("[watchdog] woke tid={} addr={:#x} old_val={:#x} cur={:#x}",
-                                tid, addr, thread.futex_val, current);
-                        }
-                    }
+            // Did the futex value change since the waiter recorded its
+            // expected value? Lost-wake backstop. The lock-handoff
+            // protocol in futex_wait spans the wait→sleep transition
+            // and shouldn't lose wakes, but this catches the
+            // value-changed-without-wake bug class as a safety net.
+            let current = (*(thread.futex_addr as *const AtomicU32)).load(Ordering::SeqCst);
+            let value_changed = current != thread.futex_val;
+
+            // Timed wait expired (used by ethr_event_twait to drive
+            // ERTS's timer wheel — `receive after N` / gen_server:call
+            // timeouts depend on this).
+            let timed_out = thread.wait_deadline_ns != 0
+                && now_ns >= thread.wait_deadline_ns;
+
+            // Stall safety net: an infinite-wait thread that has been
+            // Blocked for > BLOCKED_RESCUE_NS gets a spurious-wake-style
+            // rescue. ERTS's TSE event loop tolerates spurious wakes
+            // (it re-checks and re-waits), so this is a no-op in the
+            // healthy case and a rescue in the stuck case.
+            const BLOCKED_RESCUE_NS: u64 = 5_000_000_000; // 5 s
+            let stale = thread.wait_deadline_ns == 0
+                && thread.blocked_since_ns != 0
+                && now_ns >= thread.blocked_since_ns + BLOCKED_RESCUE_NS;
+
+            if value_changed || timed_out || stale {
+                RESCUE_REQUESTED[i].store(true, Ordering::Release);
+            }
+        }
+    }
+}
+
+/// Drain pending rescue requests from `RESCUE_REQUESTED`. Acquires the
+/// same lock set as `futex_wake` (bucket → THREAD_LOCK → queue) so the
+/// state transition is protocol-safe. Called from non-interrupt
+/// scheduler points only.
+fn process_rescues() {
+    for i in 0..MAX_THREADS {
+        if !RESCUE_REQUESTED[i].swap(false, Ordering::Acquire) { continue; }
+
+        unsafe {
+            // Read the futex address WITHOUT holding any locks first so
+            // we know which bucket lock to take.
+            let Some(thread) = THREADS[i].as_ref() else { continue };
+            if thread.state != State::Blocked { continue; }
+            let addr = thread.futex_addr;
+            if addr == 0 { continue; }
+            let bucket = futex_bucket(addr);
+
+            // Now take the locks in the same order as futex_wake.
+            let _flock = FUTEX_LOCKS[bucket].lock();
+            let _tlock = THREAD_LOCK.lock();
+
+            // Re-check under lock — the thread may have been woken
+            // through the normal futex_wake path between the watchdog
+            // setting the flag and us getting here.
+            let Some(thread) = THREADS[i].as_mut() else { continue };
+            if thread.state != State::Blocked { continue; }
+
+            // Compute deadline-expiry under lock so wait_timed_out
+            // reflects the actual state at rescue time.
+            let now_ns = crate::syscall::monotonic_ns();
+            let was_timed_out = thread.wait_deadline_ns != 0
+                && now_ns >= thread.wait_deadline_ns;
+
+            thread.state = State::Ready;
+            thread.futex_addr = 0;
+            thread.blocked_since_ns = 0;
+            if was_timed_out {
+                thread.wait_timed_out = true;
+            }
+            thread.wait_deadline_ns = 0;
+
+            let tid = thread.tid;
+            let target_cpu = thread.home_cpu as usize;
+
+            if target_cpu < MAX_CPUS {
+                let _qlock = CPU_QUEUE_LOCKS[target_cpu].lock();
+                if !CPU_QUEUES[target_cpu].queue.iter().any(|&t| t == tid) {
+                    CPU_QUEUES[target_cpu].queue.push_back(tid);
                 }
+            }
+            if target_cpu != current_cpu() as usize {
+                crate::apic::send_ipi(target_cpu as u8);
+            }
+
+            static WD_LOG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+            let c = WD_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if c < 5 {
+                crate::serial_println!("[rescue] tid={} addr={:#x}", tid, addr);
             }
         }
     }
@@ -938,6 +1007,10 @@ pub fn timer_tick() {
 
 /// Check if a reschedule is needed and yield if so. Called from syscall exit.
 pub fn check_resched() {
+    // Drain rescue requests on every syscall exit, even if no resched
+    // is otherwise needed. Syscall exit is the most-frequent safe
+    // point — keeps rescues responsive without piling up.
+    process_rescues();
     let cpu = current_cpu() as usize;
     if cpu < MAX_CPUS && NEED_RESCHED[cpu].swap(false, Ordering::Acquire) {
         yield_current();

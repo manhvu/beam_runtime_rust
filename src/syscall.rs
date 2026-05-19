@@ -1268,18 +1268,12 @@ fn sys_clone(flags: u64, stack: u64, parent_tid: u64, child_tid: u64, tls: u64) 
     // saved_clone_rip is set in the assembly stub (RCX = return RIP from syscall)
     // The child reads it in clone_child_return to return to musl's __clone
 
-    // Use the SMP scheduler to create the thread
-    let tid = crate::sched::spawn(fn_ptr, stack, tls, child_tid);
-
-    // CLONE_PARENT_SETTID (0x00100000): write TID to parent_tid.
-    if (flags & 0x00100000) != 0 && parent_tid != 0 {
-        unsafe { *(parent_tid as *mut u32) = tid; }
-    }
-    // CLONE_CHILD_SETTID (0x01000000): write TID to child_tid.
-    // Must happen before clone returns so the parent sees it immediately.
-    if (flags & 0x01000000) != 0 && child_tid != 0 {
-        unsafe { *(child_tid as *mut u32) = tid; }
-    }
+    // Use the SMP scheduler to create the thread. spawn writes the
+    // PARENT_SETTID / CHILD_SETTID pointers BEFORE making the child
+    // runnable so the child can never start on another CPU and read
+    // a stale TID slot. (Previously the writes happened here, after
+    // spawn returned — race window between push_back and the writes.)
+    let tid = crate::sched::spawn(fn_ptr, stack, tls, child_tid, parent_tid, flags);
 
     serial_println!("[clone] tid={} fn={:#x}", tid, fn_ptr);
     tid as i64
