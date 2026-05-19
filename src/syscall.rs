@@ -453,6 +453,7 @@ fn syscall_dispatch_inner(
             // socket has been torn down.
             epoll_drop_fd(fd);
             crate::vfs::close(fd);
+            crate::vfs::close_dir(fd);
             crate::pipe::close(fd);
             crate::net::socket::close(fd);
             crate::net::poll(); // flush FIN
@@ -460,9 +461,8 @@ fn syscall_dispatch_inner(
         }
         SYS_STAT => sys_stat(a0 as *const u8, a1 as *mut u8),
         SYS_FSTAT => sys_fstat(a0 as i32, a1 as *mut u8),
-        // TODO: newfstatat(dirfd, pathname, statbuf, flags) — currently ignores pathname (a1)
-        // and treats a0 as fd for fstat. Works because ERTS uses it for open fds only.
-        SYS_NEWFSTATAT => sys_fstat(a0 as i32, a2 as *mut u8),
+        SYS_NEWFSTATAT => sys_newfstatat(
+            a0 as i32, a1 as *const u8, a2 as *mut u8, a3 as i32),
         SYS_LSEEK => {
             if crate::vfs::is_vfs_fd(a0 as i32) {
                 crate::vfs::lseek(a0 as i32, a1 as i64, a2 as i32)
@@ -1104,6 +1104,14 @@ fn sys_open(a0: u64, a1: u64, nr: u64) -> i64 {
         return vfs_fd;
     }
 
+    // If no VFS file found, check if it's a directory we can list. The
+    // directory check has to come BEFORE the ENOENT trace — otherwise
+    // every successful opendir of /otp/lib etc. printed a misleading
+    // "[open ENOENT] /otp/lib" line.
+    if crate::vfs::is_dir_prefix(path) {
+        return crate::vfs::open_dir(path);
+    }
+
     // Trace failed opens to see what ERTS is looking for
     {
         static FAIL_LOG: AtomicU64 = AtomicU64::new(0);
@@ -1120,16 +1128,6 @@ fn sys_open(a0: u64, a1: u64, nr: u64) -> i64 {
         if let Ok(s) = core::str::from_utf8(path) {
             serial_println!("[vfs] ENOENT {}", s);
         }
-    }
-
-    // If no VFS file found, check if it's a directory we can list
-    if crate::vfs::is_dir_prefix(path) {
-        // Return a directory fd. Use fd 900+N for directory fds.
-        static DIR_FD_NEXT: core::sync::atomic::AtomicI32 =
-            core::sync::atomic::AtomicI32::new(900);
-        let dfd = DIR_FD_NEXT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        crate::vfs::open_dir(dfd, path);
-        return dfd as i64;
     }
 
     -2 // -ENOENT
@@ -1206,20 +1204,41 @@ fn sys_fstat(fd: i32, buf: *mut u8) -> i64 {
         // SAFETY: buf points to user struct stat (144 bytes on x86_64).
         unsafe {
             core::ptr::write_bytes(buf, 0, 144);
-            // Set st_mode to regular file (S_IFREG | 0644)
             let mode_ptr = buf.add(24) as *mut u32; // st_mode at offset 24
-            *mode_ptr = 0o100644;
-            // Set st_size if this is a VFS file
-            if let Some(size) = crate::vfs::fstat_size(fd) {
-                let size_ptr = buf.add(48) as *mut u64; // st_size at offset 48
-                *size_ptr = size as u64;
+            // Directory fds — both the synthetic /sys placeholder and live
+            // VFS directory handles — must report S_IFDIR. glibc's
+            // opendir()/readdir() validates this after fstat and rejects
+            // the descriptor as ENOTDIR otherwise, which manifests as
+            // erl_prim_loader:list_dir/1 returning bare `error` and
+            // crashes code_server:init/3 at the `{ok,Dirs} = ...` match.
+            if fd as i64 == FD_SYNTH_DIR || crate::vfs::is_dir_fd(fd) {
+                *mode_ptr = 0o40755; // S_IFDIR | 0755
+            } else {
+                *mode_ptr = 0o100644; // S_IFREG | 0644
+                if let Some(size) = crate::vfs::fstat_size(fd) {
+                    let size_ptr = buf.add(48) as *mut u64; // st_size at offset 48
+                    *size_ptr = size as u64;
+                }
             }
-            // Set st_blksize
             let blksize_ptr = buf.add(56) as *mut u64; // st_blksize at offset 56
             *blksize_ptr = 4096;
         }
     }
     0
+}
+
+fn sys_newfstatat(dirfd: i32, path_ptr: *const u8, buf: *mut u8, _flags: i32) -> i64 {
+    // Linux ABI: if pathname is the empty string and AT_EMPTY_PATH is set,
+    // this acts like fstat(dirfd). Otherwise it stats pathname (relative to
+    // dirfd, but Tyn has no cwd / dir-relative resolution — callers we care
+    // about pass absolute paths). Previously this ignored the pathname
+    // entirely and always returned an S_IFREG fstat of dirfd, so a call
+    // like newfstatat(AT_FDCWD, "/otp/lib", &st, 0) reported "/otp/lib"
+    // as a regular file and the JIT loader's list_dir gave up.
+    if !path_ptr.is_null() && unsafe { *path_ptr } != 0 {
+        return sys_stat(path_ptr, buf);
+    }
+    sys_fstat(dirfd, buf)
 }
 
 fn sys_getrandom(buf: *mut u8, len: usize) -> i64 {

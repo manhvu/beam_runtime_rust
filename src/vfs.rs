@@ -329,21 +329,53 @@ pub fn is_dir_prefix(path: &[u8]) -> bool {
     false
 }
 
-/// Register a directory fd for a given path.
-pub fn open_dir(fd: i32, path: &[u8]) {
-    // SAFETY: serialized through syscall handler
+/// Allocate a directory fd for a path that matched `is_dir_prefix`.
+/// Returns the fd on success, -EMFILE if all DIR_SLOTS are in use.
+///
+/// The fd number is derived from the slot index (`DIR_FD_BASE + idx`) so
+/// closing a slot makes its fd immediately reusable — previously this
+/// took a caller-allocated fd from a monotonic counter that never
+/// decremented, and DIR_SLOTS itself never freed entries, so after at
+/// most MAX_DIRS opendir/closedir cycles the loader was wedged.
+pub fn open_dir(path: &[u8]) -> i64 {
     let slots = unsafe { &mut DIR_SLOTS };
-    for slot in slots.iter_mut() {
+    for (i, slot) in slots.iter_mut().enumerate() {
         if slot.fd == -1 {
+            let fd = DIR_FD_BASE + i as i32;
             slot.fd = fd;
             let p = if path.starts_with(b"/") { &path[1..] } else { path };
             let len = p.len().min(127);
             slot.prefix[..len].copy_from_slice(&p[..len]);
             slot.prefix_len = len;
             slot.done = false;
-            return;
+            return fd as i64;
         }
     }
+    -24 // -EMFILE
+}
+
+/// Reserved fd range for VFS directory handles: 900..900+MAX_DIRS.
+/// Stays under the 1000 floor used by `NEXT_VFS_FD` for file fds.
+pub const DIR_FD_BASE: i32 = 900;
+
+/// Free a dir fd's slot. Returns true if the fd was a known dir handle.
+pub fn close_dir(fd: i32) -> bool {
+    let slots = unsafe { &mut DIR_SLOTS };
+    for slot in slots.iter_mut() {
+        if slot.fd == fd {
+            slot.fd = -1;
+            slot.prefix_len = 0;
+            slot.done = false;
+            return true;
+        }
+    }
+    false
+}
+
+/// Is this fd a live VFS directory handle?
+pub fn is_dir_fd(fd: i32) -> bool {
+    let slots = unsafe { &DIR_SLOTS };
+    slots.iter().any(|s| s.fd == fd)
 }
 
 /// Return directory entries for a directory fd.
