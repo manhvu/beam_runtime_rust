@@ -51,7 +51,7 @@ pub fn init_with_transport(transport: PciTransport) {
     use crate::serial_println;
     use virtio_drivers::device::net::VirtIONet;
 
-    const QUEUE_SIZE: usize = 16;
+    const QUEUE_SIZE: usize = 64;
     const BUF_LEN: usize = 2048;
 
     let net = VirtIONet::<TynHal, _, QUEUE_SIZE>::new(transport, BUF_LEN)

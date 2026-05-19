@@ -11,7 +11,7 @@ use smoltcp::time::Instant;
 use virtio_drivers::device::net::VirtIONet;
 use virtio_drivers::transport::Transport;
 
-const QUEUE_SIZE: usize = 16;
+const QUEUE_SIZE: usize = 64;
 
 /// smoltcp device backed by a VirtIONet driver.
 pub struct VirtioNetDevice<T: Transport> {
