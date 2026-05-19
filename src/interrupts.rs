@@ -102,8 +102,17 @@ extern "x86-interrupt" fn timer_handler(mut frame: InterruptStackFrame) {
     crate::sched::watchdog_wake();
 
     const KERNEL_BASE: u64 = 0x0F00_0000;
+    // JIT/mmap region: BeamAsm emits native code into mmap'd pages, which
+    // live above the static ELF segments (MMAP_NEXT base = 0x1A00_0000).
+    // Treat those addresses as user code too — without this, timer ticks
+    // that land inside JIT'd functions only set NEED_RESCHED and never
+    // run the preemption trampoline, so a hot JIT loop can starve the
+    // scheduler entirely.
+    const MMAP_BASE: u64 = 0x1A00_0000;
+    const MMAP_END: u64 = 0xA000_0000;
     let ip = frame.instruction_pointer.as_u64();
-    if ip < KERNEL_BASE {
+    let is_user = ip < KERNEL_BASE || (ip >= MMAP_BASE && ip < MMAP_END);
+    if is_user {
         // User-mode code interrupted. Push the original RIP onto the user
         // stack and redirect IRET to a trampoline that does sched_yield.
         // The trampoline does `syscall(sched_yield); ret` — the ret pops
