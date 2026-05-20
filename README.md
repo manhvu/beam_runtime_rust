@@ -78,8 +78,10 @@ A TCP eval shell ships alongside the Phoenix demo. Connect from the host and pok
 
 ```
 $ nc localhost 5567
-Tyn eval shell - OTP 27, ERTS 15.2.7
+Tyn eval shell - OTP 27, ERTS 15.2.7.1
 Expressions end in '.'   Disconnect to exit.
+>> erlang:system_info(emu_flavor).
+jit
 >> erlang:system_info(process_count).
 351
 >> 'Elixir.System':version().
@@ -99,15 +101,16 @@ Expressions end in '.'   Disconnect to exit.
 
 Where things stand on KVM (host: AWS Xeon 6975P-C):
 
-- **Image size:** 49 MB bootable image — ~4× smaller than Alpine + Elixir + Phoenix (~190 MB)
-- **Cold boot to serving HTTP:** ~7 s on KVM (kernel → BEAM handoff in ~430 ms; rest is OTP startup)
-- **Cold-boot reliability:** ~92 % across 64-trial sweeps. Each trial routes a curl request through Phoenix.Router + Bandit + Plug. Up from a long-standing ~83 % baseline after two protocol-safety fixes: (1) the timer-context watchdog no longer mutates thread state directly — it now sets per-thread atomic rescue flags that `process_rescues()` drains from non-interrupt scheduler points under the same lock order as `futex_wake`; and (2) `sys_clone` now writes `CLONE_PARENT_SETTID` / `CLONE_CHILD_SETTID` pointers and `home_cpu` BEFORE queueing the child, closing a window where the child could run on another CPU and observe a stale TID slot. The remaining ~8 % cluster at the start of a fresh test loop and look like cold-cache timing variance rather than a single deterministic race
-- **Sustained load:** **1000/1000 sequential HTTP requests** to the Phoenix demo in a single boot, no failures. Earlier runs walled around request ~200 due to socket fds wrapping past 1000 and silently getting routed to the VFS read path (the `is_vfs_fd` heuristic was `fd >= 1000`, colliding with the monotonic socket-fd allocator). Fixed by routing reads via the real `OPEN_FILES` table and recycling socket fds within the 500+ range so they never approach the `FD_SETSIZE` (1024) bitmap limit
+- **Image size:** 52 MB bootable image (BeamAsm-enabled ERTS) — ~4× smaller than Alpine + Elixir + Phoenix (~190 MB)
+- **Cold boot to serving HTTP:** ~5 s on KVM with BeamAsm (kernel → BEAM handoff in ~430 ms; the rest is OTP startup plus JIT code-generation for boot modules)
+- **Cold-boot reliability with BeamAsm:** **60/64 = 93.75 %** across a fresh 64-trial sweep on the JIT binary, matching the long-standing non-JIT result. The 4 stalls don't recur in the same place: 3 cluster around the same cold-cache `error_logger.beam` load that affects the interpreter, and 1 was a transient BeamAsm "corrupt literal table" rejection of `lists.beam` — likely a load-time race surfaced by the JIT's stricter validator. No `#GP`/`#PF` faults
+- **Sustained throughput:** **1000 sequential HTTP requests at 14.1 req/s** through Phoenix.Router + Bandit + Plug, ~997/1000 OK. Identical rate JIT vs interpreter — the workload is network-bound (TCP handshake + smoltcp poll + virtio-net per request dominates a microsecond-scale handler), so BeamAsm doesn't surface here. A CPU-bound workload (JSON/template rendering, computation) is the natural next benchmark to show JIT throughput gains
 - **Runtime memory:** ~400 MB host RSS — ~6× an Alpine container due to ERTS allocator pool defaults (demand paging landed; allocator tuning is next)
 
 ### What works
 
 - **8-way SMP** — ACPI/MADT CPU discovery, APIC timer calibration, AP trampoline (16→64 bit), per-CPU GDT/TSS/IST, GS_BASE per-CPU syscall data, IPI wakeup, preemptive user-mode scheduling
+- **BeamAsm JIT** — OTP 27.3.4.2 with `--enable-jit`. The timer trampoline preempts inside mmap'd JIT pages (`0x1A00_0000`+), and the host-side stat/dir syscalls (`newfstatat`, `S_IFDIR` on dir fds, recycled `DIR_SLOTS`) handle the glibc-style validation the BeamAsm loader does. `erlang:system_info(emu_flavor)` returns `jit`
 - **TCP networking** — `gen_tcp:listen/accept/send/close` end-to-end, POSIX socket layer → smoltcp TCP/IP → virtio-net PCI → QEMU → host
 - **Live eval shell** — `nc` into a running BEAM and evaluate Erlang or Elixir expressions; bindings persist per session, multi-line input is buffered until the parser accepts it (`src/erl/tcp_shell.erl`)
 - **Elixir** — Elixir 1.18.3 .beam files load and execute on OTP 27
@@ -119,7 +122,7 @@ Where things stand on KVM (host: AWS Xeon 6975P-C):
 
 ### ERTS build configuration
 
-ERTS is built from unmodified OTP 27 source — no patches, no special defines. The only non-default configure flags are `--disable-jit` and `--without-*` for unused applications.
+ERTS is built from unmodified OTP 27 source — no patches, no special defines. The build enables BeamAsm and `--without-*` opts out of unused applications.
 
 Tyn uses a hybrid futex strategy:
 
@@ -130,9 +133,9 @@ The switch happens automatically after ERTS finishes loading boot modules. Norma
 
 ### What's next
 
-- **Boot reliability** — down from ~17 % to ~8 % after the watchdog / clone-TID protocol fixes; remaining variance looks like cold-cache timing, not a deterministic race
+- **CPU-bound throughput benchmark** — the current 14 req/s number is network-bound at this microsecond-scale handler. A handler that actually does work (JSON encode/decode, template render, computation) is needed to surface the BeamAsm speedup
+- **Boot reliability** — JIT now matches the interpreter at ~94 %; remaining ~6 % cluster in code-loader paths (cold-cache `error_logger`, occasional BeamAsm "corrupt literal table" rejection of `lists.beam`)
 - **Concurrent-burst load** — sequential 1000/1000 is solid; N≥5 concurrent curls cap at ~2 successful regardless of kernel-side mitigations (verified by exhaustive instrumentation: listener pool, smoltcp, accept logic, ERTS/Bandit all process what arrives). The bottleneck is host-side packet drops at the QEMU TAP / bridge forwarding layer under burst — environmental tuning territory, not kernel work. Realistic concurrent benchmarks need a separate-machine driver instead of host-loopback
-- **BEAM JIT** — BeamAsm support (requires IST-safe preemption for clone child stacks)
 - **Full IEx** — the current eval shell handles single expressions per session; line editing, history, and the real IEx group leader still need stdin I/O server work
 
 ## Building & Running
@@ -182,8 +185,8 @@ Tyn embeds a statically-linked ERTS binary and a cpio archive of .beam files dir
 git clone --branch OTP-27.3.4.2 https://github.com/erlang/otp.git otp27
 cd otp27
 
-# Configure for static musl (no JIT, minimal dependencies)
-./configure --disable-jit --without-javac --without-odbc --without-wx \
+# Configure for static musl + BeamAsm
+./configure --enable-jit --without-javac --without-odbc --without-wx \
   --without-termcap --without-ssl --without-ssh --without-megaco \
   --without-diameter --without-observer --without-debugger \
   --without-et --without-reltool --without-common-test --without-eunit \
@@ -194,9 +197,10 @@ cd otp27
 # Build
 make -j$(nproc)
 
-# The static beam.smp binary:
-ls bin/x86_64-pc-linux-musl/beam.smp
-# → ~9 MB statically linked ELF
+# The static BeamAsm binary (strip before embedding to fit the layout):
+strip bin/x86_64-pc-linux-musl/beam.jit -o beam.smp.elf
+ls -lh beam.smp.elf
+# → ~10 MB statically linked ELF
 ```
 
 ### Package the VFS (cpio archive)
@@ -221,8 +225,8 @@ cp otp27/lib/stdlib-*/ebin/*.beam staging/
 cd staging
 find . -type f | sed 's|^\./||' | cpio -o -H newc > ../src/otp-rootfs.cpio
 
-# Copy the ERTS binary
-cp otp27/bin/x86_64-pc-linux-musl/beam.smp ../src/beam.smp.elf
+# Copy the (stripped) BeamAsm ERTS binary
+strip otp27/bin/x86_64-pc-linux-musl/beam.jit -o ../src/beam.smp.elf
 ```
 
 ### Elixir support (optional)
