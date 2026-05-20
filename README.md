@@ -70,7 +70,7 @@ end
 ```
 
 ```
-$ curl http://localhost:5566/
+$ curl http://localhost:5566/hello
 Hello from Phoenix on Tyn!
 ```
 
@@ -104,7 +104,17 @@ Where things stand on KVM (host: AWS Xeon 6975P-C):
 - **Image size:** 52 MB bootable image (BeamAsm-enabled ERTS) — ~4× smaller than Alpine + Elixir + Phoenix (~190 MB)
 - **Cold boot to serving HTTP:** ~5 s on KVM with BeamAsm (kernel → BEAM handoff in ~430 ms; the rest is OTP startup plus JIT code-generation for boot modules)
 - **Cold-boot reliability with BeamAsm:** **60/64 = 93.75 %** across a fresh 64-trial sweep on the JIT binary, matching the long-standing non-JIT result. The 4 stalls don't recur in the same place: 3 cluster around the same cold-cache `error_logger.beam` load that affects the interpreter, and 1 was a transient BeamAsm "corrupt literal table" rejection of `lists.beam` — likely a load-time race surfaced by the JIT's stricter validator. No `#GP`/`#PF` faults
-- **Sustained throughput:** **1000 sequential HTTP requests at 14.1 req/s** through Phoenix.Router + Bandit + Plug, ~997/1000 OK. Identical rate JIT vs interpreter — the workload is network-bound (TCP handshake + smoltcp poll + virtio-net per request dominates a microsecond-scale handler), so BeamAsm doesn't surface here. A CPU-bound workload (JSON/template rendering, computation) is the natural next benchmark to show JIT throughput gains
+- **Sustained throughput:** **1000 sequential HTTP requests at 14.1 req/s** through Phoenix.Router + Bandit + Plug, ~997/1000 OK. Identical rate JIT vs interpreter on the trivial handler — the workload is network-bound. A second `bench_plug` exposes `/hello`, `/json`, `/compute`, `/fib` and lets us measure where compute starts to dominate
+- **Compute throughput (200 sequential HTTP, Bandit + Erlang bench_plug):**
+
+  | endpoint | interpreter req/s | JIT (BeamAsm) req/s | JIT / interp |
+  | --- | --- | --- | --- |
+  | `/hello`   | 13.18 | 8.16 | 0.62× |
+  | `/json`    | 19.80 | 2.83 | **0.14×** |
+  | `/compute` | 4.91  | 3.74 | 0.76× |
+  | `/fib`     | 11.78 | 2.64 | **0.22×** |
+
+  *The interpreter is currently faster at the HTTP layer*, and the slowdown is **not** in BEAM execution — pure-compute `timer:tc` over the TCP shell shows JIT 1.2× faster on `fib(28)`, 1.3× on the foldl sum, and 4.7× on a tight list-comp, matching the expected BeamAsm direction. The HTTP regression therefore lives in the per-request lifecycle around BEAM (process spawn / allocator / response path), where something is dramatically more expensive under JIT. Investigating that is the next perf task
 - **Runtime memory:** ~400 MB host RSS — ~6× an Alpine container due to ERTS allocator pool defaults (demand paging landed; allocator tuning is next)
 
 ### What works
@@ -133,7 +143,7 @@ The switch happens automatically after ERTS finishes loading boot modules. Norma
 
 ### What's next
 
-- **CPU-bound throughput benchmark** — the current 14 req/s number is network-bound at this microsecond-scale handler. A handler that actually does work (JSON encode/decode, template render, computation) is needed to surface the BeamAsm speedup
+- **JIT HTTP regression** — `timer:tc` confirms JIT is faster at raw BEAM compute (1.2–4.7× on fib/foldl/list-comp), but the same handlers behind Bandit are 1.3–7× *slower* than the interpreter. The cost is in the per-request lifecycle (process spawn / allocator / Plug response path), not in BEAM execution itself
 - **Boot reliability** — JIT now matches the interpreter at ~94 %; remaining ~6 % cluster in code-loader paths (cold-cache `error_logger`, occasional BeamAsm "corrupt literal table" rejection of `lists.beam`)
 - **Concurrent-burst load** — sequential 1000/1000 is solid; N≥5 concurrent curls cap at ~2 successful regardless of kernel-side mitigations (verified by exhaustive instrumentation: listener pool, smoltcp, accept logic, ERTS/Bandit all process what arrives). The bottleneck is host-side packet drops at the QEMU TAP / bridge forwarding layer under burst — environmental tuning territory, not kernel work. Realistic concurrent benchmarks need a separate-machine driver instead of host-loopback
 - **Full IEx** — the current eval shell handles single expressions per session; line editing, history, and the real IEx group leader still need stdin I/O server work
