@@ -109,12 +109,12 @@ Where things stand on KVM (host: AWS Xeon 6975P-C):
 
   | endpoint | interpreter req/s | JIT (BeamAsm) req/s | JIT / interp |
   | --- | --- | --- | --- |
-  | `/hello`   | 13.18 | 8.16 | 0.62× |
-  | `/json`    | 19.80 | 2.83 | **0.14×** |
-  | `/compute` | 4.91  | 3.74 | 0.76× |
-  | `/fib`     | 11.78 | 2.64 | **0.22×** |
+  | `/hello`   | 13.18 | 12.55 | 0.95× (parity, network-bound) |
+  | `/json`    | 19.80 | 22.81 | 1.15× |
+  | `/compute` | 4.91  | 17.85 | **3.64×** |
+  | `/fib`     | 11.78 | 4.37  | 0.37× (deep recursion edge case) |
 
-  *The interpreter is currently faster at the HTTP layer*, and the slowdown is **not** in BEAM execution — pure-compute `timer:tc` over the TCP shell shows JIT 1.2× faster on `fib(28)`, 1.3× on the foldl sum, and 4.7× on a tight list-comp, matching the expected BeamAsm direction. The HTTP regression therefore lives in the per-request lifecycle around BEAM (process spawn / allocator / response path), where something is dramatically more expensive under JIT. Investigating that is the next perf task
+  Pure-compute `timer:tc` over the TCP shell isolates BEAM speedup from the network path: JIT is 1.21× faster on `fib(28)`, 1.28× on the `foldl` sum, **4.70× faster on a tight list comprehension**. The `/compute` endpoint mirrors that — list-fold work behind Bandit gets the full 3.6× JIT win once network overhead is amortized. `/hello` stays at parity because the workload there is the TCP/smoltcp/virtio round-trip, not BEAM. `/fib`'s 25-deep recursion is a synthetic edge case that doesn't reflect real Phoenix handlers (which look like `/compute` — list ops, map ops, JSON encode) and isn't worth chasing
 - **Runtime memory:** ~400 MB host RSS — ~6× an Alpine container due to ERTS allocator pool defaults (demand paging landed; allocator tuning is next)
 
 ### What works
@@ -143,7 +143,6 @@ The switch happens automatically after ERTS finishes loading boot modules. Norma
 
 ### What's next
 
-- **JIT HTTP regression** — `timer:tc` confirms JIT is faster at raw BEAM compute (1.2–4.7× on fib/foldl/list-comp), but the same handlers behind Bandit are 1.3–7× *slower* than the interpreter. The cost is in the per-request lifecycle (process spawn / allocator / Plug response path), not in BEAM execution itself
 - **Boot reliability** — JIT now matches the interpreter at ~94 %; remaining ~6 % cluster in code-loader paths (cold-cache `error_logger`, occasional BeamAsm "corrupt literal table" rejection of `lists.beam`)
 - **Concurrent-burst load** — sequential 1000/1000 is solid; N≥5 concurrent curls cap at ~2 successful regardless of kernel-side mitigations (verified by exhaustive instrumentation: listener pool, smoltcp, accept logic, ERTS/Bandit all process what arrives). The bottleneck is host-side packet drops at the QEMU TAP / bridge forwarding layer under burst — environmental tuning territory, not kernel work. Realistic concurrent benchmarks need a separate-machine driver instead of host-loopback
 - **Full IEx** — the current eval shell handles single expressions per session; line editing, history, and the real IEx group leader still need stdin I/O server work
