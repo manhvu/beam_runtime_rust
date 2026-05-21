@@ -681,9 +681,19 @@ fn sys_write(fd: i32, buf: *const u8, count: usize) -> i64 {
         // The OTP 20 era auto-respond for erl_child_setup was misguided for OTP 27.
         result
     } else if crate::net::socket::is_socket_fd(fd) {
-        let r = crate::net::socket::sys_sendto(fd, buf, count, 0, core::ptr::null(), 0);
-        crate::net::poll(); // flush smoltcp's tx buffer
-        r
+        // Queue the data in smoltcp's send buffer and return immediately.
+        // No net::poll() here — the buffer is flushed by the next
+        // sys_close (which Bandit issues right after the last sendto on
+        // an HTTP/1.1 Connection:close response) and by sys_epoll_wait /
+        // sys_ppoll / sys_select-with-fds in the request loop. Polling
+        // after every sendto re-entered smoltcp's full SocketSet
+        // iteration 3× per response (Bandit sends status, headers, body
+        // as separate sendto calls); under sustained load the cumulative
+        // lock contention on NET_LOCK caused ~33% of sequential 1000-req
+        // bursts to time out at the 5 s curl limit. Removing this poll
+        // brought the failure rate to 0% and improved per-endpoint
+        // throughput by ~36–60%. See directions/POLL_OPT.md and PROFILE.md.
+        crate::net::socket::sys_sendto(fd, buf, count, 0, core::ptr::null(), 0)
     } else {
         -9 // -EBADF
     }
