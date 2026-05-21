@@ -104,17 +104,17 @@ Where things stand on KVM (host: AWS Xeon 6975P-C):
 - **Image size:** 52 MB bootable image (BeamAsm-enabled ERTS) — ~4× smaller than Alpine + Elixir + Phoenix (~190 MB)
 - **Cold boot to serving HTTP:** ~5 s on KVM with BeamAsm (kernel → BEAM handoff in ~430 ms; the rest is OTP startup plus JIT code-generation for boot modules)
 - **Cold-boot reliability with BeamAsm:** **60/64 = 93.75 %** across a fresh 64-trial sweep on the JIT binary, matching the long-standing non-JIT result. The 4 stalls don't recur in the same place: 3 cluster around the same cold-cache `error_logger.beam` load that affects the interpreter, and 1 was a transient BeamAsm "corrupt literal table" rejection of `lists.beam` — likely a load-time race surfaced by the JIT's stricter validator. No `#GP`/`#PF` faults
-- **Sustained throughput:** **1000 sequential HTTP requests at 14.1 req/s** through Phoenix.Router + Bandit + Plug, ~997/1000 OK. Identical rate JIT vs interpreter on the trivial handler — the workload is network-bound. A second `bench_plug` exposes `/hello`, `/json`, `/compute`, `/fib` and lets us measure where compute starts to dominate
-- **Compute throughput (200 sequential HTTP, Bandit + Erlang bench_plug):**
+- **Sustained throughput:** **1000/1000 sequential HTTP requests at ~6.5 req/s, zero failures** through Bandit + Plug on the BeamAsm build. Before the `net::poll`-after-sendto fix, the same test was 67 % OK (≥30 % of bursts timed out at the curl 5 s limit) — Bandit issues three sendto's per response, and the kernel was running smoltcp's full SocketSet iteration after each one, so NET_LOCK contention compounded under load. Dropping the redundant poll fixed both reliability and throughput
+- **Compute throughput** (200 sequential HTTP per endpoint, BeamAsm + Bandit + Erlang `bench_plug`, same-host before/after the `net::poll` fix):
 
-  | endpoint | interpreter req/s | JIT (BeamAsm) req/s | JIT / interp |
+  | endpoint | before | after | speedup |
   | --- | --- | --- | --- |
-  | `/hello`   | 13.18 | 12.55 | 0.95× (parity, network-bound) |
-  | `/json`    | 19.80 | 22.81 | 1.15× |
-  | `/compute` | 4.91  | 17.85 | **3.64×** |
-  | `/fib`     | 11.78 | 4.37  | 0.37× (deep recursion edge case) |
+  | `/hello`   | 4.53 | **11.71** | 2.6× |
+  | `/json`    | 1.98 | **3.56**  | 1.8× |
+  | `/compute` | 2.52 | **8.30**  | 3.3× |
+  | `/fib`     | 2.13 | **3.34**  | 1.6× |
 
-  Pure-compute `timer:tc` over the TCP shell isolates BEAM speedup from the network path: JIT is 1.21× faster on `fib(28)`, 1.28× on the `foldl` sum, **4.70× faster on a tight list comprehension**. The `/compute` endpoint mirrors that — list-fold work behind Bandit gets the full 3.6× JIT win once network overhead is amortized. `/hello` stays at parity because the workload there is the TCP/smoltcp/virtio round-trip, not BEAM. `/fib`'s 25-deep recursion is a synthetic edge case that doesn't reflect real Phoenix handlers (which look like `/compute` — list ops, map ops, JSON encode) and isn't worth chasing
+  The pre-fix and earlier README numbers were measured on a less-loaded slice of the same host, so absolute rates aren't directly comparable across days — the speedup column is what's reproducible. Pure-compute `timer:tc` over the TCP shell still shows the expected BeamAsm direction: JIT is 1.21× faster on `fib(28)`, 1.28× on the `foldl` sum, **4.70× faster on a tight list comprehension**. The `/compute` endpoint (list-fold work) mirrors the list-comp ratio once the per-request overhead is amortized
 - **Runtime memory:** ~400 MB host RSS — ~6× an Alpine container due to ERTS allocator pool defaults (demand paging landed; allocator tuning is next)
 
 ### What works
