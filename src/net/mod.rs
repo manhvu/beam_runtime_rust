@@ -1,7 +1,9 @@
 //! Network stack — virtio-net device wrapper, smoltcp interface, socket layer.
 
 pub mod device;
+pub mod ena;
 pub mod interface;
+pub mod pci_io;
 pub mod socket;
 pub mod tcp_echo;
 

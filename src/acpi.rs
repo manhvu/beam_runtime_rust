@@ -30,6 +30,12 @@ pub struct AcpiInfo {
     pub num_cpus: usize,
     pub ioapic: Option<IoApicInfo>,
     pub local_apic_addr: u32,
+    /// PCIe ECAM (Enhanced Configuration Access Mechanism) base from
+    /// the MCFG table, segment 0. Falls back to QEMU q35's default
+    /// (`0xB000_0000`) when MCFG is missing.
+    pub pci_ecam_base: u64,
+    pub pci_start_bus: u8,
+    pub pci_end_bus: u8,
 }
 
 /// RSDP signature: "RSD PTR " (8 bytes)
@@ -88,6 +94,83 @@ fn find_madt(rsdt_addr: u32) -> Option<u64> {
     None
 }
 
+/// Walk the RSDT looking for the MCFG table; return the first PCI
+/// segment's ECAM base address.
+///
+/// MCFG layout:
+///   header (36 bytes, standard ACPI)
+///   reserved (8 bytes)
+///   then one or more 16-byte allocation entries:
+///     u64 base_address
+///     u16 pci_segment_group
+///     u8  start_bus
+///     u8  end_bus
+///     u32 reserved
+/// Walk a system descriptor table (RSDT or XSDT) looking for a table
+/// whose signature matches `target`. Returns its physical address.
+///
+/// `entry_size` is 4 for RSDT (32-bit entry pointers) or 8 for XSDT
+/// (64-bit entry pointers). Both share the standard 36-byte ACPI
+/// header layout (signature/length/revision/checksum/oemid/...)
+/// before the entry list.
+fn find_table_in_sdt(sdt_addr: u64, expected_root_sig: &[u8; 4], target: &[u8; 4], entry_size: usize) -> Option<u64> {
+    let sdt = sdt_addr as *const u8;
+    // SAFETY: identity-mapped physical memory.
+    unsafe {
+        if core::slice::from_raw_parts(sdt, 4) != expected_root_sig { return None; }
+        let length = *(sdt.add(4) as *const u32) as usize;
+        let entries_start = 36;
+        if length <= entries_start { return None; }
+        let num_entries = (length - entries_start) / entry_size;
+        for i in 0..num_entries {
+            let entry_off = entries_start + i * entry_size;
+            let entry_addr: u64 = if entry_size == 4 {
+                (*(sdt.add(entry_off) as *const u32)) as u64
+            } else {
+                *(sdt.add(entry_off) as *const u64)
+            };
+            let table = entry_addr as *const u8;
+            let sig = core::slice::from_raw_parts(table, 4);
+            if sig == target { return Some(entry_addr); }
+        }
+    }
+    None
+}
+
+/// Returns `(ecam_base, start_bus, end_bus)` for the first PCI segment
+/// described in MCFG. Tries RSDT first, then (on ACPI 2.0+) XSDT.
+///
+/// On AWS Nitro the RSDP is revision 0 and MCFG isn't published at all;
+/// callers should fall back to port-IO PCI config (see
+/// `net::pci_io::PortIoCam`) in that case.
+fn find_mcfg(rsdp_addr: u64) -> Option<(u64, u8, u8)> {
+    // SAFETY: RSDP is at an identity-mapped BIOS address.
+    let mcfg_addr = unsafe {
+        let revision = *((rsdp_addr + 15) as *const u8);
+        let rsdt_addr = *((rsdp_addr + 16) as *const u32) as u64;
+        let from_rsdt = find_table_in_sdt(rsdt_addr, b"RSDT", b"MCFG", 4);
+        let from_xsdt = if revision >= 2 {
+            let xsdt_addr = *((rsdp_addr + 24) as *const u64);
+            find_table_in_sdt(xsdt_addr, b"XSDT", b"MCFG", 8)
+        } else {
+            None
+        };
+        from_rsdt.or(from_xsdt)?
+    };
+    // First allocation entry sits at offset 44 (36-byte header + 8-byte reserved):
+    //   u64 base_address (offset 44)
+    //   u16 segment_group (offset 52)
+    //   u8  start_bus    (offset 54)
+    //   u8  end_bus      (offset 55)
+    //   u32 reserved     (offset 56)
+    unsafe {
+        let base = *((mcfg_addr + 44) as *const u64);
+        let start_bus = *((mcfg_addr + 54) as *const u8);
+        let end_bus = *((mcfg_addr + 55) as *const u8);
+        Some((base, start_bus, end_bus))
+    }
+}
+
 /// Parse the MADT (Multiple APIC Description Table) to discover CPUs.
 fn parse_madt(madt_addr: u64) -> AcpiInfo {
     let mut info = AcpiInfo {
@@ -95,6 +178,9 @@ fn parse_madt(madt_addr: u64) -> AcpiInfo {
         num_cpus: 0,
         ioapic: None,
         local_apic_addr: 0xFEE0_0000, // default
+        pci_ecam_base: 0xB000_0000,   // QEMU q35 default; overridden by MCFG if present
+        pci_start_bus: 0,
+        pci_end_bus: 255,
     };
 
     let madt = madt_addr as *const u8;
@@ -162,7 +248,19 @@ pub fn discover_cpus() -> Option<AcpiInfo> {
     let madt_addr = find_madt(rsdt_addr)?;
     serial_println!("[acpi] MADT at {:#x}", madt_addr);
 
-    let info = parse_madt(madt_addr);
+    let mut info = parse_madt(madt_addr);
+
+    // MCFG describes the PCIe ECAM base. Walk RSDT and (on ACPI 2.0+)
+    // XSDT — Nitro firmware only publishes MCFG via XSDT.
+    if let Some((base, start_bus, end_bus)) = find_mcfg(rsdp_addr) {
+        serial_println!("[acpi] MCFG ECAM base {:#x} buses {:02x}-{:02x}",
+            base, start_bus, end_bus);
+        info.pci_ecam_base = base;
+        info.pci_start_bus = start_bus;
+        info.pci_end_bus = end_bus;
+    } else {
+        serial_println!("[acpi] no MCFG, using default ECAM base {:#x}", info.pci_ecam_base);
+    }
     serial_println!("[acpi] {} CPUs found, Local APIC at {:#x}",
         info.num_cpus, info.local_apic_addr);
     for i in 0..info.num_cpus {

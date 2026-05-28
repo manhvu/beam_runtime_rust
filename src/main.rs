@@ -7,12 +7,9 @@ mod boot;
 
 use core::panic::PanicInfo;
 use tyn_kernel::serial_println;
-use virtio_drivers::transport::pci::bus::{Cam, Command, MmioCam, PciRoot};
+use virtio_drivers::transport::pci::bus::{Command, PciRoot};
 use virtio_drivers::transport::pci::{PciTransport, virtio_device_type};
 use virtio_drivers::transport::{DeviceType, Transport};
-
-/// ECAM PCI config base for q35 (from QEMU's seabios dev-q35.h).
-const MMCONFIG_BASE: usize = 0xB000_0000;
 
 #[unsafe(no_mangle)]
 extern "C" fn main(_mbi: *const u8) -> ! {
@@ -54,7 +51,9 @@ extern "C" fn main(_mbi: *const u8) -> ! {
         x86_64::instructions::interrupts::enable();
     }
 
-    // Initialize virtio-net via PCI enumeration
+    // Initialize NIC via PCI enumeration (virtio-net on QEMU, ENA on Nitro).
+    // Use port-IO CF8/CFC for config access (portable across QEMU q35
+    // and AWS Nitro). MCFG-discovery isn't required for Phase 1.
     init_networking();
 
     // Initialize in-memory VFS (cpio archive with OTP files)
@@ -321,24 +320,66 @@ extern "C" fn main(_mbi: *const u8) -> ! {
     tyn_kernel::syscall::jump_to_user(info.entry, sp);
 }
 
-/// Enumerate PCI bus and initialize virtio-net if found.
+/// Enumerate PCI bus and initialize a NIC if found.
+/// Prefers virtio-net (used on QEMU). Falls back to logging an ENA
+/// device when running on AWS Nitro — Phase 1 of ENA support only
+/// probes and reads version registers (see directions/ENA_DRIVER.md
+/// for the full plan); Phase 2 wires it into smoltcp.
 fn init_networking() {
-    let mmconfig_base = MMCONFIG_BASE as *mut u8;
-    // SAFETY: mmconfig_base is the ECAM MMIO region at 0xB0000000,
-    // identity-mapped in our page tables.
-    let mut root = PciRoot::new(unsafe { MmioCam::new(mmconfig_base, Cam::Ecam) });
+    use virtio_drivers::transport::pci::bus::BarInfo;
 
-    for (dev_fn, info) in root.enumerate_bus(0) {
-        if let Some(vtype) = virtio_device_type(&info) {
+    serial_println!("[pci] using port-IO config (CF8/CFC)");
+    let mut root = PciRoot::new(tyn_kernel::net::pci_io::PortIoCam::new());
+
+    // Walk all 256 PCI buses. Port-IO returns 0xFFFFFFFF for unmapped
+    // slots (the standard sentinel), so we only see real devices —
+    // no ghost devices from reading past an ECAM window.
+    let mut devices: alloc::vec::Vec<_> = alloc::vec::Vec::new();
+    let mut total = 0usize;
+    let mut ghost = 0usize;
+    for bus in 0u8..=255u8 {
+        for (dev_fn, info) in root.enumerate_bus(bus) {
+            total += 1;
+            // Filter unmapped slots: 0xFFFF is the PCI standard, 0x0000
+            // is what Nitro returns. Anything else we keep.
+            if info.vendor_id == 0x0000 || info.vendor_id == 0xFFFF {
+                continue;
+            }
+            // Real PCI devices we drive (virtio or ENA) live on bus 0
+            // on every platform we target. Treat anything past bus 0
+            // with an unrecognized vendor as a ghost from the bus-range
+            // extending past the actual ECAM, and drop it silently to
+            // keep the serial log readable on AWS Nitro.
+            let recognised = virtio_device_type(&info).is_some()
+                || tyn_kernel::net::ena::is_ena(info.vendor_id, info.device_id);
+            if dev_fn.bus > 0 && !recognised {
+                ghost += 1;
+                continue;
+            }
+            devices.push((dev_fn, info));
+        }
+        if bus == 255 { break; }
+    }
+    serial_println!("[pci] scanned {} function slots, {} ghost, {} usable",
+        total, ghost, devices.len());
+    for (dev_fn, info) in &devices {
+        serial_println!("[pci]   {:02x}:{:02x}.{} {:04x}:{:04x} class={:02x}.{:02x}",
+            dev_fn.bus, dev_fn.device, dev_fn.function,
+            info.vendor_id, info.device_id, info.class, info.subclass);
+    }
+
+    // First pass: virtio-net (QEMU / KVM dev path).
+    for (dev_fn, info) in &devices {
+        if let Some(vtype) = virtio_device_type(info) {
             serial_println!("[pci] {}:{}.{} VirtIO {:?}",
                 dev_fn.bus, dev_fn.device, dev_fn.function, vtype);
             root.set_command(
-                dev_fn,
+                *dev_fn,
                 Command::IO_SPACE | Command::MEMORY_SPACE | Command::BUS_MASTER,
             );
 
             let transport =
-                PciTransport::new::<tyn_kernel::drivers::virtio::hal::TynHal, _>(&mut root, dev_fn)
+                PciTransport::new::<tyn_kernel::drivers::virtio::hal::TynHal, _>(&mut root, *dev_fn)
                     .expect("PciTransport::new failed");
 
             if transport.device_type() == DeviceType::Network {
@@ -348,7 +389,35 @@ fn init_networking() {
         }
     }
 
-    serial_println!("[net] no virtio-net device found, networking disabled");
+    // Second pass: AWS ENA (Nitro). Identified by vendor 0x1d0f.
+    for (dev_fn, info) in &devices {
+        if !tyn_kernel::net::ena::is_ena(info.vendor_id, info.device_id) {
+            continue;
+        }
+        serial_println!(
+            "[pci] {}:{}.{} ENA {:04x}:{:04x}",
+            dev_fn.bus, dev_fn.device, dev_fn.function, info.vendor_id, info.device_id);
+        root.set_command(
+            *dev_fn,
+            Command::MEMORY_SPACE | Command::BUS_MASTER,
+        );
+        let bars = root.bars(*dev_fn).expect("ENA bars()");
+        let bar0 = match bars[0] {
+            Some(BarInfo::Memory { address, .. }) => address,
+            _ => {
+                serial_println!("[ena] BAR0 is not a memory BAR; skipping");
+                continue;
+            }
+        };
+        tyn_kernel::net::ena::probe(
+            bar0,
+            info.device_id,
+            (dev_fn.bus, dev_fn.device, dev_fn.function));
+        // Phase 1: no smoltcp integration yet, so do NOT return —
+        // continue and report "no usable NIC" below.
+    }
+
+    serial_println!("[net] no usable NIC found (virtio-net or fully-wired ENA), networking disabled");
 }
 
 #[panic_handler]
