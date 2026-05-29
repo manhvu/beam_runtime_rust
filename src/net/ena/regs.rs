@@ -38,11 +38,11 @@ pub const DEV_STS_RESET_IN_PROGRESS: u32 = 1 << 2;
 pub const DEV_STS_RESET_FINISHED:    u32 = 1 << 3;
 pub const DEV_STS_FATAL_ERROR:       u32 = 1 << 4;
 
-// CAPS bit layout.
-//   bits  0..5    : Contains reset timeout, in units of 100ms
-//   bits  8..15   : MMIO read timeout, in units of 100ms
-//   bits 16..23   : DMA addr width (in bits)
-//   bits 24..31   : admin completion buffer size (in 64-byte units)
+// CAPS bit layout (from ena_regs_defs.h).
+//   bit   0       : contiguous queue required
+//   bits  1..5    : reset timeout, in units of 100ms (SHIFT 1, MASK 0x3e)
+//   bits  8..15   : DMA addr width, in bits (MASK 0xff00)
+//   bits 16..19   : admin command timeout (MASK 0xf0000)
 pub fn caps_reset_timeout_ms(caps: u32) -> u32 {
-    ((caps >> 0) & 0x3f) * 100
+    ((caps >> 1) & 0x1f) * 100
 }
