@@ -5,6 +5,7 @@
 //! No data path here yet — Phase 2 lands TX/RX queues and the smoltcp
 //! Device trait. See directions/ENA_DRIVER.md for the full plan.
 
+pub mod admin;
 pub mod regs;
 
 use crate::serial_println;
@@ -53,7 +54,34 @@ pub fn probe(bar0_addr: u64, device_id: u16, location: (u8, u8, u8)) {
             (dev_sts & regs::DEV_STS_FATAL_ERROR) != 0);
     }
 
-    // Phase 1 next step (not in this commit): reset, admin queue init,
-    // GET_FEATURE(DEVICE_ATTRIBUTES) to read the MAC address.
-    serial_println!("[ena] Phase 1 probe complete (no data path yet)");
+    serial_println!("[ena] Phase 1 probe complete");
+}
+
+/// Phase 2 milestone A: bring up the admin queue and read device attributes
+/// (MAC, max MTU). Returns `true` on success. No data path yet — I/O queues
+/// and the smoltcp Device trait land in the next milestone.
+pub fn init(bar0_addr: u64) -> bool {
+    let mut aq = match admin::AdminQueue::init(bar0_addr) {
+        Ok(aq) => aq,
+        Err(e) => {
+            serial_println!("[ena] admin queue init failed: {}", e);
+            return false;
+        }
+    };
+
+    match aq.get_device_attributes() {
+        Ok(attrs) => {
+            serial_println!(
+                "[ena] dev attrs: mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} max_mtu={} phys_addr_width={} features={:#010x}",
+                attrs.mac[0], attrs.mac[1], attrs.mac[2],
+                attrs.mac[3], attrs.mac[4], attrs.mac[5],
+                attrs.max_mtu, attrs.phys_addr_width, attrs.supported_features);
+            serial_println!("[ena] Phase 2A complete: admin queue operational (no data path yet)");
+            true
+        }
+        Err(e) => {
+            serial_println!("[ena] get_device_attributes failed: {}", e);
+            false
+        }
+    }
 }

@@ -1,16 +1,21 @@
 //! ENA BAR0 register offsets and bit definitions.
 //!
-//! Mirrors `ena_regs_defs.h` from amzn-drivers
-//! (https://github.com/amzn/amzn-drivers/tree/master/kernel/linux/ena).
+//! Ported verbatim from `ena_regs_defs.h` in amzn-drivers
+//! (kernel/linux/common/ena_com/ena_regs_defs.h). The Phase 1 version of
+//! this file had CAPS..AQ_CAPS shifted +4 bytes; admin-queue setup writes
+//! land on the wrong registers if these offsets are off by even one word,
+//! so they are reproduced here exactly.
+
+use core::ptr::{read_volatile, write_volatile};
 
 // Register offsets (from start of BAR0).
 pub const VERSION:            u64 = 0x00;
 pub const CONTROLLER_VERSION: u64 = 0x04;
-pub const CAPS:               u64 = 0x0c;
-pub const CAPS_EXT:           u64 = 0x10;
-pub const AQ_BASE_LO:         u64 = 0x14;
-pub const AQ_BASE_HI:         u64 = 0x18;
-pub const AQ_CAPS:            u64 = 0x1c;
+pub const CAPS:               u64 = 0x08;
+pub const CAPS_EXT:           u64 = 0x0c;
+pub const AQ_BASE_LO:         u64 = 0x10;
+pub const AQ_BASE_HI:         u64 = 0x14;
+pub const AQ_CAPS:            u64 = 0x18;
 pub const ACQ_BASE_LO:        u64 = 0x20;
 pub const ACQ_BASE_HI:        u64 = 0x24;
 pub const ACQ_CAPS:           u64 = 0x28;
@@ -33,10 +38,13 @@ pub const DEV_CTL_DEV_RESET: u32 = 1 << 0;
 
 // DEV_STS bits.
 pub const DEV_STS_READY:             u32 = 1 << 0;
-pub const DEV_STS_AQ_RESTART_REQ:    u32 = 1 << 1;
-pub const DEV_STS_RESET_IN_PROGRESS: u32 = 1 << 2;
-pub const DEV_STS_RESET_FINISHED:    u32 = 1 << 3;
-pub const DEV_STS_FATAL_ERROR:       u32 = 1 << 4;
+pub const DEV_STS_RESET_IN_PROGRESS: u32 = 1 << 3;
+pub const DEV_STS_RESET_FINISHED:    u32 = 1 << 4;
+pub const DEV_STS_FATAL_ERROR:       u32 = 1 << 5;
+
+// AQ_CAPS / ACQ_CAPS field layout: depth in low 16 bits, entry size << 16.
+pub const AQ_CAPS_DEPTH_MASK:      u32 = 0xffff;
+pub const AQ_CAPS_ENTRY_SIZE_SHIFT: u32 = 16;
 
 // CAPS bit layout (from ena_regs_defs.h).
 //   bit   0       : contiguous queue required
@@ -45,4 +53,16 @@ pub const DEV_STS_FATAL_ERROR:       u32 = 1 << 4;
 //   bits 16..19   : admin command timeout (MASK 0xf0000)
 pub fn caps_reset_timeout_ms(caps: u32) -> u32 {
     ((caps >> 1) & 0x1f) * 100
+}
+
+/// Read a u32 from a BAR0 register. SAFETY: `bar0` is identity-mapped MMIO.
+#[inline]
+pub unsafe fn read32(bar0: u64, off: u64) -> u32 {
+    unsafe { read_volatile((bar0 + off) as *const u32) }
+}
+
+/// Write a u32 to a BAR0 register. SAFETY: `bar0` is identity-mapped MMIO.
+#[inline]
+pub unsafe fn write32(bar0: u64, off: u64, val: u32) {
+    unsafe { write_volatile((bar0 + off) as *mut u32, val) }
 }
