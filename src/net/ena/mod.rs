@@ -6,6 +6,7 @@
 //! Device trait. See directions/ENA_DRIVER.md for the full plan.
 
 pub mod admin;
+pub mod device;
 pub mod regs;
 
 use crate::serial_println;
@@ -69,18 +70,28 @@ pub fn init(bar0_addr: u64) -> bool {
         }
     };
 
-    match aq.get_device_attributes() {
-        Ok(attrs) => {
-            serial_println!(
-                "[ena] dev attrs: mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} max_mtu={} phys_addr_width={} features={:#010x}",
-                attrs.mac[0], attrs.mac[1], attrs.mac[2],
-                attrs.mac[3], attrs.mac[4], attrs.mac[5],
-                attrs.max_mtu, attrs.phys_addr_width, attrs.supported_features);
-            serial_println!("[ena] Phase 2A complete: admin queue operational (no data path yet)");
+    let attrs = match aq.get_device_attributes() {
+        Ok(attrs) => attrs,
+        Err(e) => {
+            serial_println!("[ena] get_device_attributes failed: {}", e);
+            return false;
+        }
+    };
+    serial_println!(
+        "[ena] dev attrs: mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} max_mtu={} phys_addr_width={} features={:#010x}",
+        attrs.mac[0], attrs.mac[1], attrs.mac[2],
+        attrs.mac[3], attrs.mac[4], attrs.mac[5],
+        attrs.max_mtu, attrs.phys_addr_width, attrs.supported_features);
+
+    // Phase 2B: bring up I/O queues and hand the device to the smoltcp
+    // network stack (which runs DHCP to obtain the VPC address).
+    match device::EnaDevice::new(&mut aq, bar0_addr, attrs.mac) {
+        Ok(dev) => {
+            crate::net::init_with_ena(dev);
             true
         }
         Err(e) => {
-            serial_println!("[ena] get_device_attributes failed: {}", e);
+            serial_println!("[ena] I/O queue setup failed: {}", e);
             false
         }
     }

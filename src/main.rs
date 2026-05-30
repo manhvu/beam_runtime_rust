@@ -413,10 +413,11 @@ fn init_networking() {
             bar0,
             info.device_id,
             (dev_fn.bus, dev_fn.device, dev_fn.function));
-        // Phase 2A: bring up the admin queue and read device attributes.
-        // No smoltcp data path yet, so do NOT return — continue and report
-        // "no usable NIC" below regardless of the admin-queue result.
-        tyn_kernel::net::ena::init(bar0);
+        // Phase 2B: admin queue + I/O queues + smoltcp (DHCP). On success the
+        // global NetState is initialized and networking is live.
+        if tyn_kernel::net::ena::init(bar0) {
+            return;
+        }
     }
 
     serial_println!("[net] no usable NIC found (virtio-net or fully-wired ENA), networking disabled");

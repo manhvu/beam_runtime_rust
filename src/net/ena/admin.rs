@@ -28,9 +28,17 @@ const AENQ_DEPTH: u16 = 16;
 const AENQ_ENTRY_SIZE: usize = 64;
 
 // Admin opcodes (ena_admin_aq_opcode).
+const OP_CREATE_SQ: u8 = 1;
+const OP_CREATE_CQ: u8 = 3;
 const OP_GET_FEATURE: u8 = 8;
 // Feature ids (ena_admin_aq_feature_id).
 const FEAT_DEVICE_ATTRIBUTES: u8 = 1;
+
+// SQ direction (ena_admin_sq_direction), placed in sq_identity bits 7:5.
+pub const SQ_DIR_TX: u8 = 1;
+pub const SQ_DIR_RX: u8 = 2;
+// Placement policy (ena_admin_placement_policy_type): host memory.
+const PLACEMENT_HOST: u8 = 1;
 
 // aq/acq common-desc phase bit (bit 0 of the flags byte).
 const PHASE_MASK: u8 = 0x1;
@@ -217,4 +225,51 @@ impl AdminQueue {
             max_mtu: rd32(40),
         })
     }
+
+    /// CREATE_CQ for an I/O completion queue. `entry_size_bytes` is the cdesc
+    /// size (8 for TX, 16 for RX); the device wants it in 32-bit words.
+    /// Returns the device-assigned CQ index. Interrupt mode is left off
+    /// (cq_caps_1=0) so the CQ operates in polling mode.
+    pub fn create_io_cq(&mut self, depth: u16, cq_phys: u64, entry_size_bytes: u8) -> Result<u16, &'static str> {
+        let mut cmd = [0u8; ADMIN_ENTRY_SIZE];
+        cmd[2] = OP_CREATE_CQ;
+        // cq_caps_1 [4] = 0 (polling); cq_caps_2 [5] = entry size in words.
+        cmd[5] = (entry_size_bytes / 4) & 0x1f;
+        cmd[6..8].copy_from_slice(&depth.to_le_bytes()); // cq_depth
+        // msix_vector [8..12] = 0 (unused in polling mode).
+        cmd[12..16].copy_from_slice(&(cq_phys as u32).to_le_bytes()); // cq_ba low
+        cmd[16..18].copy_from_slice(&((cq_phys >> 32) as u16).to_le_bytes()); // cq_ba high
+
+        let resp = self.submit_and_poll(cmd)?;
+        // ena_admin_acq_create_cq_resp_desc: cq_idx at byte 8.
+        Ok(u16::from_le_bytes([resp[8], resp[9]]))
+    }
+
+    /// CREATE_SQ for an I/O submission queue (host placement, physically
+    /// contiguous, completion-per-descriptor). Returns
+    /// `(sq_idx, sq_doorbell_offset)` — the doorbell offset is relative to
+    /// BAR0 and is where the SQ tail is written to notify the device.
+    pub fn create_io_sq(&mut self, direction: u8, depth: u16, sq_phys: u64, cq_idx: u16) -> Result<(u16, u32), &'static str> {
+        let mut cmd = [0u8; ADMIN_ENTRY_SIZE];
+        cmd[2] = OP_CREATE_SQ;
+        cmd[4] = direction << 5; // sq_identity: sq_direction bits 7:5
+        cmd[6] = PLACEMENT_HOST & 0x0f; // sq_caps_2: placement_policy bits 3:0, completion_policy DESC=0
+        cmd[7] = 0x01; // sq_caps_3: is_physically_contiguous bit 0
+        cmd[8..10].copy_from_slice(&cq_idx.to_le_bytes());
+        cmd[10..12].copy_from_slice(&depth.to_le_bytes()); // sq_depth
+        cmd[12..16].copy_from_slice(&(sq_phys as u32).to_le_bytes()); // sq_ba low
+        cmd[16..18].copy_from_slice(&((sq_phys >> 32) as u16).to_le_bytes()); // sq_ba high
+
+        let resp = self.submit_and_poll(cmd)?;
+        // ena_admin_acq_create_sq_resp_desc: sq_idx at 8, sq_doorbell_offset at 12.
+        let sq_idx = u16::from_le_bytes([resp[8], resp[9]]);
+        let db_off = u32::from_le_bytes([resp[12], resp[13], resp[14], resp[15]]);
+        Ok((sq_idx, db_off))
+    }
+}
+
+/// Allocate `bytes` of page-aligned, zeroed DMA memory (identity-mapped,
+/// vaddr == paddr). Exposed for the data-path module's queue rings/buffers.
+pub fn dma_alloc(bytes: usize) -> u64 {
+    dma_alloc_zeroed(bytes)
 }
