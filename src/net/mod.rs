@@ -183,36 +183,65 @@ pub fn init_with_ena(dev: EnaDevice) {
     let dhcp_handle = sockets.add(dhcpv4::Socket::new());
 
     serial_println!("[net] ENA up, starting DHCP...");
+    // A single 20s attempt was fragile: a slow/dropped first DISCOVER (ARP
+    // resolution, DHCP-server load) left Phoenix listening on an unconfigured
+    // interface (~1/32 boots). Retry up to 5 times with exponential backoff,
+    // resetting the socket to force a fresh DISCOVER each attempt.
+    const MAX_DHCP_ATTEMPTS: u32 = 5;
+    const ATTEMPT_TIMEOUT_MS: u64 = 10_000;
     let mut configured = false;
-    loop {
-        let elapsed = now_ms(start_tsc);
-        let now = Instant::from_millis(elapsed as i64);
-        iface.poll(now, &mut device, &mut sockets);
 
-        match sockets.get_mut::<dhcpv4::Socket>(dhcp_handle).poll() {
-            Some(dhcpv4::Event::Configured(config)) => {
-                serial_println!(
-                    "[net] DHCP configured: ip={} router={:?}",
-                    config.address, config.router);
-                iface.update_ip_addrs(|addrs| {
-                    addrs.clear();
-                    let _ = addrs.push(IpCidr::Ipv4(config.address));
-                });
-                if let Some(router) = config.router {
-                    let _ = iface.routes_mut().add_default_ipv4_route(router);
+    'attempts: for attempt in 1..=MAX_DHCP_ATTEMPTS {
+        let attempt_start = now_ms(start_tsc);
+        loop {
+            let now = Instant::from_millis(now_ms(start_tsc) as i64);
+            iface.poll(now, &mut device, &mut sockets);
+
+            match sockets.get_mut::<dhcpv4::Socket>(dhcp_handle).poll() {
+                Some(dhcpv4::Event::Configured(config)) => {
+                    serial_println!(
+                        "[net] DHCP configured on attempt {}: ip={} router={:?}",
+                        attempt, config.address, config.router);
+                    iface.update_ip_addrs(|addrs| {
+                        addrs.clear();
+                        let _ = addrs.push(IpCidr::Ipv4(config.address));
+                    });
+                    if let Some(router) = config.router {
+                        let _ = iface.routes_mut().add_default_ipv4_route(router);
+                    }
+                    configured = true;
+                    break 'attempts;
                 }
-                configured = true;
-                break;
+                Some(dhcpv4::Event::Deconfigured) => {}
+                None => {}
             }
-            Some(dhcpv4::Event::Deconfigured) => {}
-            None => {}
+
+            if now_ms(start_tsc).wrapping_sub(attempt_start) > ATTEMPT_TIMEOUT_MS {
+                break; // this attempt timed out
+            }
+            core::hint::spin_loop();
         }
 
-        if elapsed > 20_000 {
-            serial_println!("[net] DHCP timed out after 20s — networking not configured");
-            break;
+        if attempt < MAX_DHCP_ATTEMPTS {
+            serial_println!("[net] DHCP attempt {}/{} timed out, retrying...", attempt, MAX_DHCP_ATTEMPTS);
+            // Force a fresh DISCOVER on the next attempt.
+            sockets.get_mut::<dhcpv4::Socket>(dhcp_handle).reset();
+            // Exponential backoff (0.5s, 1s, 2s, 4s), still polling the
+            // interface so RX/ARP and the new DISCOVER keep flowing.
+            let backoff_ms = 500u64 << (attempt - 1).min(3);
+            let backoff_start = now_ms(start_tsc);
+            while now_ms(start_tsc).wrapping_sub(backoff_start) < backoff_ms {
+                let now = Instant::from_millis(now_ms(start_tsc) as i64);
+                iface.poll(now, &mut device, &mut sockets);
+                core::hint::spin_loop();
+            }
         }
-        core::hint::spin_loop();
+    }
+
+    if !configured {
+        serial_println!(
+            "[net] DHCP failed after {} attempts — networking not configured",
+            MAX_DHCP_ATTEMPTS);
     }
 
     // Drop the DHCP socket; the app uses its own sockets.
