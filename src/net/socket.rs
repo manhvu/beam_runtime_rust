@@ -19,7 +19,12 @@ use crate::serial_println;
 /// Base fd for socket allocations (avoids collision with VFS fds at 1000+
 /// and pipe fds at 200+).
 const SOCK_FD_BASE: i32 = 500;
-const MAX_SOCKETS: usize = 32;
+/// Advisory ceiling on total smoltcp sockets (listeners + live streams).
+/// Not enforced — the `SocketSet` and fd table grow on demand — but kept as
+/// documentation of the budget: 2 listening ports × LISTENER_POOL_SIZE (64)
+/// = 128 idle listeners, leaving headroom for live connections.
+#[allow(dead_code)]
+const MAX_SOCKETS: usize = 256;
 
 /// Size of the smoltcp listener pool pre-bound to a port at `sys_listen`
 /// time. smoltcp's `tcp::Socket` only holds one connection at a time; with
@@ -29,15 +34,18 @@ const MAX_SOCKETS: usize = 32;
 /// available listener — and `sys_accept` adds a fresh replacement listener
 /// every time it consumes an established connection, so the pool stays full.
 ///
-/// 8 is enough to absorb realistic bursts; ThousandIsland's 100-acceptor
-/// default oversubscribes the pool but only N concurrent in-flight SYNs can
-/// land before any acceptor consumes one.
+/// Sized to the concurrency the clean-hardware (Nitro) sweep exposed: at
+/// pool size 8 the stack RST'd every connection past ~8 simultaneous SYNs
+/// (200/200 at N=5, but only ~8/200 at N≥25). 64 simultaneous in-flight
+/// SYNs now each land on a free listener; ThousandIsland's acceptors refill
+/// the pool as they consume connections. (This was masked on QEMU because
+/// the SLIRP host bridge dropped the excess SYNs before they reached us.)
 ///
 /// The `backlog` argument to `listen(2)` is intentionally ignored: it sets
 /// the queue depth in real kernels, not the number of pre-bound sockets,
 /// and BEAM passes values like 1024 that would exhaust the kernel heap if
 /// taken literally as a socket count.
-const LISTENER_POOL_SIZE: usize = 8;
+const LISTENER_POOL_SIZE: usize = 64;
 
 /// Socket type
 #[derive(Clone, Copy, PartialEq)]
@@ -284,8 +292,8 @@ pub fn sys_listen(fd: i32, _backlog: i32) -> i64 {
             // listeners only need to absorb a SYN/SYN-ACK plus the initial
             // HTTP request (≤ a few hundred bytes) before sys_accept hands
             // the socket off to user space; sys_accept also installs the
-            // replacement listener at 2 KiB. 8 listeners × 4 KiB = 32 KiB,
-            // small enough not to fragment a busy 4 MiB heap.
+            // replacement listener at 2 KiB. 64 listeners × 4 KiB = 256 KiB
+            // per listening port, small enough not to fragment the heap.
             sock.backlog.clear();
             for _ in 1..LISTENER_POOL_SIZE {
                 let h = install_fresh_listener(net, endpoint);
