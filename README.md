@@ -81,7 +81,7 @@ end
 ```
 
 ```
-$ curl http://localhost:5566/hello
+$ curl http://localhost:5555/hello
 Hello from Phoenix on Tyn!
 ```
 
@@ -193,13 +193,22 @@ qemu-system-x86_64 \
   -netdev user,id=net0,hostfwd=tcp::5555-:8080,hostfwd=tcp::5567-:9090
 ```
 
-### Test the Bandit demo from host
+### Test the demo from host
 
 ```bash
 # In another terminal while QEMU is running, after Tyn prints
-# "bandit_listening" on the serial console (~12s after boot):
-curl http://localhost:5555/
-# → Hello from Bandit on Tyn!
+# "phoenix_listening" and "shell_listening 9090" on the serial console:
+curl http://localhost:5555/hello
+# → Hello from Phoenix on Tyn!
+
+# Other bench_plug endpoints:
+curl http://localhost:5555/json      # live BEAM stats (procs, mem, emu_flavor)
+curl http://localhost:5555/compute   # integer fold
+curl http://localhost:5555/fib       # fib(25)
+# (any other path, including "/", returns 404 "not found")
+
+# Live eval shell:
+nc localhost 5567
 ```
 
 ## Building ERTS + VFS
