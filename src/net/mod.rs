@@ -8,9 +8,11 @@ pub mod pci_io;
 pub mod socket;
 pub mod tcp_echo;
 
-use smoltcp::iface::{Interface, SocketSet};
+use smoltcp::iface::{Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, RxToken, TxToken};
+use smoltcp::socket::dhcpv4;
 use smoltcp::time::Instant;
+use smoltcp::wire::IpCidr;
 use virtio_drivers::transport::pci::PciTransport;
 
 use crate::net::device::{VirtioNetDevice, VirtioRxToken, VirtioTxToken};
@@ -105,6 +107,10 @@ pub struct NetState {
     pub iface: Interface,
     pub device: NetDevice,
     start_tsc: u64,
+    /// DHCP client handle (ENA/Nitro only; `None` on virtio/static-IP). Kept
+    /// in the SocketSet so smoltcp sends RENEW at T1 / REBIND at T2; `poll()`
+    /// applies any address change.
+    dhcp_handle: Option<SocketHandle>,
 }
 
 impl NetState {
@@ -113,6 +119,28 @@ impl NetState {
         self.device.drain_tx();
         let now = self.now();
         self.iface.poll(now, &mut self.device, &mut self.sockets);
+        // DHCP lease renewal: smoltcp issues RENEW/REBIND on its own timers as
+        // long as the socket is polled. Apply a re-config if the lease (or IP)
+        // changes. On AWS the IP is stable across renewals, so this normally
+        // just refreshes the lease and keeps the instance reachable past it.
+        if let Some(h) = self.dhcp_handle {
+            match self.sockets.get_mut::<dhcpv4::Socket>(h).poll() {
+                Some(dhcpv4::Event::Configured(config)) => {
+                    serial_println!("[net] DHCP renewed: ip={}", config.address);
+                    self.iface.update_ip_addrs(|addrs| {
+                        addrs.clear();
+                        let _ = addrs.push(IpCidr::Ipv4(config.address));
+                    });
+                    if let Some(router) = config.router {
+                        let _ = self.iface.routes_mut().add_default_ipv4_route(router);
+                    }
+                }
+                Some(dhcpv4::Event::Deconfigured) => {
+                    serial_println!("[net] DHCP lease lost");
+                }
+                None => {}
+            }
+        }
         socket::gc_closed_handles(self);
     }
 
@@ -134,7 +162,7 @@ static NET_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 /// Initialize networking with a virtio-net PCI transport (QEMU dev path).
 pub fn init_with_transport(transport: PciTransport) {
     use crate::drivers::virtio::hal::TynHal;
-    use smoltcp::wire::{IpAddress, IpCidr};
+    use smoltcp::wire::IpAddress;
     use virtio_drivers::device::net::VirtIONet;
 
     const QUEUE_SIZE: usize = 64;
@@ -161,7 +189,13 @@ pub fn init_with_transport(transport: PciTransport) {
     let sockets = SocketSet::new(alloc::vec::Vec::new());
     let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
     unsafe {
-        NET_STATE = Some(NetState { sockets, iface, device, start_tsc });
+        NET_STATE = Some(NetState {
+            sockets,
+            iface,
+            device,
+            start_tsc,
+            dhcp_handle: None,
+        });
     }
     serial_println!("[net] initialized (virtio), IP={}", interface::KERNEL_IP);
 }
@@ -171,9 +205,6 @@ pub fn init_with_transport(transport: PciTransport) {
 /// DHCP exchange also exercises the RX path (the OFFER/ACK are unicast to
 /// our MAC).
 pub fn init_with_ena(dev: EnaDevice) {
-    use smoltcp::socket::dhcpv4;
-    use smoltcp::wire::IpCidr;
-
     let mac = dev.mac_address();
     let mut device = NetDevice::Ena(dev);
     let mut iface = interface::build(&mut device, mac);
@@ -244,14 +275,19 @@ pub fn init_with_ena(dev: EnaDevice) {
             MAX_DHCP_ATTEMPTS);
     }
 
-    // Drop the DHCP socket; the app uses its own sockets.
-    sockets.remove(dhcp_handle);
-
+    // Keep the DHCP socket in the SocketSet so smoltcp renews the lease
+    // (RENEW at T1, REBIND at T2); NetState::poll applies any address change.
     unsafe {
-        NET_STATE = Some(NetState { sockets, iface, device, start_tsc });
+        NET_STATE = Some(NetState {
+            sockets,
+            iface,
+            device,
+            start_tsc,
+            dhcp_handle: Some(dhcp_handle),
+        });
     }
     if configured {
-        serial_println!("[net] initialized (ENA) via DHCP");
+        serial_println!("[net] initialized (ENA) via DHCP (lease renewal active)");
     }
 }
 
