@@ -198,18 +198,66 @@ qemu-system-x86_64 \
 ```bash
 # In another terminal while QEMU is running, after Tyn prints
 # "phoenix_listening" and "shell_listening 9090" on the serial console:
-curl http://localhost:5555/hello
-# → Hello from Phoenix on Tyn!
-
-# Other bench_plug endpoints:
+curl http://localhost:5555/          # endpoint list (landing page)
+curl http://localhost:5555/health    # → {"status":"ok"}  (for load balancers)
+curl http://localhost:5555/hello     # → Hello from Phoenix on Tyn!
 curl http://localhost:5555/json      # live BEAM stats (procs, mem, emu_flavor)
-curl http://localhost:5555/compute   # integer fold
-curl http://localhost:5555/fib       # fib(25)
-# (any other path, including "/", returns 404 "not found")
+curl http://localhost:5555/compute   # integer fold benchmark
+curl http://localhost:5555/fib       # fib(25) benchmark
 
 # Live eval shell:
 nc localhost 5567
 ```
+
+## AWS Deployment
+
+Tyn runs on real AWS Nitro EC2 — a from-scratch ENA driver brings up the NIC,
+DHCP assigns the VPC address, and Phoenix serves HTTP through it.
+
+### Prerequisites
+
+- AWS account with EC2 access; AWS CLI configured (or an instance role)
+- The `vmimport` IAM service role (one-time — see [AWS docs](https://docs.aws.amazon.com/vm-import/latest/userguide/required-permissions.html))
+- An S3 bucket `tyn-images-<account-id>` for the import source
+
+### One-command deploy
+
+From the repo root on a build host with the toolchain:
+
+```bash
+./deploy-ami.sh
+# INSTANCE_TYPE=c5.xlarge AWS_REGION=eu-west-1 ./deploy-ami.sh   # overrides
+```
+
+It builds the kernel, makes a BIOS disk image, uploads to S3, imports an EBS
+snapshot, registers a `legacy-bios --ena-support` AMI, and launches an
+instance (~12 min total). It prints the instance ID, public IP, the curl
+commands, and the cleanup commands.
+
+```
+=== Tyn deployed ===
+Instance:  i-0abc123...
+Public IP: 54.x.x.x
+
+Wait ~15s for boot + DHCP, then:
+  curl http://54.x.x.x:8080/health   # {"status":"ok"}
+  curl http://54.x.x.x:8080/hello    # Hello from Phoenix on Tyn!
+```
+
+### Measured on Nitro (c5.large)
+
+- **4,175 req/s** at 25-way concurrency, 100% reliable (`/hello`, BeamAsm JIT)
+- 100% success through 50 concurrent connections
+- ~97% cold-boot-to-serving reliability across 32-trial sweeps
+
+### Notes
+
+- `/health` returns `{"status":"ok"}` for ALB/Target-Group/ASG health checks.
+- Tyn runs on any Nitro instance type (c5/m5/r5/t3, …); the ENA driver
+  auto-detects the NIC. For production, restrict the security-group source
+  CIDR and terminate HTTPS at an ALB.
+- The AMI + snapshot persist (< $0.10/month). Terminate instances when done —
+  they accrue hourly charges.
 
 ## Building ERTS + VFS
 
