@@ -18,6 +18,9 @@ init(Opts) -> Opts.
 call(Conn, _Opts) ->
     Path = maps:get(request_path, Conn),
     case Path of
+        <<"/">>        -> handle_root(Conn);
+        <<"/health">>  -> respond(Conn, 200, <<"application/json">>,
+                                  <<"{\"status\":\"ok\"}">>);
         <<"/hello">>   -> respond(Conn, 200, <<"text/plain">>,
                                   <<"Hello from Phoenix on Tyn!\n">>);
         <<"/json">>    -> handle_json(Conn);
@@ -25,6 +28,17 @@ call(Conn, _Opts) ->
         <<"/fib">>     -> handle_fib(Conn);
         _              -> respond(Conn, 404, <<"text/plain">>, <<"not found\n">>)
     end.
+
+handle_root(Conn) ->
+    Body = <<"Tyn - BEAM on bare metal\n\n"
+             "Endpoints:\n"
+             "  /          - this page\n"
+             "  /health    - health check (200, for load balancers)\n"
+             "  /hello     - hello world\n"
+             "  /json      - live BEAM stats\n"
+             "  /compute   - integer fold benchmark\n"
+             "  /fib       - fib(25) benchmark\n">>,
+    respond(Conn, 200, <<"text/plain">>, Body).
 
 handle_json(Conn) ->
     Data = #{
