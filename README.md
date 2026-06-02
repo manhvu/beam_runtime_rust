@@ -6,7 +6,7 @@ No Linux. No POSIX. Just your Erlang/Elixir/Gleam code on bare metal.
 
 ## What is Tyn?
 
-Tyn is a unikernel — a single-purpose operating system kernel that hosts one thing: the BEAM virtual machine. It replaces the entire Linux stack with ~7,000 lines of Rust, and runs on both KVM/QEMU and **real AWS Nitro EC2** — where it drives the network with a from-scratch ENA NIC driver and serves production HTTP traffic.
+Tyn is a unikernel — a single-purpose operating system kernel that hosts one thing: the BEAM virtual machine. It replaces the entire Linux stack with ~8,000 lines of Rust, and runs on both KVM/QEMU and **real AWS Nitro EC2** — where it drives the network with a from-scratch ENA NIC driver and serves production HTTP traffic.
 
 The BEAM already has its own process model, scheduler, memory management, and distribution protocol. A general-purpose OS kernel underneath duplicates much of what the BEAM provides natively. Tyn explores what happens when you remove that redundancy and give BEAM a purpose-built host.
 
@@ -33,7 +33,7 @@ The BEAM already has its own process model, scheduler, memory management, and di
 │  BEAM Host Interface (Rust)             │
 │  ~50 Linux syscalls emulated            │
 ├─────────────────────────────────────────┤
-│  Tyn Kernel (Rust, ~7,000 LOC)          │
+│  Tyn Kernel (Rust, ~8,000 LOC)          │
 │  SMP · Memory · Networking · VFS · I/O  │
 ├─────────────────────────────────────────┤
 │  KVM / QEMU / Cloud Hypervisor          │
@@ -44,7 +44,7 @@ Tyn runs the real, unmodified ERTS/BEAM — not a reimplementation. When OTP shi
 
 ## Status
 
-**OTP 27 BEAM running on bare metal with SMP, TCP, **Phoenix + Bandit + Plug**, and Elixir — on QEMU and on real AWS Nitro.**
+**OTP 27 BEAM running on bare metal with SMP, TCP, Phoenix + Bandit + Plug, and Elixir — on QEMU and on real AWS Nitro.**
 
 ### Running on AWS Nitro
 
@@ -55,7 +55,7 @@ Tyn boots on a stock **c5.large EC2 instance**, brings up the **Elastic Network 
 - **Phoenix + Bandit + BeamAsm JIT serving 4,175 req/s** at **25 concurrent connections, 100% reliable** (2000/2000 requests)
 - **~45 MB image** (ERTS + OTP/Elixir rootfs), **boots to serving HTTP in ~5 s**
 
-The full path is `ENA hardware → admin queue → I/O queues → smoltcp → DHCP → gen_tcp → Bandit → Phoenix`, entirely inside the ~7,000-line Rust kernel. No Linux, no host networking — the kernel talks to the NIC's descriptor rings directly.
+The full path is `ENA hardware → admin queue → I/O queues → smoltcp → DHCP → gen_tcp → Bandit → Phoenix`, entirely inside the ~8,000-line Rust kernel. No Linux, no host networking — the kernel talks to the NIC's descriptor rings directly.
 
 ```elixir
 defmodule TynHelloWeb.HelloController do
@@ -112,7 +112,7 @@ jit
 
 Where things stand on KVM (host: AWS Xeon 6975P-C):
 
-- **Image size:** 52 MB bootable image (BeamAsm-enabled ERTS) — ~4× smaller than Alpine + Elixir + Phoenix (~190 MB)
+- **Image size:** ~45 MB (ERTS + OTP/Elixir rootfs + kernel; ~52 MB as built with `debug = true` — strip for the smaller figure) — ~4× smaller than Alpine + Elixir + Phoenix (~190 MB)
 - **Cold boot to serving HTTP:** ~5 s on KVM with BeamAsm (kernel → BEAM handoff in ~430 ms; the rest is OTP startup plus JIT code-generation for boot modules)
 - **Cold-boot reliability with BeamAsm:** **60/64 = 93.75 %** across a fresh 64-trial sweep on the JIT binary, matching the long-standing non-JIT result. The 4 stalls don't recur in the same place: 3 cluster around the same cold-cache `error_logger.beam` load that affects the interpreter, and 1 was a transient BeamAsm "corrupt literal table" rejection of `lists.beam` — likely a load-time race surfaced by the JIT's stricter validator. No `#GP`/`#PF` faults
 - **Sustained throughput:** **1000/1000 sequential HTTP requests at ~6.5 req/s, zero failures** through Bandit + Plug on the BeamAsm build. Before the `net::poll`-after-sendto fix, the same test was 67 % OK (≥30 % of bursts timed out at the curl 5 s limit) — Bandit issues three sendto's per response, and the kernel was running smoltcp's full SocketSet iteration after each one, so NET_LOCK contention compounded under load. Dropping the redundant poll fixed both reliability and throughput
@@ -139,7 +139,7 @@ Where things stand on **AWS Nitro** (c5.large, real ENA NIC, measured from a sep
 
 - **8-way SMP** — ACPI/MADT CPU discovery, APIC timer calibration, AP trampoline (16→64 bit), per-CPU GDT/TSS/IST, GS_BASE per-CPU syscall data, IPI wakeup, preemptive user-mode scheduling
 - **BeamAsm JIT** — OTP 27.3.4.2 with `--enable-jit`. The timer trampoline preempts inside mmap'd JIT pages (`0x1A00_0000`+), and the host-side stat/dir syscalls (`newfstatat`, `S_IFDIR` on dir fds, recycled `DIR_SLOTS`) handle the glibc-style validation the BeamAsm loader does. `erlang:system_info(emu_flavor)` returns `jit`
-- **TCP networking** — `gen_tcp:listen/accept/send/close` end-to-end, POSIX socket layer → smoltcp TCP/IP → **virtio-net (QEMU) or a from-scratch ENA driver (AWS Nitro)**. On Nitro the address is obtained via **DHCP**; the ENA driver does PCI discovery, admin-queue init, I/O-queue creation, and RX/TX descriptor rings directly
+- **TCP networking** — `gen_tcp:listen/accept/send/close` end-to-end, POSIX socket layer → smoltcp TCP/IP → **virtio-net (QEMU) or a from-scratch ENA driver (AWS Nitro)**. On Nitro the address is obtained via **DHCP** (with lease renewal for long-lived instances); the ENA driver does PCI discovery, admin-queue init, I/O-queue creation, and RX/TX descriptor rings directly
 - **AWS Nitro deployment** — boots from a GRUB/multiboot disk image imported as an EBS snapshot; ENA NIC (`1d0f:ec20`) detected via port-IO PCI config, since Nitro publishes no MCFG/ECAM
 - **Live eval shell** — `nc` into a running BEAM and evaluate Erlang or Elixir expressions; bindings persist per session, multi-line input is buffered until the parser accepts it (`src/erl/tcp_shell.erl`)
 - **Elixir** — Elixir 1.18.3 .beam files load and execute on OTP 27
@@ -147,7 +147,7 @@ Where things stand on **AWS Nitro** (c5.large, real ENA NIC, measured from a sep
 - **VFS** — cpio newc archive with OTP kernel/stdlib .beam files + optional Elixir
 - **Boot** — Multiboot1, identity-mapped 4 GiB, ELF loader for static musl binaries
 - **Threading** — up to 16 CPUs, per-thread kernel stacks, atomic futex, preemptive + deferred scheduling
-- **I/O** — COM1 serial (stdin/stdout/stderr), PCI ECAM, virtio-net
+- **I/O** — COM1 serial (stdin/stdout/stderr), PCI config (ECAM on QEMU, port-IO on Nitro), virtio-net + ENA NIC drivers
 
 ### ERTS build configuration
 
@@ -162,7 +162,7 @@ The switch happens automatically after ERTS finishes loading boot modules. Norma
 
 ### What's next
 
-- **Boot reliability** — JIT now matches the interpreter at ~94 %; remaining ~6 % cluster in code-loader paths (cold-cache `error_logger`, occasional BeamAsm "corrupt literal table" rejection of `lists.beam`)
+- **Boot reliability** — ~97 % boot-to-serving on Nitro (62/64 across two 32-trial sweeps), in line with the KVM ~94 %. A DHCP-miss failure mode was fixed with retry + backoff; the remaining ~3 % is a BEAM cold-boot stall in code-loader paths (cold-cache `error_logger`, occasional BeamAsm "corrupt literal table" rejection of `lists.beam`)
 - **Concurrent-burst load** — ✅ **resolved on real hardware.** On QEMU, N≥5 concurrent curls capped at ~2 successful and the cause was ambiguous between host TAP/bridge drops and the kernel. Benchmarking a real AWS Nitro NIC from a separate instance settled it: the limit was the kernel-side **listener pool**, pre-bound at 8 — smoltcp routes each SYN to a free pre-bound listener, so past ~8 simultaneous SYNs the rest were RST'd. Sizing the pool to 64 gives **100% success through N=50** and **4,175 req/s at N=25**. QEMU's SLIRP bridge had masked the real limit by silently dropping the excess SYNs before they reached the kernel
 - **Full IEx** — the current eval shell handles single expressions per session; line editing, history, and the real IEx group leader still need stdin I/O server work
 
@@ -351,7 +351,7 @@ These document the bug-class hunts that got Tyn from "ERTS boots" to "Bandit + P
 
 **Minimal kernel, maximal BEAM.** The kernel provides only what BEAM needs — memory, interrupts, device access, network. BEAM handles its own scheduling, memory management, code loading, and supervision.
 
-**Target KVM/virtio.** Standardized virtual hardware means the kernel only needs a handful of drivers. The entire device layer is a few hundred lines of Rust.
+**Target KVM/virtio and AWS Nitro.** Standardized virtual hardware (virtio on KVM/QEMU, ENA on Nitro) means the kernel only needs a handful of drivers — each NIC driver is a few hundred lines of Rust.
 
 **Designed for verification.** The kernel is structured for future formal verification with Verus. Minimal unsafe code, explicit invariants, small trusted computing base.
 
