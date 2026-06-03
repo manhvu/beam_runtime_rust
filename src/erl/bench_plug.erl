@@ -30,14 +30,21 @@ call(Conn, _Opts) ->
     end.
 
 handle_root(Conn) ->
-    Body = <<"Tyn - BEAM on bare metal\n\n"
+    Body = <<"Tyn - BEAM on bare metal (no Linux)\n\n"
+             "OTP 27 | BeamAsm JIT | Phoenix + Bandit | ~8,000 lines of Rust\n\n"
+             "Try it:\n"
+             "  curl http://<this-ip>:8080/hello\n"
+             "  curl http://<this-ip>:8080/json\n"
+             "  curl http://<this-ip>:8080/health\n\n"
              "Endpoints:\n"
-             "  /          - this page\n"
-             "  /health    - health check (200, for load balancers)\n"
-             "  /hello     - hello world\n"
-             "  /json      - live BEAM stats\n"
-             "  /compute   - integer fold benchmark\n"
-             "  /fib       - fib(25) benchmark\n">>,
+             "  /hello    - hello world\n"
+             "  /health   - health check (200 OK, for load balancers)\n"
+             "  /json     - live BEAM stats (process count, memory, JIT status)\n"
+             "  /compute  - integer fold benchmark\n"
+             "  /fib      - fib(25) benchmark\n\n"
+             "This is a demo instance. Remember to terminate when done -\n"
+             "EC2 instances accrue hourly charges.\n\n"
+             "Source: https://github.com/tyn-os/kernel\n">>,
     respond(Conn, 200, <<"text/plain">>, Body).
 
 handle_json(Conn) ->
