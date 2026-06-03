@@ -751,19 +751,39 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> i64 {
 /// Read from COM1 serial port (stdin). Blocks until at least one byte is available.
 fn sys_read_stdin(buf: *mut u8, count: usize) -> i64 {
     if count == 0 { return 0; }
+    use x86_64::instructions::port::Port;
 
-    // Poll COM1 LSR (0x3FD) bit 0 for data ready.
-    // Yield between polls to avoid busy-waiting.
     loop {
-        let lsr = unsafe { x86_64::instructions::port::Port::<u8>::new(0x3FD).read() };
-        if lsr & 1 != 0 {
-            // Data available — read one byte
-            let byte = unsafe { x86_64::instructions::port::Port::<u8>::new(0x3F8).read() };
-            unsafe { *buf = byte; }
-            return 1;
+        // Wait until COM1 has at least one byte (yield-poll, no busy-wait).
+        if unsafe { Port::<u8>::new(0x3FD).read() } & 1 == 0 {
+            crate::sched::yield_current();
+            continue;
         }
-        // No data — yield and retry (non-blocking poll)
-        crate::sched::yield_current();
+        // Drain the UART FIFO into the caller's buffer, echoing each byte so
+        // the operator sees what they type on the serial console (raw serial
+        // doesn't echo locally). Normalize CR/LF to '\n' for the reader and
+        // turn DEL/BS into an on-screen erase + a DEL byte the shell strips.
+        let mut n = 0usize;
+        while n < count {
+            if unsafe { Port::<u8>::new(0x3FD).read() } & 1 == 0 { break; }
+            let byte = unsafe { Port::<u8>::new(0x3F8).read() };
+            match byte {
+                b'\r' | b'\n' => {
+                    crate::serial::raw_str(b"\r\n");
+                    unsafe { *buf.add(n) = b'\n'; }
+                }
+                0x7f | 0x08 => {
+                    crate::serial::raw_str(b"\x08 \x08");
+                    unsafe { *buf.add(n) = 0x7f; }
+                }
+                _ => {
+                    crate::serial::raw_str(core::slice::from_ref(&byte));
+                    unsafe { *buf.add(n) = byte; }
+                }
+            }
+            n += 1;
+        }
+        if n > 0 { return n as i64; }
     }
 }
 
@@ -1405,6 +1425,10 @@ fn sys_epoll_wait(_epfd: u64, events_ptr: u64, maxevents: u64, timeout_ms: i32) 
                 if e.fd < 0 { continue; }
                 let ready = if e.fd == 51 {
                     timerfd_ready()
+                } else if e.fd == 0 {
+                    // serial stdin: COM1 LSR data-ready bit. Mirrors ppoll so
+                    // ERTS's epoll-driven fd port sees the serial shell's input.
+                    unsafe { x86_64::instructions::port::Port::<u8>::new(0x3FD).read() & 1 != 0 }
                 } else if crate::pipe::is_pipe_fd(e.fd) {
                     crate::pipe::has_data(e.fd)
                 } else if crate::net::socket::is_socket_fd(e.fd) {

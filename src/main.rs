@@ -202,7 +202,7 @@ extern "C" fn main(_mbi: *const u8) -> ! {
             // compiled May 5 (before our kernel fix) but their bytecode
             // is unchanged — only the kernel's accept semantics changed.
             // §B3 Phoenix bisection #1: Bandit with Router directly (skip Endpoint middleware)
-            b"-eval\0", b"application:ensure_all_started(telemetry), application:ensure_all_started(jason), {ok,_}='Elixir.Bandit':start_link([{plug,bench_plug},{port,8080},{scheme,http}]), tcp_shell:start(9090), io:format(\"phoenix_listening~n\"), io:format(\"shell_listening 9090~n\"), receive _ -> ok after 1800000 -> ok end.\0",
+            b"-eval\0", b"application:ensure_all_started(telemetry), application:ensure_all_started(jason), {ok,_}='Elixir.Bandit':start_link([{plug,bench_plug},{port,8080},{scheme,http}]), tcp_shell:start(9090), serial_shell:start(), io:format(\"phoenix_listening~n\"), io:format(\"shell_listening 9090~n\"), io:format(\"serial_shell ready~n\"), receive _ -> ok after 1800000 -> ok end.\0",
         ];
         let mut arg_ptrs = [0u64; 24];
         for (i, arg) in args.iter().enumerate() {
