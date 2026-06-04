@@ -209,88 +209,102 @@ curl http://localhost:5555/fib       # fib(25) benchmark
 nc localhost 5567
 ```
 
-## AWS Deployment
+## Try it on AWS
 
-Tyn runs on real AWS Nitro EC2 — a from-scratch ENA driver brings up the NIC,
-DHCP assigns the VPC address, and Phoenix serves HTTP through it.
+Launch Tyn on a Nitro EC2 instance — under 2 minutes, no build required.
 
-### Prerequisites
+**AMI:** `ami-093863e8a76caecc5` (us-east-1)
 
-- AWS account with EC2 access; AWS CLI configured (or an instance role)
-- The `vmimport` IAM service role (one-time — see [AWS docs](https://docs.aws.amazon.com/vm-import/latest/userguide/required-permissions.html))
-- An S3 bucket `tyn-images-<account-id>` for the import source
-
-### One-command deploy
-
-From the repo root on a build host with the toolchain:
+### Launch
 
 ```bash
-./deploy-ami.sh
-# INSTANCE_TYPE=c5.xlarge AWS_REGION=eu-west-1 ./deploy-ami.sh   # overrides
+# Create a security group (one-time)
+SG_ID=$(aws ec2 create-security-group \
+    --group-name tyn-demo \
+    --description "Tyn demo - HTTP on 8080" \
+    --region us-east-1 \
+    --query 'GroupId' --output text)
+
+aws ec2 authorize-security-group-ingress \
+    --group-id $SG_ID --protocol tcp --port 8080 --cidr 0.0.0.0/0 \
+    --region us-east-1
+
+# Launch
+INSTANCE_ID=$(aws ec2 run-instances \
+    --image-id ami-093863e8a76caecc5 \
+    --instance-type c5.large \
+    --security-group-ids $SG_ID \
+    --region us-east-1 \
+    --query 'Instances[0].InstanceId' --output text)
+
+# Wait for running + get IP
+aws ec2 wait instance-running --region us-east-1 --instance-ids $INSTANCE_ID
+
+IP=$(aws ec2 describe-instances \
+    --instance-ids $INSTANCE_ID \
+    --region us-east-1 \
+    --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+
+echo "Tyn is at $IP"
 ```
 
-It builds the kernel, makes a BIOS disk image, uploads to S3, imports an EBS
-snapshot, registers a `legacy-bios --ena-support` AMI, and launches an
-instance (~12 min total). It prints the instance ID, public IP, the curl
-commands, and the cleanup commands.
-
-```
-=== Tyn deployed ===
-Instance:  i-0abc123...
-Public IP: 54.x.x.x
-
-Wait ~15s for boot + DHCP, then:
-  curl http://54.x.x.x:8080/health   # {"status":"ok"}
-  curl http://54.x.x.x:8080/hello    # Hello from Phoenix on Tyn!
-```
-
-### Measured on Nitro (c5.large)
-
-- **4,175 req/s** at 25-way concurrency, 100% reliable (`/hello`, BeamAsm JIT)
-- 100% success through 50 concurrent connections
-- ~97% cold-boot-to-serving reliability across 32-trial sweeps
-
-### Notes
-
-- `/health` returns `{"status":"ok"}` for ALB/Target-Group/ASG health checks.
-- Tyn runs on any Nitro instance type (c5/m5/r5/t3, …); the ENA driver
-  auto-detects the NIC. For production, restrict the security-group source
-  CIDR and terminate HTTPS at an ALB.
-- The AMI + snapshot persist (< $0.10/month). Terminate instances when done —
-  they accrue hourly charges.
-
-### Serial console (eval shell)
-
-Every Tyn instance runs an Erlang/Elixir eval shell on the **EC2 Serial
-Console** — IAM-authenticated, with **no open management port**. Enable serial
-console access on the account once, then connect:
+Wait ~10 seconds for boot, then:
 
 ```bash
-# One-time, per account:
-aws ec2 enable-serial-console-access --region us-east-1
+curl http://$IP:8080/hello
+# Hello from Phoenix on Tyn!
 
-# Push your SSH public key (valid 60s to establish the connection):
+curl http://$IP:8080/json
+# {"status":"ok","beam":"27","jit":"jit","procs":...,"mem":...,"server":"Tyn"}
+```
+
+Other endpoints: `/` (landing page), `/health` (health check), `/compute`, `/fib`.
+
+### Serial console (interactive BEAM shell)
+
+Access a live Erlang eval shell via EC2 Serial Console — IAM-authenticated, no open ports:
+
+```bash
+# Enable serial console access (one-time, account-level)
+aws ec2 modify-serial-console-access \
+    --serial-console-access-enabled --region us-east-1
+
+# Connect (use your SSH key — check: ls ~/.ssh/*.pub)
+SSH_KEY=~/.ssh/id_ed25519  # adjust to your key name
+
 aws ec2-instance-connect send-serial-console-ssh-public-key \
-  --instance-id i-xxxxxxxx --serial-port 0 \
-  --ssh-public-key file://~/.ssh/id_rsa.pub --region us-east-1
-
-# Connect to the serial console:
-ssh i-xxxxxxxx.port0@serial-console.ec2-instance-connect.us-east-1.aws
+    --instance-id $INSTANCE_ID --serial-port 0 \
+    --ssh-public-key file://${SSH_KEY}.pub \
+    --region us-east-1 && \
+ssh -i $SSH_KEY -o StrictHostKeyChecking=no \
+    $INSTANCE_ID.port0@serial-console.ec2-instance-connect.us-east-1.aws
 ```
 
+In the shell:
 ```
->> 1 + 1.
+>> 1+1.
 2
 >> erlang:system_info(emu_flavor).
 jit
->> erlang:system_info(process_count).
-353
+>> erlang:memory().
+[{total,18124768}, ...]
 ```
 
-The shell reads/writes COM1 directly (`open_port({fd,0,1})`), so it works over
-a raw serial line without a TTY. Access is gated entirely by EC2 Serial Console
-IAM permissions — there's no inbound port to expose. (HTTP on 8080 is the only
-listening port; the legacy TCP shell on 9090 is for QEMU development.)
+`Enter` then `~.` to disconnect.
+
+### Instance types
+
+Any Nitro instance type works (c5, m5, t3, r5, etc.). The ENA driver auto-detects the NIC.
+
+### Terminate
+
+Remember to terminate when done — instances accrue hourly charges:
+
+```bash
+aws ec2 terminate-instances --region us-east-1 --instance-ids $INSTANCE_ID
+```
+
+The security group persists for future launches (no recurring cost).
 
 ## Building ERTS + VFS
 
