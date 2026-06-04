@@ -664,6 +664,18 @@ fn sys_write(fd: i32, buf: *const u8, count: usize) -> i64 {
                 x86_64::instructions::port::Port::<u8>::new(0x3F8).write(byte);
             }
         }
+        // Boot-complete signal: when the boot eval prints "serial_shell ready"
+        // (its last line), go quiet so routine kernel logs stop garbling the
+        // serial-console shell. The marker (underscore) doesn't match the shell
+        // banner ("Tyn serial shell"), so it only fires once, post-boot.
+        const MARK: &[u8] = b"serial_shell ready";
+        if !crate::serial::is_quiet() && count >= MARK.len() {
+            // SAFETY: buf points to `count` bytes of identity-mapped user memory.
+            let s = unsafe { core::slice::from_raw_parts(buf, count) };
+            if s.windows(MARK.len()).any(|w| w == MARK) {
+                crate::serial::set_quiet(true);
+            }
+        }
         count as i64
     } else if fd as i64 == FD_DEVNULL {
         count as i64 // silently discard
@@ -788,6 +800,8 @@ fn sys_read_stdin(buf: *mut u8, count: usize) -> i64 {
 }
 
 fn sys_exit_group(status: i32) -> i64 {
+    // A BEAM exit is always worth seeing, even under post-boot quiet mode.
+    crate::serial::set_quiet(false);
     serial_println!("[syscall] exit_group({})", status);
     crate::halt_loop();
 }

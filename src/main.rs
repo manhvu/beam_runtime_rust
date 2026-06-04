@@ -425,6 +425,8 @@ fn init_networking() {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    // Always surface panics, even if post-boot quiet mode is on.
+    tyn_kernel::serial::set_quiet(false);
     serial_println!("KERNEL PANIC: {}", info);
     tyn_kernel::halt_loop();
 }

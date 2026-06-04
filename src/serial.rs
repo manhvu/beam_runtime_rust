@@ -3,6 +3,7 @@
 //! All kernel logging goes through serial output, which QEMU
 //! captures via `-serial stdio` for headless operation.
 
+use core::sync::atomic::{AtomicBool, Ordering};
 use spin::{Lazy, Mutex};
 use uart_16550::SerialPort;
 
@@ -14,10 +15,32 @@ pub static SERIAL1: Lazy<Mutex<SerialPort>> = Lazy::new(|| {
     Mutex::new(serial_port)
 });
 
+/// When set, routine kernel logging via `serial_print!`/`serial_println!` is
+/// suppressed. Flipped on once boot completes (the BEAM prints
+/// `serial_shell ready`) so the serial-console eval shell isn't garbled by
+/// `[vfs]`/`[net]` debug logs. Panic and fault handlers call `set_quiet(false)`
+/// first, so faults are always printed. Boot logs (which aid diagnosing the
+/// cold-boot stall) stay visible until boot actually succeeds.
+static QUIET: AtomicBool = AtomicBool::new(false);
+
+/// Suppress (`true`) or restore (`false`) routine kernel serial logging.
+pub fn set_quiet(q: bool) {
+    QUIET.store(q, Ordering::Relaxed);
+}
+
+/// Whether routine kernel logging is currently suppressed.
+pub fn is_quiet() -> bool {
+    QUIET.load(Ordering::Relaxed)
+}
+
 #[doc(hidden)]
 pub fn _print(args: ::core::fmt::Arguments) {
     use core::fmt::Write;
     use x86_64::instructions::interrupts;
+
+    if QUIET.load(Ordering::Relaxed) {
+        return;
+    }
 
     // Disable interrupts while holding the serial lock to prevent deadlock
     // if an interrupt handler also tries to print.

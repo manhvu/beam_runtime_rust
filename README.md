@@ -259,6 +259,39 @@ Wait ~15s for boot + DHCP, then:
 - The AMI + snapshot persist (< $0.10/month). Terminate instances when done —
   they accrue hourly charges.
 
+### Serial console (eval shell)
+
+Every Tyn instance runs an Erlang/Elixir eval shell on the **EC2 Serial
+Console** — IAM-authenticated, with **no open management port**. Enable serial
+console access on the account once, then connect:
+
+```bash
+# One-time, per account:
+aws ec2 enable-serial-console-access --region us-east-1
+
+# Push your SSH public key (valid 60s to establish the connection):
+aws ec2-instance-connect send-serial-console-ssh-public-key \
+  --instance-id i-xxxxxxxx --serial-port 0 \
+  --ssh-public-key file://~/.ssh/id_rsa.pub --region us-east-1
+
+# Connect to the serial console:
+ssh i-xxxxxxxx.port0@serial-console.ec2-instance-connect.us-east-1.aws
+```
+
+```
+>> 1 + 1.
+2
+>> erlang:system_info(emu_flavor).
+jit
+>> erlang:system_info(process_count).
+353
+```
+
+The shell reads/writes COM1 directly (`open_port({fd,0,1})`), so it works over
+a raw serial line without a TTY. Access is gated entirely by EC2 Serial Console
+IAM permissions — there's no inbound port to expose. (HTTP on 8080 is the only
+listening port; the legacy TCP shell on 9090 is for QEMU development.)
+
 ## Building ERTS + VFS
 
 Tyn embeds a statically-linked ERTS binary and a cpio archive of .beam files directly in the kernel image. Here's how to build them.
