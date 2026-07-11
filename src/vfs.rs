@@ -24,6 +24,12 @@ fn cpio_data() -> &'static [u8] {
     }
 }
 
+/// Size of the embedded cpio archive, for comparing against a GRUB
+/// multiboot module of the same file (Track 1 Phase 1a validation).
+pub fn embedded_len() -> usize {
+    CPIO_EMBEDDED.len()
+}
+
 /// Copy the cpio archive to a safe address above the kernel, so it
 /// survives ELF loading which overwrites .rodata.
 ///
@@ -35,6 +41,25 @@ pub unsafe fn relocate(dest: usize) {
     core::ptr::copy_nonoverlapping(src.as_ptr(), dest as *mut u8, src.len());
     CPIO_PTR = dest as *const u8;
     CPIO_LEN = src.len();
+}
+
+/// Point the VFS at a cpio already resident at `src..src+len` (a GRUB module),
+/// copying it up to `dest` (CPIO_HOME) exactly as the embedded path does. The
+/// caller zeros the `src` staging area afterward.
+///
+/// # Safety
+/// `src` and `dest` must be valid, identity-mapped, non-overlapping ranges of
+/// at least `len` bytes.
+pub unsafe fn relocate_from(src: usize, len: usize, dest: usize) {
+    core::ptr::copy_nonoverlapping(src as *const u8, dest as *mut u8, len);
+    CPIO_PTR = dest as *const u8;
+    CPIO_LEN = len;
+}
+
+/// True if `path` exists in the current cpio source. Used to prove which
+/// source (module vs embedded) is live via a sentinel file.
+pub fn exists(path: &[u8]) -> bool {
+    cpio_lookup(path).is_some()
 }
 
 /// Next file descriptor to allocate for VFS files.

@@ -11,9 +11,97 @@ use virtio_drivers::transport::pci::bus::{Command, PciRoot};
 use virtio_drivers::transport::pci::{PciTransport, virtio_device_type};
 use virtio_drivers::transport::{DeviceType, Transport};
 
+/// Read a little-endian u32 at `base + off`. Multiboot structures are
+/// 4-byte aligned in practice, but `read_unaligned` is safe regardless.
+///
+/// # Safety
+/// `base + off .. + 4` must be a readable, identity-mapped address.
+#[inline]
+unsafe fn mb_read_u32(base: *const u8, off: usize) -> u32 {
+    unsafe { core::ptr::read_unaligned(base.add(off) as *const u32) }
+}
+
+/// Parse the GRUB multiboot1 module list, print where GRUB placed each module,
+/// and return the `[mod_start, mod_end)` bounds of the first module that is a
+/// valid newc cpio. Returns `None` when no module is present or the first
+/// module is not a cpio (caller then falls back to the embedded cpio).
+///
+/// The module is NOT consumed here — the caller relocates it out of low RAM
+/// (Phase 1b) before `elf::load`, because GRUB places it on top of the ERTS
+/// load region.
+///
+/// Multiboot1 info layout: flags@0, mods_count@20, mods_addr@24. Bit 3 of
+/// flags means the module fields are valid. Each module entry is 16 bytes:
+/// { u32 mod_start; u32 mod_end; u32 cmdline; u32 pad; }.
+fn parse_multiboot_module(mbi: *const u8) -> Option<(u32, u32)> {
+    if mbi.is_null() {
+        serial_println!("[mb] no multiboot info pointer (booted via QEMU -kernel?)");
+        return None;
+    }
+    // SAFETY: GRUB places the multiboot info struct and module metadata in low
+    // RAM, which is identity-mapped (boot page tables map the first 4 GiB). We
+    // only ever read from these addresses.
+    unsafe {
+        let flags = mb_read_u32(mbi, 0);
+        if flags & (1 << 3) == 0 {
+            serial_println!("[mb] flags={:#x}: no modules present (bit 3 clear)", flags);
+            return None;
+        }
+        let mods_count = mb_read_u32(mbi, 20);
+        let mods_addr = mb_read_u32(mbi, 24);
+        serial_println!("[mb] mods_count={}", mods_count);
+
+        let embedded = tyn_kernel::vfs::embedded_len();
+        let mut cpio_module: Option<(u32, u32)> = None;
+        for i in 0..mods_count {
+            let ent = (mods_addr as usize + i as usize * 16) as *const u8;
+            let mod_start = mb_read_u32(ent, 0);
+            let mod_end = mb_read_u32(ent, 4);
+            let cmdline_ptr = mb_read_u32(ent, 8) as *const core::ffi::c_char;
+            let size = mod_end.saturating_sub(mod_start);
+            let cmdline = if cmdline_ptr.is_null() {
+                ""
+            } else {
+                core::ffi::CStr::from_ptr(cmdline_ptr)
+                    .to_str()
+                    .unwrap_or("<non-utf8>")
+            };
+            serial_println!(
+                "[mb] module {}: start={:#x} end={:#x} size={} cmdline=\"{}\"",
+                i, mod_start, mod_end, size, cmdline
+            );
+
+            // A newc cpio archive begins with the ASCII magic "070701".
+            let magic = core::slice::from_raw_parts(mod_start as usize as *const u8, 6);
+            let is_cpio = magic == b"070701";
+            let matches = size as usize == embedded;
+            serial_println!(
+                "[mb] module {} magic={} ({}), size {} embedded ({} bytes)",
+                i,
+                core::str::from_utf8(magic).unwrap_or("??????"),
+                if is_cpio { "cpio newc OK" } else { "NOT cpio newc" },
+                if matches { "matches" } else { "DIFFERS from" },
+                embedded
+            );
+
+            // Use the first valid cpio module. A non-cpio module is not trusted
+            // (caller falls back to embedded).
+            if is_cpio && cpio_module.is_none() {
+                cpio_module = Some((mod_start, mod_end));
+            }
+        }
+        cpio_module
+    }
+}
+
 #[unsafe(no_mangle)]
-extern "C" fn main(_mbi: *const u8) -> ! {
+extern "C" fn main(mbi: *const u8) -> ! {
     serial_println!("=== Tyn Kernel v{} ===", env!("CARGO_PKG_VERSION"));
+
+    // Track 1 Phase 1b: parse the GRUB multiboot module list. If a cpio module
+    // is present we relocate it to CPIO_HOME below (before elf::load); otherwise
+    // the embedded cpio is used. Returns the module's low-memory bounds.
+    let cpio_module = parse_multiboot_module(mbi);
 
     tyn_kernel::memory::heap::init_static();
     tyn_kernel::drivers::virtio::hal::init_dma();
@@ -56,9 +144,6 @@ extern "C" fn main(_mbi: *const u8) -> ! {
     // and AWS Nitro). MCFG-discovery isn't required for Phase 1.
     init_networking();
 
-    // Initialize in-memory VFS (cpio archive with OTP files)
-    tyn_kernel::vfs::init();
-
     // Set up syscall entry point
     tyn_kernel::syscall::init();
 
@@ -90,11 +175,65 @@ extern "C" fn main(_mbi: *const u8) -> ! {
         core::ptr::copy_nonoverlapping(HELLO_ELF.as_ptr(), dst, HELLO_ELF.len());
         core::slice::from_raw_parts(dst, HELLO_ELF.len())
     };
-    // Copy cpio to safe location and update the VFS to use it.
-    unsafe {
-        tyn_kernel::vfs::relocate(CPIO_COPY_BASE);
+    // Choose the cpio source and place it at CPIO_HOME. Both the embedded copy
+    // and a GRUB module end up at the same home, so the VFS (which reads from
+    // CPIO_HOME) is source-agnostic.
+    //
+    // CPIO_HOME must stay below the mmap region (BeamAsm JIT pages) so a large
+    // user app cpio can't silently overwrite it — hence the size ceiling.
+    const CPIO_HOME: usize = CPIO_COPY_BASE;   // 0x1500_0000, 336 MiB
+    const MMAP_BASE: usize = 0x1A00_0000;      // 416 MiB — start of JIT mmaps
+    const CPIO_MAX: usize = MMAP_BASE - CPIO_HOME; // 0x0500_0000, ~80 MiB
+    match cpio_module {
+        Some((mod_start, mod_end)) => {
+            let start = mod_start as usize;
+            let end = mod_end as usize;
+            let size = end - start;
+            // Size ceiling: refuse to relocate a cpio that would spill into the
+            // JIT mmap region. Panic loudly rather than silently corrupt.
+            assert!(size <= CPIO_MAX,
+                "cpio module too large: {} bytes, max {} (~80 MiB)", size, CPIO_MAX);
+            // Source (module, low RAM) and dest (CPIO_HOME) must not overlap, or
+            // copy_nonoverlapping would corrupt mid-copy. True for the known
+            // addresses; assert so a future layout change fails loudly.
+            assert!(end <= CPIO_HOME || start >= CPIO_HOME + size,
+                "module [{:#x},{:#x}) overlaps CPIO_HOME [{:#x},{:#x})",
+                start, end, CPIO_HOME, CPIO_HOME + size);
+            serial_println!(
+                "[vfs] module present, relocating {:#x} -> {:#x} ({} bytes), headroom {} bytes",
+                start, CPIO_HOME, size, CPIO_MAX - size);
+            // Copy the module up FIRST, then zero its low-memory staging area.
+            // The staging range overlaps the ERTS load region + sbrk heap; 1a
+            // proved leftover cpio bytes there #GP ERTS. Zeroing restores the
+            // pristine "as if no module" state ERTS depends on. Never zero
+            // before the copy.
+            // SAFETY: both ranges are identity-mapped, non-overlapping, and the
+            // staging range holds only the now-copied module (APs already up;
+            // the AP trampoline at 0x8000 is below it).
+            unsafe {
+                tyn_kernel::vfs::relocate_from(start, size, CPIO_HOME);
+                let zero_end = (end + 0xFFF) & !0xFFF; // page-align up
+                core::ptr::write_bytes(start as *mut u8, 0, zero_end - start);
+                serial_println!("[vfs] zeroed staging [{:#x},{:#x})", start, zero_end);
+            }
+        }
+        None => {
+            serial_println!("[vfs] no module, using embedded");
+            // SAFETY: CPIO_HOME is identity-mapped and above the kernel.
+            unsafe { tyn_kernel::vfs::relocate(CPIO_HOME); }
+        }
     }
-    serial_println!("[boot] ELF copied to {:#x}, CPIO to {:#x}", ELF_COPY_BASE, CPIO_COPY_BASE);
+    serial_println!("[boot] ELF copied to {:#x}, CPIO to {:#x}", ELF_COPY_BASE, CPIO_HOME);
+
+    // Initialize the VFS from the chosen source and prove which one is live.
+    // (Module and embedded cpio are byte-identical in production, so only the
+    // sentinel distinguishes them during the 1b provenance test.)
+    tyn_kernel::vfs::init();
+    if tyn_kernel::vfs::exists(b"TYN_MODULE_SENTINEL") {
+        serial_println!("[vfs] source=MODULE (sentinel present)");
+    } else {
+        serial_println!("[vfs] source=embedded (no sentinel)");
+    }
 
     // SAFETY: Target addresses (0x400000+) are identity-mapped and writable.
     // Source data is at 32 MiB, safely above the load addresses.

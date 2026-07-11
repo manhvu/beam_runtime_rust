@@ -21,6 +21,13 @@
 set -e
 
 KERNEL=${KERNEL:-target/x86_64-tyn/release/tyn-kernel}
+# The cpio GRUB loads as a multiboot module. Track 1 Phase 1b: the kernel
+# relocates this module out of low RAM to CPIO_HOME and zeros its staging area
+# before elf::load, then serves the VFS from it (embedded copy is the fallback
+# when no module is present). GRUB places the module at ~1 MiB, on top of the
+# ERTS load region, so the relocate+zero is what makes it safe. Verified to boot
+# to Phoenix with source=MODULE. This is the SAME file embedded in src/vfs.rs.
+CPIO=${CPIO:-src/otp-rootfs.cpio}
 IMAGE=${IMAGE:-/dev/shm/tyn-disk.raw}
 SIZE_MB=${SIZE_MB:-128}
 MOUNT=${MOUNT:-/tmp/tyn-mount}
@@ -31,7 +38,13 @@ if [ ! -f "$KERNEL" ]; then
   exit 1
 fi
 
+if [ ! -f "$CPIO" ]; then
+  echo "ERROR: cpio module not found at $CPIO" >&2
+  exit 1
+fi
+
 echo "kernel: $KERNEL ($(stat -c%s "$KERNEL" 2>/dev/null || stat -f%z "$KERNEL") bytes)"
+echo "cpio:   $CPIO ($(stat -c%s "$CPIO" 2>/dev/null || stat -f%z "$CPIO") bytes)"
 echo "image:  $IMAGE ($SIZE_MB MB)"
 
 echo "=== Creating disk image ==="
@@ -78,15 +91,19 @@ sudo grub-install \
   $LOOP 2>&1 | tail -3
 
 sudo cp $KERNEL $MOUNT/boot/tyn-kernel
+sudo cp $CPIO   $MOUNT/boot/rootfs.cpio
 sudo mkdir -p $MOUNT/boot/grub
 sudo tee $MOUNT/boot/grub/grub.cfg > /dev/null << 'EOF'
 set timeout=0
 set default=0
 
 # Tyn ships a multiboot1 header (magic 0x1BADB002 in src/multiboot.S).
-# Use the `multiboot` command, not `multiboot2`.
+# Use the `multiboot`/`module` commands, not `multiboot2`/`module2`.
+# The `module` line hands the cpio to the kernel as a multiboot module; the
+# kernel relocates it out of low RAM and serves the VFS from it (Phase 1b).
 menuentry "Tyn" {
     multiboot /boot/tyn-kernel
+    module /boot/rootfs.cpio
     boot
 }
 EOF
