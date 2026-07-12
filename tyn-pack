@@ -1,0 +1,211 @@
+#!/bin/bash
+# tyn-pack — package a standard Elixir Mix release into a Tyn-bootable cpio +
+# boot.config that the generic 1c kernel boots. No Rust, no kernel rebuild.
+#
+#   mix release
+#   tyn-pack _build/prod/rel/my_app -o rootfs.cpio
+#   ./build-disk.sh   # (CPIO=rootfs.cpio) -> disk image -> deploy-ami.sh
+#
+# Design (see directions/TRACK1_PHASE2_TYNPACK.md):
+#   * OTP/Elixir CORE (kernel, stdlib, compiler, sasl, elixir, logger, eex, ...)
+#     comes from Tyn's BASE cpio — those beams are coupled to the ERTS inside our
+#     musl beam.smp. The release's own copies are ignored (base wins for core).
+#   * The user's app + non-core deps come FROM the release (release wins).
+#   * .app resource files are taken from the release for the whole graph, so
+#     application:ensure_all_started/1 resolves dependencies (the missing-.app
+#     gap that made ensure_all_started(jason) fail in 1c).
+#   * The release's bundled ERTS and OTP boot scripts are ignored — tyn_boot
+#     starts applications itself.
+#
+# Version policy: compiling with an OLDER OTP than the runtime is safe (old .beam
+# loads on newer ERTS — what 1c relied on); NEWER is not. tyn-pack fails loudly
+# if the release's OTP/ERTS or Elixir exceeds Tyn's base.
+
+set -euo pipefail
+
+# ---- Tyn base runtime versions (the ERTS inside beam.smp) ----
+BASE_ERTS_MAJOR=15          # OTP 27 -> ERTS 15.x (ERTS 15.2.7.1)
+BASE_ELIXIR=1.18.3
+CPIO_MAX=$((0x05000000))    # CPIO_HOME 0x15000000 -> MMAP_BASE 0x1A000000 (~80 MiB)
+
+# Elixir/OTP CORE application names that must come from the base, never the
+# release. OTP apps are discovered from the base cpio's otp/lib tree; the Elixir
+# core set is fixed (stable across Elixir versions).
+ELIXIR_CORE="elixir eex logger ex_unit iex mix"
+
+die() { echo "tyn-pack: ERROR: $*" >&2; exit 1; }
+note() { echo "tyn-pack: $*"; }
+
+usage() {
+  cat >&2 <<EOF
+usage: tyn-pack <release_dir> -o <out.cpio> [options]
+  <release_dir>          a Mix release, e.g. _build/prod/rel/my_app
+  -o, --out FILE         output cpio (required)
+  --base FILE            base cpio (default: src/otp-rootfs.cpio)
+  --tyn-erl DIR          dir with tyn_boot.beam/serial_shell.beam/tcp_shell.beam
+                         (default: src/erl)
+  --app NAME             release application to start (default: release dir name)
+  --port N               listener port (default: 8080)
+  --plug MODULE          1c override: hand this Plug to Bandit (sets boot.config
+                         {plug,MODULE} instead of {apps,[app]})
+  --start-mfa 'm:f(a,b)' 1c override: {start_mfa,{m,f,[a,b]}}
+EOF
+  exit 2
+}
+
+REL=""; OUT=""; BASE="src/otp-rootfs.cpio"; TYN_ERL="src/erl"
+APP=""; PORT=8080; PLUG=""; START_MFA=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o|--out) OUT="$2"; shift 2;;
+    --base) BASE="$2"; shift 2;;
+    --tyn-erl) TYN_ERL="$2"; shift 2;;
+    --app) APP="$2"; shift 2;;
+    --port) PORT="$2"; shift 2;;
+    --plug) PLUG="$2"; shift 2;;
+    --start-mfa) START_MFA="$2"; shift 2;;
+    -h|--help) usage;;
+    -*) die "unknown option $1";;
+    *) [ -z "$REL" ] && REL="$1" || die "unexpected arg $1"; shift;;
+  esac
+done
+[ -n "$REL" ] || usage
+[ -n "$OUT" ] || die "missing -o <out.cpio>"
+[ -d "$REL" ] || die "release dir not found: $REL"
+[ -f "$BASE" ] || die "base cpio not found: $BASE"
+[ -d "$REL/lib" ] || die "$REL/lib not found — is this a Mix release?"
+
+# ================= Step 1: version check =================
+# Elixir version from the release's lib/elixir-<vsn>.
+REL_ELIXIR=$(ls -d "$REL"/lib/elixir-* 2>/dev/null | head -1 | sed 's/.*elixir-//')
+# ERTS version from releases/start_erl.data (first field) if present, else from
+# a bundled erts-* dir; map its major to compare against the base.
+REL_ERTS=""
+if [ -f "$REL/releases/start_erl.data" ]; then
+  REL_ERTS=$(awk '{print $1}' "$REL/releases/start_erl.data")
+fi
+[ -z "$REL_ERTS" ] && REL_ERTS=$(ls -d "$REL"/erts-* 2>/dev/null | head -1 | sed 's/.*erts-//')
+REL_ERTS_MAJOR=${REL_ERTS%%.*}
+
+note "release: app=$(basename "$REL")  elixir=${REL_ELIXIR:-?}  erts=${REL_ERTS:-?}"
+note "base:    erts major<=$BASE_ERTS_MAJOR  elixir<=$BASE_ELIXIR"
+
+if [ -n "$REL_ERTS_MAJOR" ] && [ "$REL_ERTS_MAJOR" -gt "$BASE_ERTS_MAJOR" ]; then
+  die "release ERTS $REL_ERTS (major $REL_ERTS_MAJOR) is NEWER than Tyn's base (major $BASE_ERTS_MAJOR). Rebuild the release with OTP <= 27."
+fi
+if [ -n "$REL_ELIXIR" ]; then
+  newest=$(printf '%s\n%s\n' "$REL_ELIXIR" "$BASE_ELIXIR" | sort -V | tail -1)
+  [ "$newest" = "$BASE_ELIXIR" ] || die "release Elixir $REL_ELIXIR is NEWER than base $BASE_ELIXIR. Rebuild with Elixir <= $BASE_ELIXIR."
+fi
+note "version check OK (release <= base)"
+
+# ================= Step 2: core skip-list from the base =================
+BASE_LIST=$(cpio -it < "$BASE" 2>/dev/null)
+# OTP core app names = otp/lib/<app>-<vsn> dirs in the base.
+OTP_CORE=$(echo "$BASE_LIST" | sed -n 's#^otp/lib/\([a-z_][a-z_0-9]*\)-[0-9].*#\1#p' | sort -u)
+SKIP=$(printf '%s\n%s\n' "$OTP_CORE" "$(echo "$ELIXIR_CORE" | tr ' ' '\n')" | sort -u | grep -v '^$')
+note "core skip-list ($(echo "$SKIP" | wc -w | tr -d ' ') apps): $(echo $SKIP | tr '\n' ' ')"
+
+is_skipped() { echo "$SKIP" | grep -qx "$1"; }
+
+# ================= Step 3: staging = base + release overlay =================
+STAGE=$(mktemp -d)
+trap 'rm -rf "$STAGE"' EXIT
+( cd "$STAGE" && cpio -idm --quiet < "$OLDPWD/$BASE" 2>/dev/null || cpio -idm --quiet < "$BASE" ) 2>/dev/null || \
+  ( cd "$STAGE" && cpio -idm --quiet < "$(cd "$(dirname "$BASE")"; pwd)/$(basename "$BASE")" )
+
+# Overlay the enhanced launcher + shells (base already has them; refresh so the
+# module cpio carries the current tyn_boot).
+for b in tyn_boot.beam serial_shell.beam tcp_shell.beam; do
+  [ -f "$TYN_ERL/$b" ] && cp "$TYN_ERL/$b" "$STAGE/$b"
+done
+
+# Copy ALL release .app files (whole dep graph -> ensure_all_started resolves).
+# already-loaded OTP apps (kernel/stdlib) reject a second load harmlessly.
+napp=0; nbeam_apps=0
+CRYPTO_APPS=""
+for ebin in "$REL"/lib/*/ebin; do
+  [ -d "$ebin" ] || continue
+  appdir=$(basename "$(dirname "$ebin")")   # <app>-<vsn>
+  app=${appdir%-*}
+  # .app files always
+  for f in "$ebin"/*.app; do
+    [ -e "$f" ] || continue
+    cp "$f" "$STAGE/"; napp=$((napp+1))
+    # crypto/ssl dependency scan
+    if grep -qE '(^|[^a-z_])(crypto|ssl)([^a-z_]|$)' "$f" 2>/dev/null; then
+      CRYPTO_APPS="$CRYPTO_APPS $app"
+    fi
+  done
+  # beams: only for NON-core apps (release wins for everything but core)
+  if is_skipped "$app"; then continue; fi
+  cp "$ebin"/*.beam "$STAGE/" 2>/dev/null && nbeam_apps=$((nbeam_apps+1)) || true
+done
+note "overlaid: $napp .app files; beams from $nbeam_apps non-core release apps"
+
+# ================= Step 4: crypto/ssl warning =================
+CRYPTO_APPS=$(echo "$CRYPTO_APPS" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ')
+if [ -n "${CRYPTO_APPS// /}" ]; then
+  echo "tyn-pack: WARNING: these apps depend on :crypto/:ssl, which are UNAVAILABLE" >&2
+  echo "tyn-pack:          on Tyn (beam.smp is static musl, no OpenSSL; :crypto is a NIF):" >&2
+  echo "tyn-pack:            $CRYPTO_APPS" >&2
+  echo "tyn-pack:          Apps needing crypto (e.g. a full Phoenix Endpoint that signs" >&2
+  echo "tyn-pack:          with secret_key_base) will FAIL at runtime. Bandit + Plug" >&2
+  echo "tyn-pack:          without Endpoint signing is the supported configuration." >&2
+fi
+
+# ================= Step 5: boot.config =================
+[ -n "$APP" ] || APP=$(basename "$REL")
+BC="$STAGE/boot.config"
+{
+  echo "%% generated by tyn-pack for release '$APP'"
+  if [ -n "$START_MFA" ]; then
+    # 'mod:fun(a,b)' -> {start_mfa,{mod,fun,[a,b]}}
+    m=${START_MFA%%:*}; rest=${START_MFA#*:}; f=${rest%%(*}
+    args=${rest#*(}; args=${args%)}
+    echo "{start_mfa, {$m, $f, [$args]}}."
+    echo "{port, $PORT}."
+  elif [ -n "$PLUG" ]; then
+    echo "{apps, []}."
+    echo "{plug, $PLUG}."
+    echo "{port, $PORT}."
+  else
+    echo "{apps, [$APP]}."
+    echo "{port, $PORT}."
+  fi
+} > "$BC"
+note "boot.config:"; sed 's/^/    /' "$BC" >&2
+
+# ================= Step 6: deterministic order-preserving pack =================
+# Ordering rule (load-bearing — 1c found find(1)'s arbitrary order tickled the
+# cold-boot code-loader flake): BASE entries keep their exact original cpio order
+# (preserving the proven core layout; overwritten dep beams get release content
+# at the same position), then NEW entries (release beams/.app + boot.config not
+# present in the base) in LC_ALL=C sorted order.
+BASE_ORDER=$(echo "$BASE_LIST" | grep -v '^TRAILER!!!$' || true)
+( cd "$STAGE"
+  # staging FILES only, base-relative. The base cpio carries no directory
+  # entries (the kernel VFS matches by full path); adding find(1)'s directory
+  # entries as new members would create 0-byte `otp/lib` etc. files that make
+  # code_server open a "directory" and crash with {badmatch,error}.
+  find . -type f | sed 's#^\./##' | LC_ALL=C sort > /tmp/tp_all.$$
+)
+echo "$BASE_ORDER" > /tmp/tp_base.$$
+# new = staging entries not in base order, sorted
+LC_ALL=C sort /tmp/tp_base.$$ > /tmp/tp_base_sorted.$$
+comm -23 /tmp/tp_all.$$ /tmp/tp_base_sorted.$$ > /tmp/tp_new.$$
+ORDER=$(cat <(echo "$BASE_ORDER") /tmp/tp_new.$$)
+rm -f /tmp/tp_all.$$ /tmp/tp_base.$$ /tmp/tp_base_sorted.$$ /tmp/tp_new.$$
+
+OUT_ABS=$(cd "$(dirname "$OUT")"; pwd)/$(basename "$OUT")
+( cd "$STAGE" && echo "$ORDER" | cpio -o -H newc --quiet > "$OUT_ABS" )
+
+# ================= Step 7: size-ceiling check =================
+SZ=$(stat -c%s "$OUT_ABS" 2>/dev/null || stat -f%z "$OUT_ABS")
+HEAD=$((CPIO_MAX - SZ))
+note "packed $OUT_ABS: $SZ bytes ($(( SZ/1024/1024 )) MiB), ceiling $CPIO_MAX (~80 MiB), headroom $HEAD bytes ($(( HEAD/1024/1024 )) MiB)"
+if [ "$SZ" -gt "$CPIO_MAX" ]; then
+  rm -f "$OUT_ABS"
+  die "packed cpio ($SZ) exceeds the ~80 MiB ceiling ($CPIO_MAX). The mmap region (CPIO_HOME->MMAP_BASE) would be corrupted. Shrink the app or revisit the kernel memory map."
+fi
+note "done."

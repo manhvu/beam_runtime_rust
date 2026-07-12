@@ -1,0 +1,6 @@
+# Mix build artifacts — the source projects are checked in, not their builds.
+*/_build/
+*/deps/
+*/.elixir_ls/
+*/*.ez
+erl_crash.dump
