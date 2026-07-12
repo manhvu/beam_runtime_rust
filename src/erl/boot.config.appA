@@ -1,0 +1,8 @@
+%% App A (demo) — Track 1 Phase 1c.
+%% Copied to `boot.config` at the root of cpio A. Reproduces the pre-1c demo:
+%% start telemetry, then hand bench_plug to Bandit on port 8080. jason is NOT an
+%% app here (its elixir app-dep has no findable elixir.app); 'Elixir.Jason' is
+%% used as plain module calls, exactly as in the pre-1c boot.
+{apps, [telemetry]}.
+{plug, bench_plug}.
+{port, 8080}.

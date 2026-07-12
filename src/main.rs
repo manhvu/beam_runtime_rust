@@ -340,8 +340,15 @@ extern "C" fn main(mbi: *const u8) -> ! {
             // should now work end-to-end. Both Bandit and HelloPlug were
             // compiled May 5 (before our kernel fix) but their bytecode
             // is unchanged — only the kernel's accept semantics changed.
-            // §B3 Phoenix bisection #1: Bandit with Router directly (skip Endpoint middleware)
-            b"-eval\0", b"application:ensure_all_started(telemetry), application:ensure_all_started(jason), {ok,_}='Elixir.Bandit':start_link([{plug,bench_plug},{port,8080},{scheme,http}]), tcp_shell:start(9090), serial_shell:start(), io:format(\"phoenix_listening~n\"), io:format(\"shell_listening 9090~n\"), io:format(\"serial_shell ready~n\"), receive _ -> ok after 1800000 -> ok end.\0",
+            // Track 1 Phase 1c: the -eval is now app-agnostic. tyn_boot:start()
+            // reads boot.config from the cpio, starts the shells + whatever app
+            // the config names, and keeps printing the phoenix_listening marker.
+            // Which app boots is decided by the cpio, not this kernel binary —
+            // that's the "one kernel, many apps" claim Track 1 proves. The
+            // embedded-cpio fallback ships no boot.config, so tyn_boot uses its
+            // demo defaults (telemetry+jason+bench_plug on 8080), reproducing the
+            // pre-1c boot exactly.
+            b"-eval\0", b"tyn_boot:start().\0",
         ];
         let mut arg_ptrs = [0u64; 24];
         for (i, arg) in args.iter().enumerate() {

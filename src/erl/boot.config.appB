@@ -1,0 +1,7 @@
+%% App B (plain gen_tcp responder) — Track 1 Phase 1c.
+%% Copied to `boot.config` at the root of cpio B. No Elixir apps: appb_responder
+%% depends only on kernel/stdlib, so cpio B can drop all Elixir.* beams. tyn_boot
+%% starts it via the generic start_mfa path.
+{apps, []}.
+{start_mfa, {appb_responder, start, [8080]}}.
+{port, 8080}.
