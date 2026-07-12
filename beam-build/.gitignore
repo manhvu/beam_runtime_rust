@@ -1,0 +1,8 @@
+# build outputs (regenerable via build-beam.sh)
+beam.smp
+beam.smp.full
+*.smp
+*.smp.full
+nifs/*.a
+nifs/*.o
+rust-nif/target/
