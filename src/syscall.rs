@@ -596,10 +596,15 @@ fn syscall_dispatch_inner(
         }
         // Socket syscalls
         41 => crate::net::socket::sys_socket(a0 as i32, a1 as i32, a2 as i32),
-        42 => -115, // connect → -EINPROGRESS (TODO)
+        42 => crate::net::socket::sys_connect(a0 as i32, a1 as *const u8, a2 as u32),
         43 | 288 => crate::net::socket::sys_accept(a0 as i32, a1 as *mut u8, a2 as *mut u32, a3 as i32),
-        44 => crate::net::socket::sys_sendto(a0 as i32, a1 as *const u8, a2 as usize, a3 as i32, 0 as *const u8, 0),
-        45 => crate::net::socket::sys_recvfrom(a0 as i32, a1 as *mut u8, a2 as usize, a3 as i32, 0 as *mut u8, 0 as *mut u32),
+        // sendto/recvfrom: a4=dest/src addr, a5=addrlen. a5 (R9 at entry) is
+        // recovered from the per-CPU save slot (the register shuffle clobbers it).
+        44 => crate::net::socket::sys_sendto(a0 as i32, a1 as *const u8, a2 as usize, a3 as i32, _a4 as *const u8, 16),
+        45 => {
+            let a5 = get_clone_regs().0;
+            crate::net::socket::sys_recvfrom(a0 as i32, a1 as *mut u8, a2 as usize, a3 as i32, _a4 as *mut u8, a5 as *mut u32)
+        }
         46 => { // sendmsg — used by erl_child_setup protocol
             // Parse msghdr to get total iov length for return value
             // struct msghdr { void *name; socklen_t namelen; struct iovec *iov;
@@ -730,6 +735,25 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> i64 {
     }
     if crate::pipe::is_pipe_fd(fd) {
         return crate::pipe::read(fd, buf, count);
+    }
+    // /dev/urandom or /dev/random: fill from the kernel CSPRNG.
+    if fd as i64 == FD_DEV_RANDOM {
+        if count == 0 { return 0; }
+        // SAFETY: buf points to `count` bytes of identity-mapped user memory.
+        unsafe { crate::rng::fill_raw(buf, count); }
+        return count as i64;
+    }
+    // /tyn/resolv.conf: serve the snapshot from the current read position.
+    if fd as i64 == FD_RESOLV_CONF {
+        let mut g = RESOLV.lock();
+        let (content, pos) = &mut *g;
+        let remaining = content.len().saturating_sub(*pos);
+        if remaining == 0 { return 0; }
+        let n = remaining.min(count);
+        // SAFETY: buf points to `count` bytes of identity-mapped user memory.
+        unsafe { core::ptr::copy_nonoverlapping(content[*pos..].as_ptr(), buf, n); }
+        *pos += n;
+        return n as i64;
     }
     // Synthetic /sys files: return "0\n" once, then EOF
     if fd as i64 == FD_SYNTH_ZERO {
@@ -1041,7 +1065,14 @@ fn sys_uname(buf: *mut u8) -> i64 {
     // SAFETY: buf points to user memory (identity-mapped).
     unsafe {
         core::ptr::write_bytes(buf, 0, 65 * 5);
-        let fields = [b"Linux" as &[u8], b"tyn", b"6.1.0-tyn", b"Tyn Kernel", b"x86_64"];
+        // nodename is DOTTED ("tyn.local", not "tyn") on purpose: musl's
+        // gethostname() returns this field, and ERTS's inet_config:set_hostname/0
+        // splits it into host+domain. A dot-less name leaves the resolver domain
+        // empty, which makes inet_config attempt a *native* gethostbyname at boot
+        // — spawning the inet_gethost port program Tyn can't exec (fatal). The
+        // dot gives a non-empty domain ("local"), so that native lookup is
+        // skipped. See src/net/socket.rs sys_bind for the paired reasoning.
+        let fields = [b"Linux" as &[u8], b"tyn.local", b"6.1.0-tyn", b"Tyn Kernel", b"x86_64"];
         for (i, field) in fields.iter().enumerate() {
             core::ptr::copy_nonoverlapping(
                 field.as_ptr(),
@@ -1096,6 +1127,14 @@ fn sys_prlimit64(_new: *const u8, old: *mut u8) -> i64 {
 const FD_DEVNULL: i64 = 100;
 const FD_SYNTH_ZERO: i64 = 101; // synthetic file: read returns "0\n"
 const FD_SYNTH_DIR: i64 = 102;  // synthetic empty directory: getdents64 returns 0
+const FD_DEV_RANDOM: i64 = 103; // synthetic /dev/urandom + /dev/random: read = CSPRNG
+const FD_RESOLV_CONF: i64 = 104; // synthetic /tyn/resolv.conf from DHCP nameservers
+
+/// Synthetic /etc/resolv.conf backing store (content + read position). Populated
+/// on open from the DHCP-learned nameservers; served by read/fstat. tyn_boot
+/// reads this via erl_prim_loader to configure inet_res.
+static RESOLV: spin::Mutex<(alloc::vec::Vec<u8>, usize)> =
+    spin::Mutex::new((alloc::vec::Vec::new(), 0));
 
 fn sys_open(a0: u64, a1: u64, nr: u64) -> i64 {
     // For SYS_OPENAT, the filename is in a1 (a0 is dirfd).
@@ -1119,6 +1158,26 @@ fn sys_open(a0: u64, a1: u64, nr: u64) -> i64 {
     // Check /dev/null
     if path == b"/dev/null" {
         return FD_DEVNULL;
+    }
+    // /dev/urandom and /dev/random: some libraries open the file rather than
+    // calling getrandom(2). Reads are served from the kernel CSPRNG (src/rng.rs).
+    if path == b"/dev/urandom" || path == b"/dev/random" {
+        return FD_DEV_RANDOM;
+    }
+    // /tyn/resolv.conf: synthesized from the DHCP-learned nameservers. Snapshot
+    // the content at open time and serve it from a read position.
+    //
+    // NOT /etc/resolv.conf: ERTS's inet_config reads /etc/resolv.conf during
+    // kernel-app startup, and its mere presence makes inet_config attempt a
+    // native hostname resolution at boot — which spawns the inet_gethost port
+    // program. Tyn can't exec that program (enosys), so the node dies before
+    // -eval ever runs. We keep /etc/resolv.conf absent (ENOENT, as it always
+    // was) and expose the nameservers at a private path that inet_config never
+    // reads; tyn_boot reads /tyn/resolv.conf and configures inet_db itself.
+    if path == b"/tyn/resolv.conf" {
+        let content = crate::net::resolv_conf().into_bytes();
+        *RESOLV.lock() = (content, 0);
+        return FD_RESOLV_CONF;
     }
 
     // Synthetic /sys files for CPU topology — ERTS reads these to detect cores.
@@ -1205,6 +1264,24 @@ fn sys_stat(path_ptr: *const u8, buf: *mut u8) -> i64 {
         unsafe { core::ptr::write_bytes(buf, 0, 144); }
     }
 
+    // /dev/urandom + /dev/random: report a character device.
+    if path == b"/dev/urandom" || path == b"/dev/random" || path == b"/dev/null" {
+        if !buf.is_null() {
+            unsafe { *(buf.add(24) as *mut u32) = 0o020666; } // S_IFCHR | 0666
+        }
+        return 0;
+    }
+    // /tyn/resolv.conf: synthetic regular file sized from the DHCP nameservers.
+    if path == b"/tyn/resolv.conf" {
+        if !buf.is_null() {
+            unsafe {
+                *(buf.add(24) as *mut u32) = 0o100644; // S_IFREG
+                *(buf.add(48) as *mut u64) = crate::net::resolv_conf().len() as u64;
+            }
+        }
+        return 0;
+    }
+
     // Try opening as a file to get size
     let vfs_fd = crate::vfs::open(path);
     if vfs_fd >= 0 {
@@ -1257,6 +1334,12 @@ fn sys_fstat(fd: i32, buf: *mut u8) -> i64 {
             // crashes code_server:init/3 at the `{ok,Dirs} = ...` match.
             if fd as i64 == FD_SYNTH_DIR || crate::vfs::is_dir_fd(fd) {
                 *mode_ptr = 0o40755; // S_IFDIR | 0755
+            } else if fd as i64 == FD_DEV_RANDOM || fd as i64 == FD_DEVNULL {
+                *mode_ptr = 0o020666; // S_IFCHR | 0666
+            } else if fd as i64 == FD_RESOLV_CONF {
+                *mode_ptr = 0o100644; // S_IFREG
+                let size_ptr = buf.add(48) as *mut u64;
+                *size_ptr = RESOLV.lock().0.len() as u64;
             } else {
                 *mode_ptr = 0o100644; // S_IFREG | 0644
                 if let Some(size) = crate::vfs::fstat_size(fd) {
@@ -1286,20 +1369,13 @@ fn sys_newfstatat(dirfd: i32, path_ptr: *const u8, buf: *mut u8, _flags: i32) ->
 }
 
 fn sys_getrandom(buf: *mut u8, len: usize) -> i64 {
-    unsafe {
-        let mut i = 0;
-        while i < len {
-            let mut val: u64 = 0;
-            let ok = core::arch::x86_64::_rdrand64_step(&mut val);
-            if ok == 0 {
-                val = core::arch::x86_64::_rdtsc(); // fallback
-            }
-            let bytes = val.to_ne_bytes();
-            let to_copy = (len - i).min(8);
-            core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.add(i), to_copy);
-            i += to_copy;
-        }
+    // getrandom(buf, buflen, flags): the CSPRNG is seeded at boot, so no flag
+    // (GRND_NONBLOCK/GRND_RANDOM) ever needs to block — just fill and return.
+    if buf.is_null() || len == 0 {
+        return 0;
     }
+    // SAFETY: buf/len come from the caller; user memory is identity-mapped.
+    unsafe { crate::rng::fill_raw(buf, len); }
     len as i64
 }
 
@@ -1408,6 +1484,9 @@ fn sys_epoll_ctl(op: i32, fd: i32, event_ptr: u64) -> i64 {
 
 fn sys_epoll_wait(_epfd: u64, events_ptr: u64, maxevents: u64, timeout_ms: i32) -> i64 {
     const EPOLLIN: u32 = 0x001;
+    const EPOLLOUT: u32 = 0x004;
+    const EPOLLERR: u32 = 0x008;
+    const EPOLLHUP: u32 = 0x010;
     let max = maxevents as usize;
 
     // ERTS calls epoll_wait(epfd, events, max, timeout_ms) with a timeout
@@ -1437,23 +1516,30 @@ fn sys_epoll_wait(_epfd: u64, events_ptr: u64, maxevents: u64, timeout_ms: i32) 
             for e in EPOLL_TABLE.iter() {
                 if count >= max as i64 { break; }
                 if e.fd < 0 { continue; }
-                let ready = if e.fd == 51 {
-                    timerfd_ready()
+                // revents = the events actually ready, matched against what ERTS
+                // registered (e.events) — plus ERR/HUP, which epoll always
+                // reports. Critically this must include EPOLLOUT: a non-blocking
+                // connect completes by the socket becoming writable, and ERTS
+                // registers EPOLLOUT and waits for exactly that. Reporting only
+                // EPOLLIN (the old bug) left every outbound connect hung.
+                let revents: u32 = if e.fd == 51 {
+                    if timerfd_ready() { EPOLLIN } else { 0 }
                 } else if e.fd == 0 {
                     // serial stdin: COM1 LSR data-ready bit. Mirrors ppoll so
                     // ERTS's epoll-driven fd port sees the serial shell's input.
-                    unsafe { x86_64::instructions::port::Port::<u8>::new(0x3FD).read() & 1 != 0 }
+                    if unsafe { x86_64::instructions::port::Port::<u8>::new(0x3FD).read() & 1 != 0 } { EPOLLIN } else { 0 }
                 } else if crate::pipe::is_pipe_fd(e.fd) {
-                    crate::pipe::has_data(e.fd)
+                    if crate::pipe::has_data(e.fd) { EPOLLIN } else { 0 }
                 } else if crate::net::socket::is_socket_fd(e.fd) {
-                    crate::net::socket::poll_socket(e.fd) & 0x1 != 0
+                    let sev = crate::net::socket::poll_socket(e.fd) as u32;
+                    sev & (e.events | EPOLLERR | EPOLLHUP)
                 } else {
-                    false
+                    0
                 };
-                if ready {
+                if revents != 0 {
                     let off = (count as u64) * 12;
                     let ev = (events_ptr + off) as *mut u8;
-                    *(ev as *mut u32) = EPOLLIN;
+                    *(ev as *mut u32) = revents;
                     *((ev as u64 + 4) as *mut u64) = e.data;
                     count += 1;
                 }

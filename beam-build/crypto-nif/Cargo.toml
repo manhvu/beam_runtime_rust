@@ -1,0 +1,27 @@
+# standalone — not part of the kernel's cargo workspace
+[workspace]
+
+[package]
+name = "tyn_crypto_nif"
+version = "0.1.0"
+edition = "2021"
+
+# The Rust crypto NIF (Option A): implements the enumerated :crypto surface with
+# vetted RustCrypto crates, linked into beam.smp via --enable-static-nifs. no_std;
+# allocation is routed to enif_alloc/enif_free.
+[lib]
+name = "crypto"          # archive `crypto.a` -> `crypto_nif_init`, module "crypto"
+crate-type = ["staticlib"]
+
+[dependencies]
+sha1 = { version = "0.10", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+hmac = { version = "0.12", default-features = false }
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+subtle = { version = "2", default-features = false }
+
+[profile.release]
+panic = "abort"
+opt-level = 3

@@ -46,6 +46,20 @@ Tyn runs the real, unmodified ERTS/BEAM — not a reimplementation. When OTP shi
 
 **OTP 27 BEAM running on bare metal with SMP, TCP, Phoenix + Bandit + Plug, and Elixir — on QEMU and on real AWS Nitro.**
 
+> ⚠️ **Crypto is new and unreviewed.** Tyn's `:crypto` is a from-scratch Rust NIF
+> (RustCrypto primitives) fed by a from-scratch kernel CSPRNG (RDSEED → ChaCha20).
+> It passes known-answer vectors and cross-checks byte-for-byte against upstream
+> OTP, but it has **not** had outside security review. Do not trust it for
+> production session security (cookies, CSRF, tokens) until it has.
+>
+> **No in-guest TLS.** `ssl`, `public_key`, and `asn1` are **stubs** (empty library
+> apps) so the dependency graph resolves — they satisfy `ensure_all_started` but
+> provide no functions. **Terminate TLS at the load balancer** and serve plain HTTP
+> (`scheme: http`) in-guest. Configuring an `https:` listener will start cleanly and
+> then fail with `:undef` at request time; `tyn-pack` warns when it detects one.
+> The boot also requires a hardware RNG (RDRAND/RDSEED) and **panics on a CPU
+> without one** (present on c5/m5/t3 Nitro families).
+
 ### Running on AWS Nitro
 
 Tyn boots on a stock **c5.large EC2 instance**, brings up the **Elastic Network Adapter (ENA)** with a driver written from scratch in Rust, configures its address over **DHCP**, and serves Phoenix HTTP through the real Nitro NIC. Verified end-to-end with `curl` from a separate machine:

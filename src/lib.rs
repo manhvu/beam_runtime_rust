@@ -14,6 +14,7 @@ pub mod interrupts;
 pub mod memory;
 pub mod net;
 pub mod percpu;
+pub mod rng;
 pub mod sched;
 pub mod serial;
 pub mod smp;

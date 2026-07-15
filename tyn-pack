@@ -55,11 +55,15 @@ EOF
 
 REL=""; OUT=""; BASE="src/otp-rootfs.cpio"; TYN_ERL="src/erl"
 APP=""; PORT=8080; PLUG=""; START_MFA=""
+# OTP lib dir to source core .app files (compiler/sasl/...) not bundled by an
+# include_erts:false release. Defaults to the build host's system OTP.
+OTP_LIB="${OTP_LIB:-/usr/lib/erlang/lib}"
 while [ $# -gt 0 ]; do
   case "$1" in
     -o|--out) OUT="$2"; shift 2;;
     --base) BASE="$2"; shift 2;;
     --tyn-erl) TYN_ERL="$2"; shift 2;;
+    --otp-lib) OTP_LIB="$2"; shift 2;;
     --app) APP="$2"; shift 2;;
     --port) PORT="$2"; shift 2;;
     --plug) PLUG="$2"; shift 2;;
@@ -143,15 +147,49 @@ for ebin in "$REL"/lib/*/ebin; do
 done
 note "overlaid: $napp .app files; beams from $nbeam_apps non-core release apps"
 
-# ================= Step 4: crypto/ssl warning =================
+# ================= Step 3b: Phoenix / crypto enablement =================
+# What makes mainstream Phoenix ({apps,[my_app]}) boot on Tyn:
+#  - the Tyn crypto shim (crypto.beam + crypto.app) — the Rust crypto NIF is in
+#    beam.smp; :crypto works (SHA/HMAC/AES-GCM/PBKDF2/strong_rand_bytes).
+#  - the release's sys.config (app env: e.g. the Endpoint's port/secret_key_base);
+#    tyn_boot application:set_env's it before ensure_all_started.
+#  - stub library .app for ssl/public_key/asn1 (TLS/X.509 — Tyn terminates TLS at
+#    the load balancer, not in-guest), so the dependency graph resolves without
+#    real ssl beams. HTTP never calls them.
+#  - OTP-core library .app files (compiler/sasl/runtime_tools) that an
+#    include_erts:false release doesn't bundle and the base cpio lacks.
+for b in crypto.beam crypto.app; do
+  [ -f "$TYN_ERL/$b" ] && cp "$TYN_ERL/$b" "$STAGE/$b"
+done
+SYSCFG=$(find "$REL/releases" -name sys.config 2>/dev/null | head -1)
+[ -n "$SYSCFG" ] && cp "$SYSCFG" "$STAGE/sys.config" && note "sys.config -> cpio root"
+# Warn loudly if the release configures HTTPS/TLS: :ssl is a STUB on Tyn, so an
+# https listener starts cleanly then fails with :undef at request time. Silent
+# success + mysterious runtime failure is worse than an up-front error.
+if [ -n "$SYSCFG" ] && grep -qE '\{https,|[,[]https[],]' "$SYSCFG" 2>/dev/null; then
+  echo "tyn-pack: WARNING: the release configures HTTPS/TLS (an :https key in the" >&2
+  echo "tyn-pack:          Endpoint config). Tyn has NO in-guest TLS — ssl/public_key/asn1" >&2
+  echo "tyn-pack:          are STUBS, so an https listener starts cleanly then fails with" >&2
+  echo "tyn-pack:          :undef at request time. Terminate TLS at the load balancer and" >&2
+  echo "tyn-pack:          serve plain HTTP (scheme: http) in-guest." >&2
+fi
+for app in ssl public_key asn1; do
+  printf '%s' "{application, $app, [{description,\"stub (Tyn: TLS/X.509 at the load balancer)\"},{vsn,\"1.0\"},{modules,[]},{registered,[]},{applications,[kernel,stdlib]}]}." > "$STAGE/$app.app"
+done
+for app in compiler sasl runtime_tools; do
+  f=$(ls "$OTP_LIB"/${app}-*/ebin/${app}.app 2>/dev/null | head -1)
+  [ -n "$f" ] && cp "$f" "$STAGE/"
+done
+note "enabled crypto shim + stub ssl/public_key/asn1 + OTP-core .app"
+
+# ================= Step 4: crypto/ssl note =================
+# :crypto is now provided by the Tyn shim; only :ssl (TLS) is stubbed.
 CRYPTO_APPS=$(echo "$CRYPTO_APPS" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ')
 if [ -n "${CRYPTO_APPS// /}" ]; then
-  echo "tyn-pack: WARNING: these apps depend on :crypto/:ssl, which are UNAVAILABLE" >&2
-  echo "tyn-pack:          on Tyn (beam.smp is static musl, no OpenSSL; :crypto is a NIF):" >&2
-  echo "tyn-pack:            $CRYPTO_APPS" >&2
-  echo "tyn-pack:          Apps needing crypto (e.g. a full Phoenix Endpoint that signs" >&2
-  echo "tyn-pack:          with secret_key_base) will FAIL at runtime. Bandit + Plug" >&2
-  echo "tyn-pack:          without Endpoint signing is the supported configuration." >&2
+  echo "tyn-pack: NOTE: $CRYPTO_APPS use :crypto/:ssl." >&2
+  echo "tyn-pack:       :crypto works via Tyn's Rust NIF shim (SHA/HMAC/AES-GCM/PBKDF2)." >&2
+  echo "tyn-pack:       :ssl is stubbed — TLS is terminated at the load balancer, not" >&2
+  echo "tyn-pack:       in-guest, so serve plain HTTP (scheme: http) behind it." >&2
 fi
 
 # ================= Step 5: boot.config =================

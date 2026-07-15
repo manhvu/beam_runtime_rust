@@ -18,6 +18,33 @@ use virtio_drivers::transport::pci::PciTransport;
 use crate::net::device::{VirtioNetDevice, VirtioRxToken, VirtioTxToken};
 use crate::net::ena::device::{EnaDevice, EnaRxToken, EnaTxToken};
 use crate::serial_println;
+use smoltcp::wire::Ipv4Address;
+
+/// DNS nameservers from the DHCP lease. Exposed to userspace via the synthetic
+/// /etc/resolv.conf and read by tyn_boot to configure inet_res (the pure-Erlang
+/// resolver). Empty until DHCP configures.
+static DNS_SERVERS: spin::Mutex<alloc::vec::Vec<Ipv4Address>> =
+    spin::Mutex::new(alloc::vec::Vec::new());
+
+/// Record DHCP-provided nameservers (idempotent replace).
+fn set_dns_servers(cfg: &dhcpv4::Config) {
+    let mut v = DNS_SERVERS.lock();
+    v.clear();
+    for ns in cfg.dns_servers.iter() {
+        v.push(*ns);
+    }
+}
+
+/// Synthesize `/etc/resolv.conf` content from the DHCP nameservers.
+/// Empty vec → empty string (tyn_boot then skips DNS setup).
+pub fn resolv_conf() -> alloc::string::String {
+    use core::fmt::Write;
+    let mut s = alloc::string::String::new();
+    for ns in DNS_SERVERS.lock().iter() {
+        let _ = writeln!(s, "nameserver {}", ns);
+    }
+    s
+}
 
 /// The physical NIC backing smoltcp. virtio-net on QEMU, ENA on AWS Nitro.
 /// An enum (not `dyn Device`) because smoltcp's `Device` has GAT token
@@ -134,6 +161,7 @@ impl NetState {
                     if let Some(router) = config.router {
                         let _ = self.iface.routes_mut().add_default_ipv4_route(router);
                     }
+                    set_dns_servers(&config);
                 }
                 Some(dhcpv4::Event::Deconfigured) => {
                     serial_println!("[net] DHCP lease lost");
@@ -185,6 +213,12 @@ pub fn init_with_transport(transport: PciTransport) {
         .routes_mut()
         .add_default_ipv4_route(interface::GATEWAY_IP)
         .expect("adding default route failed");
+
+    // The virtio dev path is static-IP (no DHCP to learn a nameserver). QEMU's
+    // SLIRP user-net always runs a DNS forwarder at 10.0.2.3 (gateway .2), so
+    // seed it — this makes /tyn/resolv.conf non-empty and outbound DNS behave
+    // under QEMU exactly as it does from a DHCP lease on Nitro.
+    DNS_SERVERS.lock().push(Ipv4Address::new(10, 0, 2, 3));
 
     let sockets = SocketSet::new(alloc::vec::Vec::new());
     let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
@@ -240,6 +274,7 @@ pub fn init_with_ena(dev: EnaDevice) {
                     if let Some(router) = config.router {
                         let _ = iface.routes_mut().add_default_ipv4_route(router);
                     }
+                    set_dns_servers(&config);
                     configured = true;
                     break 'attempts;
                 }

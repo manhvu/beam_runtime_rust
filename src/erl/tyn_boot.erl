@@ -43,6 +43,15 @@ start() ->
     %%    the very end (on success) so kernel logs stay visible through app
     %%    startup and, on failure, stay visible for debugging.
     start_shells(),
+    %% 1b. Apply the release's sys.config (app environment) if the cpio carries
+    %%    one — a Mix release keeps its compile-time config there, and e.g. a
+    %%    Phoenix Endpoint needs its adapter/port/secret_key_base from it.
+    apply_sys_config(),
+    %% 1c. Configure the pure-Erlang DNS resolver (inet_res) from the DHCP
+    %%    nameservers BEFORE any app can resolve a name — otherwise ERTS's
+    %%    default inet_gethost port program is tried (Tyn can't spawn it) and
+    %%    hangs. Must precede ensure_all_started.
+    configure_dns(),
     %% 2/3/4/5. Config-driven app + listener, guarded so a failure can't take
     %%    down the boot process (and with it, cleanliness of the shells).
     try
@@ -65,6 +74,67 @@ start_shells() ->
     catch tcp_shell:start(9090),
     catch serial_shell:start(),
     io:format("shell_listening 9090~n").
+
+%% Configure ERTS's resolver to use the kernel-synthesized nameservers via the
+%% pure-Erlang inet_res (gen_udp), never the native inet_gethost port program
+%% (which Tyn can't spawn — any 'native' lookup is fatal).
+%%
+%% Two things matter, both learned the hard way:
+%%
+%%  1. set_lookup([dns]) — drop 'native' from the lookup order entirely, so no
+%%     code path can ever spawn inet_gethost after boot.
+%%
+%%  2. set_resolv_conf("/tyn/resolv.conf") — point inet at the kernel's file and
+%%     let inet own the parsing. This is NOT interchangeable with the obvious
+%%     inet_db:add_ns/1: inet_res calls inet_db:res_update_conf() on *every*
+%%     query, which reloads nameservers from the configured resolv.conf file and
+%%     WIPES anything add_ns put there. add_ns "works" until the first resolve,
+%%     then silently reverts to empty -> nxdomain. Pointing at the file makes the
+%%     nameservers survive every reload.
+%%
+%% Deliberately NOT /etc/resolv.conf: ERTS's inet_config reads that path during
+%% kernel-app startup; here we hand inet our private copy after boot instead.
+%% (The boot-time native-lookup hazard is handled separately by the kernel
+%% giving the node a dotted hostname — see src/syscall.rs sys_uname.)
+configure_dns() ->
+    inet_db:set_lookup([dns]),
+    case try_paths(["/tyn/resolv.conf"]) of
+        {ok, Bin} ->
+            case has_nameserver(Bin) of
+                true ->
+                    inet_db:set_resolv_conf("/tyn/resolv.conf"),
+                    io:format("tyn_boot: DNS -> [dns] via /tyn/resolv.conf ~p~n",
+                              [inet_db:res_option(nameservers)]);
+                false ->
+                    io:format("tyn_boot: /tyn/resolv.conf has no nameservers; "
+                              "DNS lookups will fail (no upstream)~n")
+            end;
+        error ->
+            io:format("tyn_boot: /tyn/resolv.conf absent; DNS lookups will fail~n")
+    end.
+
+has_nameserver(Bin) ->
+    case binary:match(Bin, <<"nameserver ">>) of
+        nomatch -> false;
+        _ -> true
+    end.
+
+%% Read sys.config (one Erlang term: [{App,[{K,V}...]}...]) from the cpio and
+%% application:set_env each key, so a release's compile-time config takes effect.
+apply_sys_config() ->
+    case try_paths(["sys.config", "/sys.config", "./sys.config"]) of
+        {ok, Bin} ->
+            case parse_terms(binary_to_list(Bin)) of
+                {ok, [Cfg | _]} when is_list(Cfg) ->
+                    _ = [ [ application:set_env(App, K, V) || {K, V} <- KVs ]
+                          || {App, KVs} <- Cfg ],
+                    io:format("tyn_boot: sys.config applied (~p apps)~n", [length(Cfg)]);
+                _ ->
+                    io:format("tyn_boot: sys.config present but not parseable, skipping~n")
+            end;
+        error ->
+            ok
+    end.
 
 %% Returns a proplist of config terms. Absent boot.config -> demo defaults.
 %% Malformed boot.config raises (caught by start/0 -> FAILED, no halt).

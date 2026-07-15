@@ -73,6 +73,28 @@ struct Socket {
     /// Local address after bind
     local_port: u16,
     local_addr: Ipv4Address,
+    /// TcpStream: true between `connect()` and the moment we observe the
+    /// SynSent→Established (success) or SynSent→Closed (failure) transition.
+    /// Drives the getsockopt(SO_ERROR) / POLLOUT|POLLERR reporting ERTS waits on.
+    connecting: bool,
+    /// UdpDgram: default remote endpoint set by connect(), so send/2 (no addr)
+    /// works. None until connected.
+    udp_peer: Option<IpEndpoint>,
+}
+
+/// Ephemeral source-port allocator for outbound connect() and UDP binds.
+/// 49152–65535 (IANA dynamic range), disjoint from the service ports (8080/9090)
+/// and the listener pool (which binds the low service ports), so it never
+/// collides with inbound.
+static NEXT_EPHEMERAL: AtomicI32 = AtomicI32::new(49152);
+fn alloc_ephemeral_port() -> u16 {
+    let p = NEXT_EPHEMERAL.fetch_add(1, Ordering::Relaxed);
+    // wrap within 49152..=65535
+    let port = 49152 + ((p - 49152).rem_euclid(65535 - 49152 + 1));
+    if port >= 65535 {
+        NEXT_EPHEMERAL.store(49152, Ordering::Relaxed);
+    }
+    port as u16
 }
 
 /// Global socket table. Guarded by its own spinlock; lock order is
@@ -186,13 +208,15 @@ pub fn sys_socket(domain: i32, sock_type: i32, _protocol: i32) -> i64 {
                 net.sockets.add(tcp_socket)
             }
             _ => {
+                // Generous: DNS replies routinely exceed the old 512-byte
+                // assumption with EDNS0, and several may queue before recv.
                 let rx_buf = udp::PacketBuffer::new(
-                    alloc::vec![udp::PacketMetadata::EMPTY; 8],
-                    alloc::vec![0u8; 8192],
+                    alloc::vec![udp::PacketMetadata::EMPTY; 16],
+                    alloc::vec![0u8; 16384],
                 );
                 let tx_buf = udp::PacketBuffer::new(
-                    alloc::vec![udp::PacketMetadata::EMPTY; 8],
-                    alloc::vec![0u8; 8192],
+                    alloc::vec![udp::PacketMetadata::EMPTY; 16],
+                    alloc::vec![0u8; 16384],
                 );
                 let udp_socket = udp::Socket::new(rx_buf, tx_buf);
                 net.sockets.add(udp_socket)
@@ -210,9 +234,66 @@ pub fn sys_socket(domain: i32, sock_type: i32, _protocol: i32) -> i64 {
         backlog: Vec::new(),
         local_port: 0,
         local_addr: Ipv4Address::UNSPECIFIED,
+        connecting: false,
+        udp_peer: None,
     });
 
     fd as i64
+}
+
+/// connect(fd, addr, addrlen) → 0 or -errno. TCP is non-blocking: initiates the
+/// SYN and returns -EINPROGRESS; ERTS then waits on epoll for POLLOUT and calls
+/// getsockopt(SO_ERROR). UDP: records the default peer (send/2 needs no addr).
+pub fn sys_connect(fd: i32, addr_ptr: *const u8, _addrlen: u32) -> i64 {
+    // struct sockaddr_in { sa_family(2), sin_port(2 be), sin_addr(4), zero(8) }
+    let (port, addr) = unsafe {
+        let family = *(addr_ptr as *const u16);
+        if family != 2 { return -97; } // AF_INET only
+        let port = u16::from_be(*(addr_ptr.add(2) as *const u16));
+        let ip = core::slice::from_raw_parts(addr_ptr.add(4), 4);
+        (port, Ipv4Address::new(ip[0], ip[1], ip[2], ip[3]))
+    };
+    let remote = IpEndpoint { addr: IpAddress::Ipv4(addr), port };
+
+    with_socket(fd, |sock| {
+        match sock.sock_type {
+            SockType::UdpDgram => {
+                sock.udp_peer = Some(remote);
+                // smoltcp requires a bound UDP socket before send.
+                if sock.local_port == 0 {
+                    sock.local_port = alloc_ephemeral_port();
+                    crate::net::with_net(|net| {
+                        let udp = net.sockets.get_mut::<udp::Socket>(sock.handle);
+                        let _ = udp.bind(IpListenEndpoint { addr: None, port: sock.local_port });
+                    });
+                }
+                0
+            }
+            SockType::TcpStream | SockType::TcpListener => {
+                let local_port = if sock.local_port != 0 {
+                    sock.local_port
+                } else {
+                    let p = alloc_ephemeral_port();
+                    sock.local_port = p;
+                    p
+                };
+                sock.sock_type = SockType::TcpStream;
+                sock.connecting = true;
+                crate::net::with_net(|net| {
+                    // split borrow: connect needs iface context + the socket
+                    let iface = &mut net.iface;
+                    let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
+                    match tcp.connect(iface.context(), remote, local_port) {
+                        Ok(()) => -115, // -EINPROGRESS
+                        Err(_) => {
+                            sock.connecting = false;
+                            -111 // -ECONNREFUSED (immediate; rare)
+                        }
+                    }
+                })
+            }
+        }
+    }).unwrap_or(-9)
 }
 
 /// bind(fd, addr, addrlen) → 0 or error
@@ -228,6 +309,19 @@ pub fn sys_bind(fd: i32, addr_ptr: *const u8, _addrlen: u32) -> i64 {
     };
 
     with_socket(fd, |sock| {
+        // port 0 = "assign an ephemeral port" (e.g. gen_udp:open(0), which
+        // inet_res uses for DNS). smoltcp binds the exact port given and rejects
+        // 0, so allocate one from the dynamic range here.
+        //
+        // Making this succeed is what inet_res needs — but it also makes ERTS's
+        // boot-time `inet_udp:open(0)` in inet_config:set_hostname/0 succeed,
+        // which then resolves the node's hostname. If that hostname is dot-less
+        // the resolver's domain stays "" and inet_config does a *native*
+        // gethostbyname (the inet_gethost port program Tyn can't spawn → fatal).
+        // The kernel therefore reports a DOTTED hostname from uname (see
+        // sys_uname: "tyn.local"), so set_hostname/1 records a non-empty domain
+        // and inet_config skips that native lookup. The two changes are a pair.
+        let port = if port == 0 { alloc_ephemeral_port() } else { port };
         sock.local_port = port;
         sock.local_addr = addr;
 
@@ -408,6 +502,8 @@ pub fn sys_accept(fd: i32, addr_ptr: *mut u8, addrlen_ptr: *mut u32, flags: i32)
         backlog: Vec::new(),
         local_port: listen_port,
         local_addr: listen_addr,
+        connecting: false,
+        udp_peer: None,
     });
 
     // Fill in peer address if requested
@@ -523,6 +619,25 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen
     if optval.is_null() || optlen.is_null() {
         return -14; // -EFAULT
     }
+    // SO_ERROR reports the outcome of a non-blocking connect(): 0 once
+    // Established, ECONNREFUSED once the SYN failed (SynSent→Closed). ERTS reads
+    // this the moment the socket becomes writable/errored.
+    let so_error: i32 = with_socket(fd, |sock| {
+        if sock.sock_type == SockType::TcpStream && sock.connecting {
+            crate::net::with_net(|net| {
+                use smoltcp::socket::tcp::State;
+                let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
+                match tcp.state() {
+                    State::Established => { sock.connecting = false; 0 }
+                    State::Closed | State::TimeWait | State::CloseWait => {
+                        sock.connecting = false; 111 // ECONNREFUSED
+                    }
+                    _ => 0, // still in progress
+                }
+            })
+        } else { 0 }
+    }).unwrap_or(0);
+
     unsafe {
         let len = *optlen;
         match (level, optname) {
@@ -540,7 +655,7 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen
                 }
             }
             (1, 4) => { // SO_ERROR
-                if len >= 4 { *(optval as *mut i32) = 0; *optlen = 4; }
+                if len >= 4 { *(optval as *mut i32) = so_error; *optlen = 4; }
             }
             _ => {
                 if len >= 4 { *(optval as *mut i32) = 0; *optlen = 4; }
@@ -552,11 +667,51 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen
 
 /// send/sendto/write on a socket fd
 pub fn sys_sendto(fd: i32, buf: *const u8, len: usize, _flags: i32,
-                  _dest_addr: *const u8, _addrlen: u32) -> i64 {
+                  dest_addr: *const u8, _addrlen: u32) -> i64 {
     let data = unsafe { core::slice::from_raw_parts(buf, len) };
+
+    // For UDP sendto, the destination is in dest_addr (sockaddr_in). If NULL
+    // (plain send/2 on a connected UDP socket), fall back to the stored peer.
+    let dest = if !dest_addr.is_null() {
+        unsafe {
+            let family = *(dest_addr as *const u16);
+            if family == 2 {
+                let port = u16::from_be(*(dest_addr.add(2) as *const u16));
+                let ip = core::slice::from_raw_parts(dest_addr.add(4), 4);
+                Some(IpEndpoint {
+                    addr: IpAddress::Ipv4(Ipv4Address::new(ip[0], ip[1], ip[2], ip[3])),
+                    port,
+                })
+            } else { None }
+        }
+    } else { None };
 
     with_socket(fd, |sock| {
         match sock.sock_type {
+            SockType::UdpDgram => {
+                let endpoint = match dest.or(sock.udp_peer) {
+                    Some(e) => e,
+                    None => return -89i64, // -EDESTADDRREQ
+                };
+                // smoltcp requires the socket be bound before send.
+                if sock.local_port == 0 {
+                    sock.local_port = alloc_ephemeral_port();
+                    crate::net::with_net(|net| {
+                        let udp = net.sockets.get_mut::<udp::Socket>(sock.handle);
+                        let _ = udp.bind(IpListenEndpoint { addr: None, port: sock.local_port });
+                    });
+                }
+                let r = crate::net::with_net(|net| {
+                    let udp = net.sockets.get_mut::<udp::Socket>(sock.handle);
+                    match udp.send_slice(data, endpoint) {
+                        Ok(()) => len as i64,
+                        Err(udp::SendError::BufferFull) => -11, // -EAGAIN
+                        Err(_) => -22, // -EINVAL
+                    }
+                });
+                crate::net::poll(); // flush the datagram now
+                r
+            }
             SockType::TcpStream => {
                 crate::net::with_net(|net| {
                     let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
@@ -569,15 +724,14 @@ pub fn sys_sendto(fd: i32, buf: *const u8, len: usize, _flags: i32,
                     }
                 })
             }
-            SockType::UdpDgram => -95, // -EOPNOTSUPP
-            _ => -9,
+            SockType::TcpListener => -95, // -EOPNOTSUPP
         }
     }).unwrap_or(-9)
 }
 
 /// recv/recvfrom/read on a socket fd
 pub fn sys_recvfrom(fd: i32, buf: *mut u8, len: usize, _flags: i32,
-                    _src_addr: *mut u8, _addrlen: *mut u32) -> i64 {
+                    src_addr: *mut u8, addrlen: *mut u32) -> i64 {
     // Poll network first to process any pending incoming packets. Done
     // outside the SOCKETS lock so concurrent senders/recvers on other
     // fds aren't blocked.
@@ -601,7 +755,39 @@ pub fn sys_recvfrom(fd: i32, buf: *mut u8, len: usize, _flags: i32,
                     }
                 })
             }
-            _ => -9,
+            SockType::UdpDgram => {
+                crate::net::with_net(|net| {
+                    let udp = net.sockets.get_mut::<udp::Socket>(sock.handle);
+                    if !udp.can_recv() {
+                        return -11i64; // -EAGAIN
+                    }
+                    match udp.recv() {
+                        Ok((data, meta)) => {
+                            let n = data.len().min(len);
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(data.as_ptr(), buf, n);
+                                // recvfrom must fill src_addr — the resolver
+                                // verifies the reply came from the nameserver and
+                                // silently drops it otherwise.
+                                if !src_addr.is_null() {
+                                    let ep = meta.endpoint;
+                                    *(src_addr as *mut u16) = 2u16; // AF_INET
+                                    *(src_addr.add(2) as *mut u16) = ep.port.to_be();
+                                    if let IpAddress::Ipv4(v4) = ep.addr {
+                                        let oct = v4.octets();
+                                        core::ptr::copy_nonoverlapping(
+                                            oct.as_ptr(), src_addr.add(4), 4);
+                                    }
+                                    if !addrlen.is_null() { *addrlen = 16; }
+                                }
+                            }
+                            n as i64
+                        }
+                        Err(_) => -11, // -EAGAIN
+                    }
+                })
+            }
+            SockType::TcpListener => -9,
         }
     });
 
@@ -636,8 +822,23 @@ pub fn poll_socket(fd: i32) -> u16 {
         crate::net::with_net(|net| {
             match sock.sock_type {
                 SockType::TcpStream => {
+                    use smoltcp::socket::tcp::State;
                     let tcp = net.sockets.get_mut::<tcp::Socket>(sock.handle);
                     let mut events = 0u16;
+                    if sock.connecting {
+                        // Non-blocking connect in flight: writable == connected.
+                        // Report the failure (SynSent→Closed) as POLLOUT|POLLERR
+                        // so ERTS wakes and reads SO_ERROR (getsockopt), instead
+                        // of hanging on a refused/timed-out connection.
+                        match tcp.state() {
+                            State::Established => { sock.connecting = false; events |= POLLOUT; }
+                            State::Closed | State::TimeWait | State::CloseWait => {
+                                events |= POLLOUT | _POLLERR;
+                            }
+                            _ => {} // still connecting
+                        }
+                        return events;
+                    }
                     if tcp.can_recv() { events |= POLLIN; }
                     if tcp.can_send() { events |= POLLOUT; }
                     if !tcp.is_active() && !tcp.is_listening() {

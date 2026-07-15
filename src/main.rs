@@ -147,6 +147,10 @@ extern "C" fn main(mbi: *const u8) -> ! {
     // Set up syscall entry point
     tyn_kernel::syscall::init();
 
+    // Seed the kernel CSPRNG from the CPU hardware RNG. Panics if the CPU has no
+    // RDRAND/RDSEED — we refuse to serve weak entropy to userspace crypto.
+    tyn_kernel::rng::init();
+
     // Timer starts at first clone (sys_clone sets timer_active, calls init_timer).
     // Pre-clone init must run without interrupts — timer interferes with spin-waits.
 

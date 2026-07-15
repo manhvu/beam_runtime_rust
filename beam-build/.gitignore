@@ -6,3 +6,4 @@ beam.smp.full
 nifs/*.a
 nifs/*.o
 rust-nif/target/
+crypto-nif/target/
