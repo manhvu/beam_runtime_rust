@@ -210,8 +210,83 @@ add_code_paths(Paths) ->
           || P <- Paths, is_list(P) ],
     ok.
 
+%% Set OS env vars from boot.config {env,[{"K","V"}...]} before runtime.exs reads
+%% them. Tyn has no environment otherwise; this is the recompile-free way to
+%% supply SECRET_KEY_BASE / PHX_HOST / PORT (and the precursor to EC2 user-data).
+apply_env([]) -> ok;
+apply_env(Env) ->
+    N = length([ ok || {K, V} <- Env, is_list(K), is_list(V),
+                       true =:= os:putenv(K, V) ]),
+    io:format("tyn_boot: env set (~p vars)~n", [N]).
+
+%% Evaluate the release's runtime.exs and merge the result into the application
+%% environment, before ensure_all_started. Elixir + the config beams are already
+%% in the image, so Config.Reader can read it directly. Guarded: a missing or
+%% raising runtime.exs is reported, not fatal (the shells stay up either way).
+eval_runtime_config() ->
+    case runtime_exs_path() of
+        undefined ->
+            io:format("tyn_boot: no runtime.exs (nothing to evaluate)~n");
+        Path ->
+            try
+                Runtime = 'Elixir.Config.Reader':'read!'(
+                            list_to_binary(Path), [{env, prod}]),
+                %% MERGE runtime.exs into the existing (sys.config/config.exs)
+                %% environment — do NOT replace. put_all_env replaces per {app,key},
+                %% so a bare put would wipe compile-time Endpoint keys that
+                %% runtime.exs doesn't restate (notably `adapter: Bandit.PhoenixAdapter`
+                %% — losing it makes Phoenix fall back to the Cowboy2 adapter and the
+                %% listener never comes up). Config.Reader.merge/2 is Mix's own
+                %% deep keyword-list merge (runtime wins on conflicts).
+                Existing = [ {App, 'Elixir.Application':get_all_env(App)}
+                             || {App, _} <- Runtime ],
+                Merged0 = 'Elixir.Config.Reader':merge(Existing, Runtime),
+                %% Stock Phoenix runtime.exs binds http/https on IPv6-any
+                %% ({0,0,0,0,0,0,0,0}) with the comment "bind on all interfaces".
+                %% Tyn's stack is IPv4-only, so a `::` bind isn't reachable. Rewrite
+                %% any {ip, <8-tuple>} to IPv4-any {0,0,0,0} — same intent, and the
+                %% only place `ip:` appears in Phoenix config is the bind address.
+                Merged = fix_ipv6_bind(Merged0),
+                'Elixir.Application':put_all_env(Merged),
+                io:format("tyn_boot: runtime.exs evaluated + merged (~p apps)~n",
+                          [length(Merged)])
+            catch
+                Class:Reason:Stk ->
+                    io:format("tyn_boot: runtime.exs eval FAILED ~p:~p~n  ~p~n",
+                              [Class, Reason, lists:sublist(Stk, 5)])
+            end
+    end.
+
+%% runtime.exs is placed at the cpio root by tyn-pack. Config.Reader reads the
+%% file itself (via the file server), so return a path erl_prim_loader can find
+%% to confirm it exists before handing the name to Config.Reader.
+runtime_exs_path() ->
+    case try_paths(["runtime.exs", "/runtime.exs", "./runtime.exs"]) of
+        {ok, _} -> "runtime.exs";
+        error   -> undefined
+    end.
+
+%% Recursively rewrite {ip, <IPv6 8-tuple>} -> {ip, {0,0,0,0}} in a config tree,
+%% so an IPv4-only Tyn serves a stock app that defaults to binding IPv6-any.
+fix_ipv6_bind({ip, T}) when tuple_size(T) =:= 8 -> {ip, {0, 0, 0, 0}};
+fix_ipv6_bind({K, V}) -> {K, fix_ipv6_bind(V)};
+fix_ipv6_bind(L) when is_list(L) -> [ fix_ipv6_bind(E) || E <- L ];
+fix_ipv6_bind(Other) -> Other.
+
 apply_config(Terms) ->
     Port = proplists:get_value(port, Terms, 8080),
+    %% Part C — make a STOCK app work unmodified. The runtime configuration a
+    %% `mix release` normally evaluates on the target (secret_key_base, the
+    %% Endpoint http port, PHX_HOST, ...) lives in runtime.exs, which raises if
+    %% its env vars are missing. Order matters and follows Mix's own:
+    %%   sys.config (applied earlier in start/0) -> env -> runtime.exs -> apps.
+    %% 1. Set env vars from boot.config {env,[{"K","V"}...]} FIRST, so
+    %%    System.get_env in runtime.exs sees them (this is also how a user
+    %%    supplies SECRET_KEY_BASE without recompiling).
+    apply_env(proplists:get_value(env, Terms, [])),
+    %% 2. Evaluate runtime.exs (Config.Reader) and put_all_env the result, before
+    %%    any app starts and reads its (now-complete) environment.
+    eval_runtime_config(),
     %% Put each release app's lib/<app>-<vsn>/ebin on the code path BEFORE
     %% starting apps. This is what makes code:lib_dir/1 (and therefore
     %% Application.app_dir/2 -> priv/static) resolve: without an ebin dir named

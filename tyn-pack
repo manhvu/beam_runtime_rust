@@ -49,12 +49,14 @@ usage: tyn-pack <release_dir> -o <out.cpio> [options]
   --plug MODULE          1c override: hand this Plug to Bandit (sets boot.config
                          {plug,MODULE} instead of {apps,[app]})
   --start-mfa 'm:f(a,b)' 1c override: {start_mfa,{m,f,[a,b]}}
+  --env KEY=VAL          set an env var for runtime.exs (repeatable), e.g.
+                         --env SECRET_KEY_BASE=... --env PHX_SERVER=true
 EOF
   exit 2
 }
 
 REL=""; OUT=""; BASE="src/otp-rootfs.cpio"; TYN_ERL="src/erl"
-APP=""; PORT=8080; PLUG=""; START_MFA=""
+APP=""; PORT=8080; PLUG=""; START_MFA=""; ENV_VARS=""
 # OTP lib dir to source core .app files (compiler/sasl/...) not bundled by an
 # include_erts:false release. Defaults to the build host's system OTP.
 OTP_LIB="${OTP_LIB:-/usr/lib/erlang/lib}"
@@ -68,6 +70,8 @@ while [ $# -gt 0 ]; do
     --port) PORT="$2"; shift 2;;
     --plug) PLUG="$2"; shift 2;;
     --start-mfa) START_MFA="$2"; shift 2;;
+    --env) ENV_VARS="$ENV_VARS
+$2"; shift 2;;   # KEY=VAL, repeatable; -> boot.config {env,...} for runtime.exs
     -h|--help) usage;;
     -*) die "unknown option $1";;
     *) [ -z "$REL" ] && REL="$1" || die "unexpected arg $1"; shift;;
@@ -189,6 +193,10 @@ for b in crypto.beam crypto.app; do
 done
 SYSCFG=$(find "$REL/releases" -name sys.config 2>/dev/null | head -1)
 [ -n "$SYSCFG" ] && cp "$SYSCFG" "$STAGE/sys.config" && note "sys.config -> cpio root"
+# Part C: ship runtime.exs so tyn_boot can evaluate it on boot (secret_key_base,
+# Endpoint port/host, ...). A stock app keeps its runtime config here; no hand-edit.
+RUNTIME=$(find "$REL/releases" -name runtime.exs 2>/dev/null | head -1)
+[ -n "$RUNTIME" ] && cp "$RUNTIME" "$STAGE/runtime.exs" && note "runtime.exs -> cpio root"
 # Warn loudly if the release configures HTTPS/TLS: :ssl is a STUB on Tyn, so an
 # https listener starts cleanly then fails with :undef at request time. Silent
 # success + mysterious runtime failure is worse than an up-front error.
@@ -245,6 +253,19 @@ BC="$STAGE/boot.config"
     for p in $CODE_PATHS; do
       [ "$first" = 1 ] && first=0 || printf ', '
       printf '"%s"' "$p"
+    done
+    printf ']}.\n'
+  fi
+  # Part C: env vars for runtime.exs. tyn_boot os:putenv's these BEFORE evaluating
+  # runtime.exs, so System.get_env("SECRET_KEY_BASE") etc. resolve without a recompile.
+  if [ -n "$(printf '%s' "$ENV_VARS" | tr -d '[:space:]')" ]; then
+    printf '{env, ['
+    first=1
+    printf '%s\n' "$ENV_VARS" | while IFS= read -r kv; do
+      [ -z "$kv" ] && continue
+      k=${kv%%=*}; v=${kv#*=}
+      [ "$first" = 1 ] && first=0 || printf ', '
+      printf '{"%s", "%s"}' "$k" "$v"
     done
     printf ']}.\n'
   fi
