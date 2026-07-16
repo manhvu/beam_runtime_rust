@@ -201,8 +201,25 @@ take_term([{dot, _} = D | Rest], Acc) -> {ok, lists:reverse([D | Acc]), Rest};
 take_term([T | Rest], Acc) -> take_term(Rest, [T | Acc]);
 take_term([], Acc) -> {more, lists:reverse(Acc)}.
 
+%% Add release lib/<app>-<vsn>/ebin dirs to the code path so code:lib_dir/1
+%% resolves (see apply_config/1). add_pathz is lenient — a bad path returns
+%% {error,bad_directory} rather than raising — so a stray entry can't break boot.
+add_code_paths([]) -> ok;
+add_code_paths(Paths) ->
+    _ = [ io:format("tyn_boot: code path ~ts -> ~p~n", [P, code:add_pathz(P)])
+          || P <- Paths, is_list(P) ],
+    ok.
+
 apply_config(Terms) ->
     Port = proplists:get_value(port, Terms, 8080),
+    %% Put each release app's lib/<app>-<vsn>/ebin on the code path BEFORE
+    %% starting apps. This is what makes code:lib_dir/1 (and therefore
+    %% Application.app_dir/2 -> priv/static) resolve: without an ebin dir named
+    %% <app>-<vsn> on the path, there is no priv to find and Plug.Static /
+    %% Phoenix's static handlers fail. The beams themselves still load from the
+    %% flat cpio root (the proven path); these entries exist for lib_dir + priv.
+    %% tyn-pack emits both the nested layout and this {code_paths,...} list.
+    add_code_paths(proplists:get_value(code_paths, Terms, [])),
     start_apps(proplists:get_value(apps, Terms, [])),
     case proplists:get_value(start_mfa, Terms) of
         {M, F, A} when is_list(A) ->

@@ -1301,8 +1301,14 @@ fn sys_stat(path_ptr: *const u8, buf: *mut u8) -> i64 {
         return 0;
     }
 
-    // Check if it's a known directory prefix
-    if path.starts_with(b"/otp")
+    // Directory? A cpio has no directory entries, but any path that is a prefix
+    // of some entry (e.g. lib/<app>-<vsn>/ebin) is a directory as far as the
+    // release layout is concerned. Reporting S_IFDIR here is what lets
+    // code:add_pathz accept those dirs (file:read_file_info -> stat must say
+    // `directory`, else add_pathz returns {error,bad_directory} and code:lib_dir
+    // -> bad_name, breaking Application.app_dir/priv). The /sys entries are
+    // synthetic (not in the cpio) so keep them explicit.
+    if crate::vfs::is_dir_prefix(path)
         || path == b"/sys/devices/system/node"
         || path == b"/sys/devices/system/cpu"
         || path.starts_with(b"/sys/devices/system/node/node")

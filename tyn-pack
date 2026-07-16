@@ -147,6 +147,32 @@ for ebin in "$REL"/lib/*/ebin; do
 done
 note "overlaid: $napp .app files; beams from $nbeam_apps non-core release apps"
 
+# ============ Step 3c: release layout for app_dir/priv (Part B) ============
+# Application.app_dir(App,"priv/...") -> code:lib_dir(App) needs each app at
+# lib/<app>-<vsn>/ebin ON THE CODE PATH with priv/ alongside; a flat cpio has no
+# such dir, so static-asset (and LiveView-behind-it) handlers fail. Emit the
+# nested layout (ebin/<app>.app + priv/**) for every non-core app. The beams keep
+# loading from the flat root — nothing is duplicated but the tiny .app files and
+# each app's priv/. tyn_boot code:add_pathz's these ebin dirs before app start
+# (see the {code_paths,...} written into boot.config below).
+CODE_PATHS=""
+nlibs=0; npriv=0
+for ebin in "$REL"/lib/*/ebin; do
+  [ -d "$ebin" ] || continue
+  appdir=$(basename "$(dirname "$ebin")")   # <app>-<vsn>
+  app=${appdir%-*}
+  is_skipped "$app" && continue
+  mkdir -p "$STAGE/lib/$appdir/ebin"
+  cp "$ebin"/*.app "$STAGE/lib/$appdir/ebin/" 2>/dev/null || true
+  if [ -d "$REL/lib/$appdir/priv" ]; then
+    cp -a "$REL/lib/$appdir/priv" "$STAGE/lib/$appdir/"
+    npriv=$((npriv+1))
+  fi
+  CODE_PATHS="$CODE_PATHS lib/$appdir/ebin"
+  nlibs=$((nlibs+1))
+done
+note "release layout: $nlibs apps -> lib/<app>-<vsn>/ebin/.app ($npriv with priv/)"
+
 # ================= Step 3b: Phoenix / crypto enablement =================
 # What makes mainstream Phoenix ({apps,[my_app]}) boot on Tyn:
 #  - the Tyn crypto shim (crypto.beam + crypto.app) — the Rust crypto NIF is in
@@ -210,6 +236,17 @@ BC="$STAGE/boot.config"
   else
     echo "{apps, [$APP]}."
     echo "{port, $PORT}."
+  fi
+  # Part B: code paths for the nested release layout, so tyn_boot puts each
+  # lib/<app>-<vsn>/ebin on the path before ensure_all_started (code:lib_dir).
+  if [ -n "${CODE_PATHS// /}" ]; then
+    printf '{code_paths, ['
+    first=1
+    for p in $CODE_PATHS; do
+      [ "$first" = 1 ] && first=0 || printf ', '
+      printf '"%s"' "$p"
+    done
+    printf ']}.\n'
   fi
 } > "$BC"
 note "boot.config:"; sed 's/^/    /' "$BC" >&2
