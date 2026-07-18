@@ -2011,11 +2011,33 @@ fn sys_writev(fd: i32, iov: *const IoVec, iovcnt: usize) -> i64 {
     for i in 0..iovcnt {
         // SAFETY: iov array is in identity-mapped user memory.
         let v = unsafe { &*iov.add(i) };
+        if v.len == 0 {
+            continue;
+        }
         let written = sys_write(fd, v.base, v.len);
         if written < 0 {
+            // Honor partial-write semantics: if earlier iovecs already wrote
+            // bytes, report that count — never discard it. A socket write that
+            // enqueued some bytes and then hit a full TX ring (-EAGAIN) must NOT
+            // surface the error, or the caller (the OTP inet driver) concludes
+            // nothing was sent, retries the whole writev, and re-enqueues the
+            // already-consumed bytes indefinitely. That re-enqueue loop is what
+            // corrupted multi-`gen_tcp:send` responses: smoltcp retransmitted the
+            // re-fed block at an advancing sequence number, filling Content-Length
+            // with a repeated stale block while the real remainder was never sent.
+            if total > 0 {
+                return total;
+            }
             return written;
         }
         total += written;
+        if (written as usize) < v.len {
+            // Short write on this iovec: a contiguous prefix of `total` bytes is
+            // done. Stop here so the caller resumes at exactly `total` — writev
+            // must report a prefix, never skip the unsent tail of this iovec and
+            // continue into later ones (that would leave a non-contiguous gap).
+            break;
+        }
     }
     total
 }
