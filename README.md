@@ -2,13 +2,15 @@
 
 A minimal Rust microkernel purpose-built for BEAM.
 
-No Linux. No POSIX. Just your Erlang/Elixir/Gleam code on bare metal.
+No Linux. No POSIX. Just your Erlang/Elixir code on bare metal.
 
 ## What is Tyn?
 
-Tyn is a unikernel — a single-purpose operating system kernel that hosts one thing: the BEAM virtual machine. It replaces the entire Linux stack with ~8,000 lines of Rust, and runs on both KVM/QEMU and **real AWS Nitro EC2** — where it drives the network with a from-scratch ENA NIC driver and serves production HTTP traffic.
+Tyn is a unikernel — a single-purpose operating system kernel that hosts one thing: the BEAM virtual machine. It replaces the entire Linux stack with ~8,000 lines of Rust, and runs on both KVM/QEMU and **real AWS Nitro EC2**, where it drives the network with a from-scratch ENA NIC driver and serves production HTTP traffic.
 
-The BEAM already has its own process model, scheduler, memory management, and distribution protocol. A general-purpose OS kernel underneath duplicates much of what the BEAM provides natively. Tyn explores what happens when you remove that redundancy and give BEAM a purpose-built host.
+The BEAM already has its own process model, scheduler, memory management, and distribution protocol. A general-purpose OS kernel underneath duplicates much of what BEAM provides natively. Tyn explores what happens when you remove that redundancy and give BEAM a purpose-built host.
+
+Tyn runs the real, unmodified ERTS/BEAM — not a reimplementation. When OTP ships a new version, it should just work. That's the critical lesson from [LING](https://github.com/cloudozer/ling) (Erlang on Xen), which reimplemented the VM and couldn't keep pace with upstream.
 
 ## Why?
 
@@ -16,19 +18,89 @@ The BEAM already has its own process model, scheduler, memory management, and di
 
 **Simplicity.** A Tyn image contains only BEAM bytecode and the Rust kernel. No general-purpose OS services, no package management, no user accounts — just your application and its runtime.
 
-**Boot speed.** Tyn boots in milliseconds, not seconds. For elastic cloud deployments where BEAM nodes scale up and down, this matters.
-
 **Density.** Tyn images are megabytes, not gigabytes. More BEAM nodes per host, lower cloud costs.
+
+**Verifiability.** One runtime, a small trusted computing base, and a kernel structured for formal verification.
+
+## Status
+
+**A stock `mix phx.new` Phoenix app — static assets, LiveView, sessions, outbound HTTP — runs unmodified on OTP 27 BEAM on bare metal, on real AWS Nitro.**
+
+Measured on a stock **c5.large**, driven from a separate EC2 instance (real ENA NIC, no host loopback):
+
+| | |
+| --- | --- |
+| Throughput | **4,175 req/s** at 25-way concurrency (2000/2000, zero failures) |
+| Concurrency | 100% success through **N=50** |
+| Image size | **~45 MB** (ERTS + OTP/Elixir rootfs + kernel) |
+| Boot to serving HTTP | **~5 s** (kernel → BEAM handoff in ~430 ms; the rest is OTP startup + JIT codegen) |
+| Boot reliability | **~97%** on Nitro (62/64 across two 32-trial sweeps) — see Limitations |
+
+The full path is `ENA hardware → admin queue → I/O queues → smoltcp → DHCP → gen_tcp → Bandit → Phoenix`, entirely inside the Rust kernel. No Linux, no host networking — the kernel talks to the NIC's descriptor rings directly.
+
+## Try it
+
+A public AMI is available in `us-east-1` — under two minutes, no build required.
+
+```bash
+aws ec2 run-instances --image-id ami-093863e8a76caecc5 \
+    --instance-type c5.large --region us-east-1
+# open port 8080 in your security group, wait ~10s, then:
+curl http://<public-ip>:8080/hello     # → Hello from Phoenix on Tyn!
+curl http://<public-ip>:8080/json      # → live BEAM stats
+```
+
+The full walkthrough — security groups, the IAM-gated serial console shell, and deploying **your own** app with `tyn-pack` — is in [`docs/DEPLOY.md`](docs/DEPLOY.md).
+
+Instances accrue hourly charges. Terminate when you're done.
+
+## What works
+
+- **Full Phoenix stack on a stock app** — a stock `mix phx.new` app runs unmodified: **static assets** (`Plug.Static` / `send_file` via kernel `sendfile(2)` + `dup(2)`, no dependency patch), **interactive LiveView** (WebSocket mount + live updates over the socket), **`runtime.exs`** evaluation (env vars, deep-merged config), signed cookies / CSRF / `Phoenix.Token`, and **outbound TCP/UDP + DNS**. Clean-clone validated byte-exact on real Nitro and codified in [`tests/`](tests/).
+- **8-way SMP** — ACPI/MADT CPU discovery, APIC timer calibration, AP trampoline (16→64 bit), per-CPU GDT/TSS/IST, GS_BASE per-CPU syscall data, IPI wakeup, preemptive user-mode scheduling.
+- **BeamAsm JIT** — OTP 27.3.4.2 built with `--enable-jit`. The timer trampoline preempts inside mmap'd JIT pages; the host-side stat/dir syscalls handle the validation the BeamAsm loader performs. `erlang:system_info(emu_flavor)` returns `jit`.
+- **TCP/UDP networking** — `gen_tcp` and `gen_udp` end-to-end: POSIX socket layer → smoltcp → **virtio-net (QEMU)** or a **from-scratch ENA driver (AWS Nitro)**. On Nitro the address comes from **DHCP**, with lease renewal for long-lived instances.
+- **AWS Nitro deployment** — boots from a GRUB/multiboot disk image imported as an EBS snapshot. The ENA NIC (`1d0f:ec20`) is found via port-IO PCI config, since Nitro publishes no MCFG/ECAM.
+- **`:crypto`** — a from-scratch Rust NIF (RustCrypto primitives) fed by a kernel CSPRNG (RDSEED → ChaCha20), statically linked into ERTS. Passes known-answer vectors and cross-checks byte-for-byte against upstream OTP. **Unreviewed — see Limitations.**
+- **Live eval shell** — over the AWS serial console (IAM-gated, no open port) or TCP. Evaluate Erlang or Elixir against a running BEAM; bindings persist per session.
+- **Elixir 1.18.3** — loads and executes on OTP 27.
+- **~50 Linux syscalls** — `mmap`, `read`, `write`, `open`, `stat`, `pipe`, `ppoll`, `futex`, `clone`, `epoll`, `select`, `readv`, `writev`, `sendfile`, `dup`, `getrandom`, …
+- **VFS** — read-only cpio (newc) with OTP + Elixir `.beam` files; application images are packed by `tyn-pack`.
+- **Boot** — Multiboot1, identity-mapped 4 GiB, ELF loader for static musl binaries.
+
+```
+$ ssh <instance>.port0@serial-console.ec2-instance-connect.us-east-1.aws
+>> erlang:system_info(emu_flavor).
+jit
+>> 'Elixir.System':version().
+<<"1.18.3">>
+>> erlang:system_info(process_count).
+351
+```
+
+## Limitations
+
+Tyn runs a real, unmodified OTP 27 + Phoenix stack, but it is a specialized runtime with deliberate constraints. **These are first-class, not footnotes — read them before deploying.**
+
+- **No in-guest TLS.** `ssl`, `public_key`, and `asn1` are stubs — they satisfy the dependency graph but provide no functions. **Terminate TLS at the load balancer** and serve plain HTTP in-guest. An `https:` listener starts cleanly and then `:undef`s at request time; `tyn-pack` warns when it detects one.
+- **Crypto is from-scratch and unreviewed.** It passes known-answer vectors and matches upstream OTP byte-for-byte, but has had **no outside security review** — don't trust it for production session security until it has. Boot also **panics without a hardware RNG** (RDRAND/RDSEED; present on the c5/m5/t3 Nitro families).
+- **Wall clock is pinned at the epoch (1970).** Monotonic time is correct. Anything depending on *absolute* wall-clock time breaks: TLS certificate date validation (another reason to terminate TLS at the LB), absolute cookie/token expiry, `Date` headers. Relative timers and `Phoenix.Token` max-age are fine. No RTC/kvmclock yet.
+- **No writable filesystem.** The VFS is a read-only cpio. Writes to `/tmp`, cwd, or `/dev/shm` return `enoent`; file uploads (`Plug.Upload`) and anything needing scratch disk do not work.
+- **No distributed Erlang.** No `epmd`, no `net_kernel`. Single node only.
+- **IPv4 only.** IPv6 socket binds are rewritten to IPv4-any at boot (stock Phoenix `runtime.exs` binds IPv6-any).
+- **~3% cold-boot stall.** A residual liveness stall during ERTS SMP init — no crash, no corruption, and **retry always succeeds.** Mitigate with orchestration-layer retry (standard cloud practice); two retries give ~99.97% effective. Full history and the hypothesis ledger: [`docs/FUTEX_HISTORY.md`](docs/FUTEX_HISTORY.md).
+- **Use KVM or Nitro, not QEMU-TCG.** Under software emulation (`-accel tcg`) some images deterministically `#PF` at boot. Real hardware (Nitro, or KVM with `-enable-kvm`) is unaffected and is the standard of evidence.
+- **Deploying LiveView on a bare IP needs `check_origin`.** Phoenix returns `403` on the LiveView WebSocket when the served host (e.g. `http://<ip>:8080`) doesn't match the configured URL host. `check_origin: false` is fine for a throwaway IP demo — but for production set the **real host list**, because `false` is a cross-site WebSocket-hijacking hole on a real deployment.
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────┐
-│  Applications (Elixir / Erlang / Gleam) │
+│  Applications (Elixir / Erlang)         │
 ├─────────────────────────────────────────┤
 │  OTP / Supervision Trees                │
 ├─────────────────────────────────────────┤
-│  ERTS / BEAM VM (unmodified, SMP)       │
+│  ERTS / BEAM VM (unmodified, SMP, JIT)  │
 ├─────────────────────────────────────────┤
 │  BEAM Host Interface (Rust)             │
 │  ~50 Linux syscalls emulated            │
@@ -36,157 +108,23 @@ The BEAM already has its own process model, scheduler, memory management, and di
 │  Tyn Kernel (Rust, ~8,000 LOC)          │
 │  SMP · Memory · Networking · VFS · I/O  │
 ├─────────────────────────────────────────┤
-│  KVM / QEMU / Cloud Hypervisor          │
+│  KVM / QEMU / AWS Nitro                 │
 └─────────────────────────────────────────┘
 ```
 
-Tyn runs the real, unmodified ERTS/BEAM — not a reimplementation. When OTP ships a new version, it should just work. This is the critical lesson from [LING](https://github.com/cloudozer/ling) (Erlang on Xen), which died because it reimplemented the VM and couldn't keep pace with upstream changes.
+ERTS is built from unmodified OTP 27 source — no patches, no special defines — via the pinned, reproducible build in [`beam-build/`](beam-build/) (Alpine 3.19, GCC 13.2, musl 1.2.4, static, `--enable-jit --without-ssl`).
 
-## Status
+Tyn uses a hybrid futex strategy: during ERTS init (~2 s) `futex_wait` spin-yields, avoiding a thread-progress registration deadlock; afterwards it blocks properly and idle CPUs enter `HLT`. The switch is automatic once boot modules are loaded.
 
-**OTP 27 BEAM running on bare metal with SMP, TCP, Phoenix + Bandit + Plug, and Elixir — on QEMU and on real AWS Nitro.**
-
-> ⚠️ **Crypto is new and unreviewed.** Tyn's `:crypto` is a from-scratch Rust NIF
-> (RustCrypto primitives) fed by a from-scratch kernel CSPRNG (RDSEED → ChaCha20).
-> It passes known-answer vectors and cross-checks byte-for-byte against upstream
-> OTP, but it has **not** had outside security review. Do not trust it for
-> production session security (cookies, CSRF, tokens) until it has.
->
-> **No in-guest TLS.** `ssl`, `public_key`, and `asn1` are **stubs** (empty library
-> apps) so the dependency graph resolves — they satisfy `ensure_all_started` but
-> provide no functions. **Terminate TLS at the load balancer** and serve plain HTTP
-> (`scheme: http`) in-guest. Configuring an `https:` listener will start cleanly and
-> then fail with `:undef` at request time; `tyn-pack` warns when it detects one.
-> The boot also requires a hardware RNG (RDRAND/RDSEED) and **panics on a CPU
-> without one** (present on c5/m5/t3 Nitro families).
-
-### Running on AWS Nitro
-
-Tyn boots on a stock **c5.large EC2 instance**, brings up the **Elastic Network Adapter (ENA)** with a driver written from scratch in Rust, configures its address over **DHCP**, and serves Phoenix HTTP through the real Nitro NIC. Verified end-to-end with `curl` from a separate machine:
-
-- **ENA driver written from scratch in Rust** — PCI probe → admin queue → I/O queues → smoltcp `Device` trait
-- **DHCP-configured networking** on the AWS VPC (no static IP)
-- **Phoenix + Bandit + BeamAsm JIT serving 4,175 req/s** at **25 concurrent connections, 100% reliable** (2000/2000 requests)
-- **~45 MB image** (ERTS + OTP/Elixir rootfs), **boots to serving HTTP in ~5 s**
-
-The full path is `ENA hardware → admin queue → I/O queues → smoltcp → DHCP → gen_tcp → Bandit → Phoenix`, entirely inside the ~8,000-line Rust kernel. No Linux, no host networking — the kernel talks to the NIC's descriptor rings directly.
-
-```elixir
-defmodule TynHelloWeb.HelloController do
-  use TynHelloWeb, :controller
-
-  def index(conn, _params) do
-    conn
-    |> put_resp_content_type("text/plain")
-    |> send_resp(200, "Hello from Phoenix on Tyn!\n")
-  end
-end
-
-defmodule TynHelloWeb.Router do
-  use TynHelloWeb, :router
-  pipeline :api, do: plug :accepts, ["json", "html"]
-  scope "/", TynHelloWeb do
-    pipe_through :api
-    get "/", HelloController, :index
-  end
-end
-
-{:ok, _} = Bandit.start_link(plug: TynHelloWeb.Router, port: 8080)
-```
-
-```
-$ curl http://localhost:5555/hello
-Hello from Phoenix on Tyn!
-```
-
-A TCP eval shell ships alongside the Phoenix demo. Connect from the host and poke a running BEAM:
-
-```
-$ nc localhost 5567
-Tyn eval shell - OTP 27, ERTS 15.2.7.1
-Expressions end in '.'   Disconnect to exit.
->> erlang:system_info(emu_flavor).
-jit
->> erlang:system_info(process_count).
-351
->> 'Elixir.System':version().
-<<"1.18.3">>
->> X = lists:seq(1, 5).
-[1,2,3,4,5]
->> lists:sum(X).
-15
-```
-
-- OTP 27 ERTS boots with up to 8 CPUs, loads 200+ .beam files from in-memory VFS
-- Full OTP kernel application starts — supervision trees, code_server, logger
-- **Phoenix 1.8** routes through `use TynHelloWeb, :router` (Bandit fronts the Phoenix Router directly; the full `Phoenix.Endpoint` middleware stack would also work given `secret_key_base` etc., but the Router is the minimum demo)
-- **Bandit** runs unmodified on top of **ThousandIsland** with the default `num_acceptors: 100` configuration — the full `DynamicSupervisor` → `Connection.start` → handler-spawn chain works
-- **Plug pipeline**: `Plug.Conn` → `put_resp_content_type` → `send_resp` → host gets the response
-- Elixir 1.18.3 runs: `IO.puts`, `System.version`, `Kernel.inspect` all work
-
-Where things stand on KVM (host: AWS Xeon 6975P-C):
-
-- **Image size:** ~45 MB (ERTS + OTP/Elixir rootfs + kernel; ~52 MB as built with `debug = true` — strip for the smaller figure) — ~4× smaller than Alpine + Elixir + Phoenix (~190 MB)
-- **Cold boot to serving HTTP:** ~5 s on KVM with BeamAsm (kernel → BEAM handoff in ~430 ms; the rest is OTP startup plus JIT code-generation for boot modules)
-- **Cold-boot reliability with BeamAsm:** **60/64 = 93.75 %** across a fresh 64-trial sweep on the JIT binary, matching the long-standing non-JIT result. The 4 stalls don't recur in the same place: 3 cluster around the same cold-cache `error_logger.beam` load that affects the interpreter, and 1 was a transient BeamAsm "corrupt literal table" rejection of `lists.beam` — likely a load-time race surfaced by the JIT's stricter validator. No `#GP`/`#PF` faults
-- **Sustained throughput:** **1000/1000 sequential HTTP requests at ~6.5 req/s, zero failures** through Bandit + Plug on the BeamAsm build. Before the `net::poll`-after-sendto fix, the same test was 67 % OK (≥30 % of bursts timed out at the curl 5 s limit) — Bandit issues three sendto's per response, and the kernel was running smoltcp's full SocketSet iteration after each one, so NET_LOCK contention compounded under load. Dropping the redundant poll fixed both reliability and throughput
-- **Compute throughput** (200 sequential HTTP per endpoint, BeamAsm + Bandit + Erlang `bench_plug`, same-host before/after the `net::poll` fix):
-
-  | endpoint | before | after | speedup |
-  | --- | --- | --- | --- |
-  | `/hello`   | 4.53 | **11.71** | 2.6× |
-  | `/json`    | 1.98 | **3.56**  | 1.8× |
-  | `/compute` | 2.52 | **8.30**  | 3.3× |
-  | `/fib`     | 2.13 | **3.34**  | 1.6× |
-
-  The pre-fix and earlier README numbers were measured on a less-loaded slice of the same host, so absolute rates aren't directly comparable across days — the speedup column is what's reproducible. Pure-compute `timer:tc` over the TCP shell still shows the expected BeamAsm direction: JIT is 1.21× faster on `fib(28)`, 1.28× on the `foldl` sum, **4.70× faster on a tight list comprehension**. The `/compute` endpoint (list-fold work) mirrors the list-comp ratio once the per-request overhead is amortized
-- **Runtime memory:** ~400 MB host RSS — ~6× an Alpine container due to ERTS allocator pool defaults (demand paging landed; allocator tuning is next)
-
-Where things stand on **AWS Nitro** (c5.large, real ENA NIC, measured from a separate EC2 instance — no host loopback, no SLIRP):
-
-- **Throughput:** **4,175 req/s** sustained (2000/2000 requests, zero failures) at 25-way concurrency through Bandit + Plug on the BeamAsm build. That is **~350× the QEMU/SLIRP rate** — the QEMU host bridge, not Tyn, had been the ceiling all along
-- **Concurrency:** 100% success through **N=50** concurrent connections. The listener pool is pre-bound at 64; a fresh sweep shows `N=10/25/50 → 200/200`. (At pool size 8 the same sweep collapsed to ~8/200 past N=25 — see below)
-- **Networking path:** ENA hardware → admin queue → I/O queues → smoltcp → DHCP → `gen_tcp` → Bandit → Phoenix, all in-kernel. DHCP obtains the VPC address on boot
-- **Image / boot:** ~45 MB of ERTS + OTP/Elixir content; boots to serving HTTP in ~5 s on a stock c5.large
-
-### What works
-
-- **8-way SMP** — ACPI/MADT CPU discovery, APIC timer calibration, AP trampoline (16→64 bit), per-CPU GDT/TSS/IST, GS_BASE per-CPU syscall data, IPI wakeup, preemptive user-mode scheduling
-- **BeamAsm JIT** — OTP 27.3.4.2 with `--enable-jit`. The timer trampoline preempts inside mmap'd JIT pages (`0x1A00_0000`+), and the host-side stat/dir syscalls (`newfstatat`, `S_IFDIR` on dir fds, recycled `DIR_SLOTS`) handle the glibc-style validation the BeamAsm loader does. `erlang:system_info(emu_flavor)` returns `jit`
-- **TCP networking** — `gen_tcp:listen/accept/send/close` end-to-end, POSIX socket layer → smoltcp TCP/IP → **virtio-net (QEMU) or a from-scratch ENA driver (AWS Nitro)**. On Nitro the address is obtained via **DHCP** (with lease renewal for long-lived instances); the ENA driver does PCI discovery, admin-queue init, I/O-queue creation, and RX/TX descriptor rings directly
-- **AWS Nitro deployment** — boots from a GRUB/multiboot disk image imported as an EBS snapshot; ENA NIC (`1d0f:ec20`) detected via port-IO PCI config, since Nitro publishes no MCFG/ECAM
-- **Live eval shell** — `nc` into a running BEAM and evaluate Erlang or Elixir expressions; bindings persist per session, multi-line input is buffered until the parser accepts it (`src/erl/tcp_shell.erl`)
-- **Elixir** — Elixir 1.18.3 .beam files load and execute on OTP 27
-- **~50 Linux syscalls** — mmap, read, write, open, stat, pipe, ppoll, futex, clone, epoll, select, readv, ...
-- **VFS** — cpio newc archive with OTP kernel/stdlib .beam files + optional Elixir
-- **Boot** — Multiboot1, identity-mapped 4 GiB, ELF loader for static musl binaries
-- **Threading** — up to 16 CPUs, per-thread kernel stacks, atomic futex, preemptive + deferred scheduling
-- **I/O** — COM1 serial (stdin/stdout/stderr), PCI config (ECAM on QEMU, port-IO on Nitro), virtio-net + ENA NIC drivers
-
-### ERTS build configuration
-
-ERTS is built from unmodified OTP 27 source — no patches, no special defines. The build enables BeamAsm and `--without-*` opts out of unused applications.
-
-Tyn uses a hybrid futex strategy:
-
-- **During ERTS init** (~first 2 seconds): `futex_wait` returns immediately (spin-yield) to avoid a thread-progress registration deadlock where blocked threads prevent other threads from registering with the progress system.
-- **After init**: `futex_wait` blocks properly — threads sleep and consume zero CPU until woken by `futex_wake`. Idle CPUs enter HLT.
-
-The switch happens automatically after ERTS finishes loading boot modules. Normal operation uses real blocking semantics with proper sleep/wake.
-
-### What's next
-
-- **Boot reliability** — ~97 % boot-to-serving on Nitro (62/64 across two 32-trial sweeps), in line with the KVM ~94 %. A DHCP-miss failure mode was fixed with retry + backoff; the remaining ~3 % is a BEAM cold-boot stall in code-loader paths (cold-cache `error_logger`, occasional BeamAsm "corrupt literal table" rejection of `lists.beam`)
-- **Concurrent-burst load** — ✅ **resolved on real hardware.** On QEMU, N≥5 concurrent curls capped at ~2 successful and the cause was ambiguous between host TAP/bridge drops and the kernel. Benchmarking a real AWS Nitro NIC from a separate instance settled it: the limit was the kernel-side **listener pool**, pre-bound at 8 — smoltcp routes each SYN to a free pre-bound listener, so past ~8 simultaneous SYNs the rest were RST'd. Sizing the pool to 64 gives **100% success through N=50** and **4,175 req/s at N=25**. QEMU's SLIRP bridge had masked the real limit by silently dropping the excess SYNs before they reached the kernel
-- **Full IEx** — the current eval shell handles single expressions per session; line editing, history, and the real IEx group leader still need stdin I/O server work
+More: [module structure](docs/module-structure.md) · [boot flow](docs/boot-flow.md) · [runtime architecture](docs/runtime-arch.md)
 
 ## Building & Running
 
 ### Prerequisites
 
-- Rust nightly toolchain with `rust-src` component
-- QEMU with KVM support (`qemu-system-x86_64`)
-- A statically-linked `beam.smp` and the OTP/Elixir rootfs cpio. **Both are committed at `src/beam.smp.elf` and `src/otp-rootfs.cpio` so the kernel builds out of the box.** To rebuild them yourself, see "Building ERTS + VFS" below.
+- Rust nightly with the `rust-src` component
+- QEMU with KVM (`qemu-system-x86_64`)
+- A statically-linked `beam.smp` and the OTP/Elixir rootfs cpio — **both are committed** at `src/beam.smp.elf` and `src/otp-rootfs.cpio`, so the kernel builds out of the box. To rebuild them, see [`docs/BUILDING_ERTS.md`](docs/BUILDING_ERTS.md).
 
 ### Build
 
@@ -207,230 +145,60 @@ qemu-system-x86_64 \
   -netdev user,id=net0,hostfwd=tcp::5555-:8080,hostfwd=tcp::5567-:9090
 ```
 
-### Test the demo from host
+Once the serial console prints `phoenix_listening`:
 
 ```bash
-# In another terminal while QEMU is running, after Tyn prints
-# "phoenix_listening" and "shell_listening 9090" on the serial console:
-curl http://localhost:5555/          # endpoint list (landing page)
-curl http://localhost:5555/health    # → {"status":"ok"}  (for load balancers)
+curl http://localhost:5555/          # landing page
+curl http://localhost:5555/health    # → {"status":"ok"}
 curl http://localhost:5555/hello     # → Hello from Phoenix on Tyn!
-curl http://localhost:5555/json      # live BEAM stats (procs, mem, emu_flavor)
-curl http://localhost:5555/compute   # integer fold benchmark
-curl http://localhost:5555/fib       # fib(25) benchmark
-
-# Live eval shell:
-nc localhost 5567
+curl http://localhost:5555/json      # live BEAM stats
+nc localhost 5567                    # eval shell
 ```
 
-## Try it on AWS
+QEMU/SLIRP is a development convenience, not a performance environment — its host networking was the bottleneck behind every early throughput figure Tyn recorded. Benchmark on KVM or Nitro.
 
-Launch Tyn on a Nitro EC2 instance — under 2 minutes, no build required.
+## Testing
 
-**AMI:** `ami-093863e8a76caecc5` (us-east-1)
-
-### Launch
+`tests/` holds the capability suite. Every assertion checks **content**, not status codes — a truncated asset served as `200` is precisely the class of bug this exists to catch.
 
 ```bash
-# Create a security group (one-time)
-SG_ID=$(aws ec2 create-security-group \
-    --group-name tyn-demo \
-    --description "Tyn demo - HTTP on 8080" \
-    --region us-east-1 \
-    --query 'GroupId' --output text)
-
-aws ec2 authorize-security-group-ingress \
-    --group-id $SG_ID --protocol tcp --port 8080 --cidr 0.0.0.0/0 \
-    --region us-east-1
-
-# Launch
-INSTANCE_ID=$(aws ec2 run-instances \
-    --image-id ami-093863e8a76caecc5 \
-    --instance-type c5.large \
-    --security-group-ids $SG_ID \
-    --region us-east-1 \
-    --query 'Instances[0].InstanceId' --output text)
-
-# Wait for running + get IP
-aws ec2 wait instance-running --region us-east-1 --instance-ids $INSTANCE_ID
-
-IP=$(aws ec2 describe-instances \
-    --instance-ids $INSTANCE_ID \
-    --region us-east-1 \
-    --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
-
-echo "Tyn is at $IP"
+tests/setup-test-app.sh      # builds a stock mix phx.new app; fails if any dep is patched
+tests/run.sh <instance-ip>   # byte-exact assertions; non-zero exit gates a build
 ```
 
-Wait ~10 seconds for boot, then:
+It covers byte-exact static assets, large (1.5 MB) transfers spanning many TX windows, inline and multi-send bodies, N=25 concurrency with per-response hashes, and interactive LiveView.
 
-```bash
-curl http://$IP:8080/hello
-# Hello from Phoenix on Tyn!
+## Engineering record
 
-curl http://$IP:8080/json
-# {"status":"ok","beam":"27","jit":"jit","procs":...,"mem":...,"server":"Tyn"}
-```
+The bug-class hunts behind the current state, kept because the negative results are as useful as the fixes:
 
-Other endpoints: `/` (landing page), `/health` (health check), `/compute`, `/fib`.
-
-### Serial console (interactive BEAM shell)
-
-Access a live Erlang eval shell via EC2 Serial Console — IAM-authenticated, no open ports:
-
-```bash
-# Enable serial console access (one-time, account-level)
-aws ec2 modify-serial-console-access \
-    --serial-console-access-enabled --region us-east-1
-
-# Connect (use your SSH key — check: ls ~/.ssh/*.pub)
-SSH_KEY=~/.ssh/id_ed25519  # adjust to your key name
-
-aws ec2-instance-connect send-serial-console-ssh-public-key \
-    --instance-id $INSTANCE_ID --serial-port 0 \
-    --ssh-public-key file://${SSH_KEY}.pub \
-    --region us-east-1 && \
-ssh -i $SSH_KEY -o StrictHostKeyChecking=no \
-    $INSTANCE_ID.port0@serial-console.ec2-instance-connect.us-east-1.aws
-```
-
-In the shell:
-```
->> 1+1.
-2
->> erlang:system_info(emu_flavor).
-jit
->> erlang:memory().
-[{total,18124768}, ...]
-```
-
-`Enter` then `~.` to disconnect.
-
-### Instance types
-
-Any Nitro instance type works (c5, m5, t3, r5, etc.). The ENA driver auto-detects the NIC.
-
-### Terminate
-
-Remember to terminate when done — instances accrue hourly charges:
-
-```bash
-aws ec2 terminate-instances --region us-east-1 --instance-ids $INSTANCE_ID
-```
-
-The security group persists for future launches (no recurring cost).
-
-## Building ERTS + VFS
-
-Tyn embeds a statically-linked ERTS binary and a cpio archive of .beam files directly in the kernel image. Here's how to build them.
-
-### Cross-compile OTP 27 ERTS
-
-```bash
-# On an x86_64 Linux host with musl-gcc installed:
-git clone --branch OTP-27.3.4.2 https://github.com/erlang/otp.git otp27
-cd otp27
-
-# Configure for static musl + BeamAsm
-./configure --enable-jit --without-javac --without-odbc --without-wx \
-  --without-termcap --without-ssl --without-ssh --without-megaco \
-  --without-diameter --without-observer --without-debugger \
-  --without-et --without-reltool --without-common-test --without-eunit \
-  --without-edoc --without-eldap --without-ftp --without-tftp \
-  --without-snmp --without-docs --without-mnesia \
-  CC=musl-gcc CFLAGS="-O2 -static" LDFLAGS=-static
-
-# Build
-make -j$(nproc)
-
-# The static BeamAsm binary (strip before embedding to fit the layout):
-strip bin/x86_64-pc-linux-musl/beam.jit -o beam.smp.elf
-ls -lh beam.smp.elf
-# → ~10 MB statically linked ELF
-```
-
-### Package the VFS (cpio archive)
-
-```bash
-# Create an OTP release directory with .beam files
-mkdir -p staging/otp/bin
-cp otp27/bin/start.boot staging/otp/bin/
-
-# Copy kernel and stdlib .beam files (with versioned paths for boot script)
-for d in otp27/lib/kernel-*/ebin otp27/lib/stdlib-*/ebin; do
-  versioned=$(basename $(dirname $d))
-  mkdir -p staging/otp/lib/$versioned/ebin
-  cp $d/*.beam staging/otp/lib/$versioned/ebin/
-done
-
-# Copy .beam files to root for code_server fallback loading
-cp otp27/lib/kernel-*/ebin/*.beam staging/
-cp otp27/lib/stdlib-*/ebin/*.beam staging/
-
-# Create the cpio archive
-cd staging
-find . -type f | sed 's|^\./||' | cpio -o -H newc > ../src/otp-rootfs.cpio
-
-# Copy the (stripped) BeamAsm ERTS binary
-strip otp27/bin/x86_64-pc-linux-musl/beam.jit -o ../src/beam.smp.elf
-```
-
-### Elixir support (optional)
-
-```bash
-# Download prebuilt Elixir for OTP 27
-curl -L -o elixir.zip \
-  https://github.com/elixir-lang/elixir/releases/download/v1.18.3/elixir-otp-27.zip
-unzip elixir.zip -d elixir
-
-# Add Elixir .beam files to the staging root
-cp elixir/lib/elixir/ebin/*.beam staging/
-cp elixir/lib/iex/ebin/*.beam staging/
-
-# Rebuild cpio with Elixir included
-cd staging && find . -type f | sed 's|^\./||' | cpio -o -H newc > ../src/otp-rootfs.cpio
-```
-
-## Architecture Diagrams
-
-- [Module structure](docs/module-structure.md) — source file dependencies and line counts
-- [Boot flow](docs/boot-flow.md) — from power-on to Erlang shell, syscall sequence
-- [Runtime architecture](docs/runtime-arch.md) — CPU layout, futex strategy, memory map
-
-## Investigation logs
-
-These document the bug-class hunts that got Tyn from "ERTS boots" to "Bandit + Plug serves real traffic":
-
-- [BOOT_RELIABILITY.md](BOOT_RELIABILITY.md) — failure modes, stack-layout trace through preemption + syscall, what fixes worked and why
-- [MESSAGE_DELIVERY.md](MESSAGE_DELIVERY.md) — scheduler-wake / process-scheduling races, the watchdog-rescue fix, and the `sys_accept` race that was blocking ThousandIsland's concurrent-acceptor pattern (now fixed)
+- [`docs/FUTEX_HISTORY.md`](docs/FUTEX_HISTORY.md) — the cold-boot stall: current reliability numbers, a ledger of rejected hypotheses, confirmed facts, and the open questions.
+- [`docs/SEND_CORRUPTION.md`](docs/SEND_CORRUPTION.md) — the TCP send-path corruption hunt: four eliminated hypotheses, the non-perturbing trace technique that localized it, and the `sys_writev` partial-write root cause.
 
 ## Design Principles
 
 **Run the real BEAM.** Not a reimplementation — the actual ERTS, cross-compiled for Tyn's host interface.
 
-**Purpose-built for BEAM.** The kernel hosts one runtime and nothing else. This constraint enables a small trusted computing base and a clean verification story.
+**Purpose-built for BEAM.** The kernel hosts one runtime and nothing else. That constraint enables a small trusted computing base and a clean verification story.
 
 **Minimal kernel, maximal BEAM.** The kernel provides only what BEAM needs — memory, interrupts, device access, network. BEAM handles its own scheduling, memory management, code loading, and supervision.
 
-**Target KVM/virtio and AWS Nitro.** Standardized virtual hardware (virtio on KVM/QEMU, ENA on Nitro) means the kernel only needs a handful of drivers — each NIC driver is a few hundred lines of Rust.
+**Target KVM/virtio and AWS Nitro.** Standardized virtual hardware means a handful of drivers — each NIC driver is a few hundred lines of Rust.
 
-**Designed for verification.** The kernel is structured for future formal verification with Verus. Minimal unsafe code, explicit invariants, small trusted computing base.
+**Designed for verification.** Structured for future formal verification with Verus: minimal unsafe code, explicit invariants, a small trusted computing base.
 
 ## Prior Art
 
-- **[LING](https://github.com/cloudozer/ling)** — Erlang on Xen. Proved the concept. Died because it reimplemented BEAM and targeted only Xen.
-- **[Nerves](https://nerves-project.org/)** — Elixir on embedded Linux. Complementary — Nerves owns embedded, Tyn targets cloud.
-- **[GRiSP](https://www.grisp.org/)** — BEAM on RTEMS for IoT hardware. Different niche.
+- **[LING](https://github.com/cloudozer/ling)** — Erlang on Xen. Proved the concept; reimplemented BEAM and targeted only Xen.
+- **[Nerves](https://nerves-project.org/)** — Elixir on embedded Linux. Complementary: Nerves owns embedded, Tyn targets cloud.
+- **[GRiSP](https://www.grisp.org/)** — BEAM on RTEMS for IoT hardware.
 - **[Asterinas](https://github.com/asterinas/asterinas)** — Rust Linux-compatible kernel. Architectural reference.
-- **[rcore-os/virtio-drivers](https://github.com/rcore-os/virtio-drivers)** — VirtIO drivers used by Tyn.
-- **[smoltcp](https://github.com/smoltcp-rs/smoltcp)** — TCP/IP stack used by Tyn.
+- **[rcore-os/virtio-drivers](https://github.com/rcore-os/virtio-drivers)** · **[smoltcp](https://github.com/smoltcp-rs/smoltcp)** — used by Tyn.
 
 ## Related Projects
 
-Tyn is part of a broader ecosystem:
-
-- **[Vor](https://github.com/vorlang/vor)** — A BEAM-native language with compile-time verification
-- **[VorDB](https://github.com/vorlang/vordb)** — A CRDT-based distributed database built on Vor
+- **[Vor](https://github.com/vorlang/vor)** — a BEAM-native language with compile-time verification
+- **[VorDB](https://github.com/vorlang/vordb)** — a CRDT-based distributed database built on Vor
 
 ## License
 
