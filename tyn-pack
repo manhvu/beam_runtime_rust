@@ -59,6 +59,11 @@ REL=""; OUT=""; BASE="src/otp-rootfs.cpio"; TYN_ERL="src/erl"
 APP=""; PORT=8080; PLUG=""; START_MFA=""; ENV_VARS=""
 # OTP lib dir to source core .app files (compiler/sasl/...) not bundled by an
 # include_erts:false release. Defaults to the build host's system OTP.
+# Where the running Erlang's OTP apps live (compiler/sasl/runtime_tools, which the
+# release may omit). Auto-detect from `erl` so asdf/kerl/non-system installs work —
+# hardcoding /usr/lib/erlang silently produced an empty cpio when Erlang lived
+# elsewhere (e.g. ~/.asdf/installs/erlang/.../lib). Override with OTP_LIB= or --otp-lib.
+OTP_LIB="${OTP_LIB:-$(erl -noshell -eval 'io:format("~s/lib",[code:root_dir()]),halt().' 2>/dev/null)}"
 OTP_LIB="${OTP_LIB:-/usr/lib/erlang/lib}"
 while [ $# -gt 0 ]; do
   case "$1" in

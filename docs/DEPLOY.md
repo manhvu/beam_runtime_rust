@@ -103,12 +103,39 @@ Once it prints `phoenix_listening`, from another terminal: `curl http://localhos
 Tyn packages a standard **Mix release** into a bootable image with `tyn-pack` → `build-disk.sh`
 → (for AWS) `deploy-ami.sh`. No kernel rebuild.
 
-### Build the release, packaged with stock deps
+### Prerequisites (verified on a clean Ubuntu 24.04 box)
+
+- **Elixir 1.15–1.18 on OTP ≤ 27.** The distro packages are too old (Ubuntu 24.04 ships Elixir
+  1.14 / OTP 25, which can't compile a modern Phoenix app — `hpax` needs Elixir ≥ 1.15). Install a
+  pinned toolchain, e.g. with [asdf](https://asdf-vm.com):
+
+  ```bash
+  sudo apt-get install -y build-essential autoconf m4 libncurses-dev libssl-dev unzip
+  git clone https://github.com/asdf-vm/asdf.git ~/.asdf --branch v0.14.1
+  . ~/.asdf/asdf.sh
+  asdf plugin add erlang && asdf plugin add elixir
+  asdf install erlang 27.3.4.2 && asdf global erlang 27.3.4.2      # matches Tyn's base OTP
+  asdf install elixir 1.18.3-otp-27 && asdf global elixir 1.18.3-otp-27
+  ```
+
+- **AWS CLI v2** (for `deploy-ami.sh`) + credentials (`aws configure`, or an instance role):
+
+  ```bash
+  curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
+  unzip awscliv2.zip && sudo ./aws/install
+  ```
+
+- **Disk-image tools** (`build-disk.sh`): `parted grub-pc-bin e2fsprogs` (present on stock Ubuntu
+  server). `build-disk.sh` uses `sudo` internally — run it as your normal user, **not** under `sudo`.
+
+### Build a release (starting from scratch)
 
 ```bash
-# In your app, produce a prod release (OTP <= 27; older is fine, newer is rejected)
+mix archive.install hex phx_new 1.7.14 --force
+mix phx.new my_app --no-ecto        # or your existing app
+cd my_app && mix deps.get
 MIX_ENV=prod mix assets.deploy
-MIX_ENV=prod mix release
+MIX_ENV=prod mix release            # OTP <= 27; older is fine, newer is rejected
 ```
 
 ### Pack it into a Tyn cpio
