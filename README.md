@@ -149,17 +149,17 @@ qemu-system-x86_64 \
   -netdev user,id=net0,hostfwd=tcp::5555-:8080,hostfwd=tcp::5567-:9090
 ```
 
-Once the serial console prints `phoenix_listening`:
+The committed image (`src/beam.smp.elf` + `src/otp-rootfs.cpio`) boots a **minimal bench app** — small endpoints to confirm the kernel boots, serves, and runs the BEAM. It is *not* the full Phoenix demo; the stock-`phx.new` app with static assets and LiveView (the capability claims above) is what the [public AMI](#try-it) runs and what you get by [packaging your own app](docs/DEPLOY.md). Once the serial console prints `phoenix_listening`:
 
 ```bash
-curl http://localhost:5555/          # landing page
+curl http://localhost:5555/          # landing page (endpoint list)
 curl http://localhost:5555/health    # → {"status":"ok"}
 curl http://localhost:5555/hello     # → Hello from Phoenix on Tyn!
 curl http://localhost:5555/json      # live BEAM stats
 nc localhost 5567                    # eval shell
 ```
 
-QEMU/SLIRP is a development convenience, not a performance environment — its host networking was the bottleneck behind every early throughput figure Tyn recorded. Benchmark on KVM or Nitro.
+> **Use KVM (`-enable-kvm`), not TCG.** Software emulation (`-accel tcg`) deterministically `#PF`s at boot on some images. QEMU/SLIRP is a development convenience, not a performance environment — its host networking was the bottleneck behind every early throughput figure Tyn recorded. Benchmark on KVM or Nitro.
 
 ## Testing
 
