@@ -1,5 +1,14 @@
 # Message delivery / scheduler-wake liveness
 
+> **⚠️ SUPERSEDED by [docs/FUTEX_HISTORY.md](docs/FUTEX_HISTORY.md).** The *evidence and traces*
+> here remain valuable, but two conclusions are stale or misleading and are corrected there:
+> (1) the **"boot reliability is now 64/64 = 100%"** claim was measured on the `gen_tcp` echo
+> workload, not Phoenix — Phoenix on the same tree measured 53/64 (82.8%); the stall was never
+> eliminated. (2) The **B1 watchdog "fix"** (queueing the thread + IPI from the 1 Hz timer
+> interrupt) was itself the interrupt-context protocol violation we then chased for months — the
+> rescue mechanism was losing the wakes it was added to rescue. Read FUTEX_HISTORY.md for the
+> authoritative status; use this doc only for its raw traces.
+
 After commit `6704b69`, OTP 27 boots at **89%**. The remaining ~11% were
 **scheduler-progress stalls**: schedulers sat in `futex_wait` on SSI
 events, got "rescued" by the watchdog, and stayed stuck.

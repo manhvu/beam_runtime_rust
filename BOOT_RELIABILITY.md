@@ -1,5 +1,13 @@
 # Boot reliability
 
+> **⚠️ SUPERSEDED by [docs/FUTEX_HISTORY.md](docs/FUTEX_HISTORY.md).** The red-zone experiments and
+> failure-mode taxonomy here are still valid (they agree with FUTEX_HISTORY H9), but the headline
+> numbers and open findings are stale: the ~81% figure predates the data-corruption fixes
+> (`FXSAVE`/`FXRSTOR` + mmap zeroing + RFLAGS/DF preservation) that eliminated the `beam_load`
+> opcode-corruption and `#PF`-in-loader classes, and the "unrestored RFLAGS" open finding was fixed
+> in `6704b69`. The residual failure is now a pure-liveness cold-boot stall (~3%), not corruption.
+> Read FUTEX_HISTORY.md for current status.
+
 Tyn boots OTP 27 to a working `gen_tcp` echo server (`curl http://localhost:5566/` → `HELLO`) in roughly **13 of 16 fresh boots** on KVM. The remaining ~19% fail in a small number of distinct ways. None of the failures corrupt the host or the kernel itself; QEMU exits or sits at a watchdog stall and the next boot is independent.
 
 This document is the running log of what's known, what's been ruled out, and what to try next.
