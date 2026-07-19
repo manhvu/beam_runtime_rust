@@ -123,8 +123,11 @@ More: [module structure](docs/module-structure.md) · [boot flow](docs/boot-flow
 
 ### Prerequisites
 
-- Rust nightly with the `rust-src` component
-- QEMU with KVM (`qemu-system-x86_64`)
+- Rust — the toolchain is pinned in `rust-toolchain.toml` (a specific nightly with `rust-src`);
+  `rustup` installs it automatically on first build. Just have `rustup`.
+- A C toolchain — `build-essential` (Debian/Ubuntu) or equivalent; rustc needs `cc` to link build
+  scripts and proc-macros.
+- QEMU with KVM (`qemu-system-x86_64`) — for the local run only; **use `-enable-kvm`, not TCG**.
 - A statically-linked `beam.smp` and the OTP/Elixir rootfs cpio — **both are committed** at `src/beam.smp.elf` and `src/otp-rootfs.cpio`, so the kernel builds out of the box. To rebuild them, see [`docs/BUILDING_ERTS.md`](docs/BUILDING_ERTS.md).
 
 ### Build
