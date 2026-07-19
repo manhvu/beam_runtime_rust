@@ -8,8 +8,15 @@ limine-bin/
 build-iso.sh
 limine.cfg
 limine.conf
-run.sh
-tests/
+/run.sh
+# Track the committed capability suite; ignore scratch/artifacts + the old
+# no_std kernel integration tests that were never tracked.
+tests/*
+!tests/run.sh
+!tests/fixtures.env
+!tests/liveview_check.py
+!tests/setup-test-app.sh
+!tests/README.md
 CONTEXT.md
 REVIEW.md
 .DS_Store
