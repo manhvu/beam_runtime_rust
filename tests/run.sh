@@ -75,6 +75,19 @@ assert_md5 "chk/8192/4 (multi-send)"    "$B/chk/8192/4"    "$CHK_8192_4_MD5"
 assert_md5 "chk/65536/8 (multi-send)"   "$B/chk/65536/8"   "$CHK_65536_8_MD5"
 assert_md5 "chk/130000/16 (multi-send)" "$B/chk/130000/16" "$CHK_130000_16_MD5"
 
+echo "-- Throughput (sendfile TCP window — regression guard) --"
+# big.bin is 1.5 MB. With a one-segment (2048-byte) TX buffer the in-flight window
+# is capped and a large sendfile crawls at ~34 KB/s (~44 s), delayed-ACK-limited.
+# A 32 KiB TX buffer clears ~600 KB/s (~2.5 s). Assert well under the regression:
+# < 15 s (~100 KB/s floor) catches a window regression without network-jitter flakiness.
+bigtime=$(curl -s -o /dev/null -w '%{time_total}' --max-time 90 "$B$BIG_BIN_PATH")
+bigkbps=$(awk "BEGIN{ if ($bigtime>0) printf \"%d\", 1500000/$bigtime/1024; else print \"?\" }" 2>/dev/null)
+if awk "BEGIN{exit !($bigtime > 0 && $bigtime < 15)}"; then
+  ok "big.bin throughput: ${bigtime}s (< 15s; ~${bigkbps} KB/s)"
+else
+  bad "big.bin throughput (TX window)" "< 15s (~100+ KB/s)" "${bigtime}s — TX buffer may have regressed to a one-segment window"
+fi
+
 echo "-- Concurrency (large-asset back-pressure is where partial-write bugs hide) --"
 # Portable (bash 3.2 / macOS has no `mapfile`): collect md5s into a plain string.
 conc_md5s=$(seq 1 "$CONCURRENCY" | xargs -P"$CONCURRENCY" -I{} sh -c "curl -s --max-time 60 $B$BIG_BIN_PATH | md5sum | cut -d' ' -f1")

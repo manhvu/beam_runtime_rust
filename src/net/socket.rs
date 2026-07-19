@@ -154,11 +154,19 @@ fn alloc_fd() -> i32 {
     NEXT_SOCK_FD.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Size of rx/tx buffers for spare listeners installed by sys_listen and
-/// sys_accept. Smaller than the 8 KiB used in sys_socket because (a) the
-/// listener mostly only holds a SYN/SYN-ACK before sys_accept moves it
-/// to a stream, and (b) we pre-allocate LISTENER_POOL_SIZE of them.
+/// RX buffer for spare listeners installed by sys_listen and sys_accept — kept
+/// small (a) because the listener mostly only holds a SYN/SYN-ACK before
+/// sys_accept moves it to a stream, and (b) we pre-allocate LISTENER_POOL_SIZE
+/// of them across 2 ports.
 const LISTENER_BUF_SIZE: usize = 2048;
+
+/// TX buffer for those listeners — becomes the stream's send buffer after
+/// accept, so it caps the in-flight (unacked) TCP window. At 2 KiB the window
+/// was one segment, and a large `sendfile` response stalled one delayed-ACK per
+/// 2 KiB (~34 KB/s on Nitro). 32 KiB lets ~16 segments fly before an ACK is
+/// needed. Heap cost = LISTENER_POOL_SIZE × 2 ports × (RX + TX) ≈ 128 × 34 KiB
+/// ≈ 4.5 MiB of the 16 MiB kernel heap.
+const LISTENER_TX_BUF_SIZE: usize = 32768;
 
 /// Create a new `tcp::Socket` bound to `endpoint` in Listen state, add it
 /// to the SocketSet, and return its handle. Called inside `with_net`;
@@ -168,7 +176,7 @@ fn install_fresh_listener(
     endpoint: IpListenEndpoint,
 ) -> SocketHandle {
     let rx_buf = tcp::SocketBuffer::new(alloc::vec![0u8; LISTENER_BUF_SIZE]);
-    let tx_buf = tcp::SocketBuffer::new(alloc::vec![0u8; LISTENER_BUF_SIZE]);
+    let tx_buf = tcp::SocketBuffer::new(alloc::vec![0u8; LISTENER_TX_BUF_SIZE]);
     let listener = tcp::Socket::new(rx_buf, tx_buf);
     let h = net.sockets.add(listener);
     net.sockets.get_mut::<tcp::Socket>(h).listen(endpoint).ok();
