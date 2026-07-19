@@ -286,6 +286,8 @@ const SYS_PPOLL: u64 = 271;
 const SYS_TIMERFD_SETTIME: u64 = 286;
 const SYS_PRCTL: u64 = 157;
 const SYS_WRITEV: u64 = 20;
+const SYS_SENDFILE: u64 = 40;
+const SYS_DUP: u64 = 32;
 const SYS_TKILL: u64 = 200;
 const SYS_FUTEX: u64 = 202;
 const SYS_CLOCK_GETTIME64: u64 = 228; // actually clock_gettime uses 228 on x86_64
@@ -496,6 +498,16 @@ fn syscall_dispatch_inner(
             }
         }
         SYS_CLOCK_GETTIME => sys_clock_gettime(a0 as i32, a1 as *mut u64),
+        SYS_SENDFILE => sys_sendfile(a0 as i32, a1 as i32, a2 as *mut u64, a3 as usize),
+        SYS_DUP => {
+            // ERTS's inet sendfile dups the file fd before transferring. Only VFS
+            // (cpio file) fds are dup-able here; sockets/pipes are not.
+            if crate::vfs::is_vfs_fd(a0 as i32) {
+                crate::vfs::dup(a0 as i32)
+            } else {
+                -9 // -EBADF
+            }
+        }
         SYS_WRITEV => sys_writev(a0 as i32, a1 as *const IoVec, a2 as usize),
         19 => { // readv — scatter read
             let iov = a1 as *const IoVec;
@@ -2004,6 +2016,111 @@ fn sys_clock_gettime(_clk_id: i32, tp: *mut u64) -> i64 {
 struct IoVec {
     base: *const u8,
     len: usize,
+}
+
+/// sendfile(2): copy up to `count` bytes from a file fd to a socket fd in the
+/// kernel. ERTS's inet driver calls this for `Plug.Static`/`send_file`
+/// (inet_drv.c: `sendfile(socket, file, &offset, count)`); implementing it here
+/// is what makes static assets serve on a *clean clone* — no ThousandIsland
+/// bridge, no patched dependency.
+///
+/// Linux ABI: `sendfile(out_fd, in_fd, off_t *offset, size_t count)`.
+/// `out_fd` is the destination (socket), `in_fd` the source (regular file). If
+/// `offset` is non-NULL, the transfer starts at `*offset` and `*offset` is
+/// advanced by the bytes transferred (the file's own position is untouched);
+/// ERTS always passes a non-NULL offset. Returns the number of bytes actually
+/// written to the socket.
+///
+/// Partial-write discipline (the fc8d468 lesson, one layer up): stream through a
+/// small fixed buffer — NEVER buffer the whole file, and NEVER a per-socket mega
+/// buffer (64 sockets × big = the whole 16 MiB heap; that killed the earlier
+/// attempt). Advance `*offset` by exactly the bytes the socket *accepted*, return
+/// that count, and surface `-EAGAIN` only when zero bytes were transferred — ERTS
+/// resumes on POLLOUT and calls us again. Bytes read from the file but not
+/// accepted by a full TX ring are simply re-read next call from the advanced
+/// offset, so no duplication and no gaps.
+fn sys_sendfile(out_fd: i32, in_fd: i32, offset_ptr: *mut u64, count: usize) -> i64 {
+    // out must be a socket; in must be a regular (VFS) file.
+    if !crate::net::socket::is_socket_fd(out_fd) {
+        return -22; // -EINVAL
+    }
+    if !crate::vfs::is_vfs_fd(in_fd) {
+        return -22; // -EINVAL — sendfile's source must be an mmap-able file
+    }
+
+    let use_offset = !offset_ptr.is_null();
+    // Read start position: from *offset if given, else the file's current pos.
+    let start = if use_offset {
+        // SAFETY: offset_ptr is a non-null user pointer to an off_t.
+        unsafe { *offset_ptr as usize }
+    } else {
+        let p = crate::vfs::lseek(in_fd, 0, 1); // SEEK_CUR — current position
+        if p < 0 {
+            return p;
+        }
+        p as usize
+    };
+
+    // Bounded streaming buffer. The socket TX ring is 2048; a 4 KiB chunk keeps
+    // file reads coarse while holding no meaningful memory. No whole-file buffer.
+    const CHUNK: usize = 4096;
+    let mut buf = [0u8; CHUNK];
+    let mut off = start;
+    let mut total: usize = 0;
+    let mut remaining = count;
+
+    while remaining > 0 {
+        let want = remaining.min(CHUNK);
+        // Always pread (positioned, no implicit advance) so a partial socket
+        // accept leaves the unsent tail to be re-read next call — no gap.
+        let nread = crate::vfs::pread(in_fd, buf.as_mut_ptr(), want, off);
+        if nread < 0 {
+            if total > 0 {
+                break;
+            }
+            return nread; // read error, nothing transferred
+        }
+        if nread == 0 {
+            break; // EOF — fewer than `count` bytes available
+        }
+        let nread = nread as usize;
+
+        // Hand the chunk to the socket send path, which honors the accepted
+        // count (send_slice returns what fit; -EAGAIN when the ring is full).
+        let nsent =
+            crate::net::socket::sys_sendto(out_fd, buf.as_ptr(), nread, 0, core::ptr::null(), 0);
+        if nsent < 0 {
+            // Would block / error. Never discard progress: if we already sent
+            // some bytes, report them; only surface the error when nothing moved.
+            if total > 0 {
+                break;
+            }
+            return nsent; // typically -EAGAIN (-11)
+        }
+        let nsent = nsent as usize;
+        total += nsent;
+        off += nsent;
+        remaining -= nsent;
+
+        // Socket accepted less than we read → the TX ring filled. Stop; the
+        // unsent tail is re-read next call from the (nsent-advanced) offset.
+        if nsent < nread {
+            break;
+        }
+    }
+
+    // Advance the caller's offset by exactly the bytes transferred.
+    if use_offset {
+        // SAFETY: offset_ptr is a non-null user pointer to an off_t.
+        unsafe {
+            *offset_ptr = off as u64;
+        }
+    } else {
+        // NULL offset: advance the file's own position instead (SEEK_SET to the
+        // new absolute position). ERTS never hits this path, but keep it correct.
+        crate::vfs::lseek(in_fd, off as i64, 0);
+    }
+    total as i64
 }
 
 fn sys_writev(fd: i32, iov: *const IoVec, iovcnt: usize) -> i64 {

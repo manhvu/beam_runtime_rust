@@ -182,6 +182,38 @@ pub fn open(path: &[u8]) -> i64 {
     -24 // -EMFILE
 }
 
+/// Duplicate an open VFS fd (dup(2)). Returns a new fd referring to the same
+/// cpio file with an independent (copied) position. ERTS's inet-driver sendfile
+/// path dups the file fd before transferring and closes the dup afterward
+/// (inet_drv.c: `dup_file_fd = dup(raw_file_fd)`), so without this, `sendfile`
+/// receives a bogus fd and fails — which is why static assets 500'd.
+pub fn dup(oldfd: i32) -> i64 {
+    let mut files = OPEN_FILES.lock();
+    // Copy the source file's backing info (drops the immutable borrow before we
+    // mutate the table to claim a slot).
+    let mut src = None;
+    for slot in files.iter() {
+        if let Some(ref f) = slot {
+            if f.fd == oldfd {
+                src = Some((f.data_offset, f.data_len, f.pos));
+                break;
+            }
+        }
+    }
+    let (data_offset, data_len, pos) = match src {
+        Some(x) => x,
+        None => return -9, // -EBADF — not an open VFS fd
+    };
+    let fd = NEXT_VFS_FD.fetch_add(1, Ordering::Relaxed) as i32;
+    for slot in files.iter_mut() {
+        if slot.is_none() {
+            *slot = Some(OpenFile { fd, data_offset, data_len, pos });
+            return fd as i64;
+        }
+    }
+    -24 // -EMFILE
+}
+
 /// Read from an open VFS file. Returns bytes read, 0 for EOF.
 pub fn read(fd: i32, buf: *mut u8, count: usize) -> i64 {
     let mut files = OPEN_FILES.lock();
