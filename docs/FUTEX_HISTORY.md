@@ -188,6 +188,50 @@ rediscovered.
 | H15 | **Idle-loop `cli`/`sti`/`hlt` discipline.** A wake (IPI or timer) that lands in the window between the idle loop's check-for-work and its `hlt` is lost until the next interrupt — the classic `sti; hlt` atomicity trap. | If the idle path does `cli` → check runqueue → (empty) → `sti` → `hlt` non-atomically, an IPI in the gap sets no pending state and `hlt` sleeps through it. On a CPU with no armed timer (see H14) that sleep is unbounded. | Audit the idle loop for the `sti; hlt` atomic pairing (interrupt must be enabled *by* `hlt`, not before it); check whether a wake arriving mid-check is preserved as pending. | **Open — untested** |
 | H16 | **The second ERTS wake channel** (`POLL_SLEEPING` → `erts_check_io_interrupt` → self-pipe/epoll). The whole investigation has focused on the `TSE_SLEEPING` → `futex_wake` path (§3). The *other* branch of `erts_sched_finish_poke` wakes a poll-sleeping scheduler via the I/O poll set, and it has **never** been examined for lost wakeups. | §3 shows two wake targets; a scheduler blocked in `POLL_SLEEPING` is woken through `erts_check_io_interrupt` (self-pipe write / epoll), not the futex. If our `epoll`/self-pipe wake has the same lost-wake window the futex was suspected of, the bug could live here and every futex-side fix would miss it. | Instrument the `POLL_SLEEPING` branch: does `erts_check_io_interrupt` reliably wake a scheduler parked in our `epoll_wait`? Reproduce with the amplifier and check which sleep state the stalled scheduler is actually in (`TSE_SLEEPING` vs `POLL_SLEEPING`) — that single datum says which channel to chase. | **Open — untested** |
 
+### Phase 0 code-read verdicts on H14–H16 (VERIFICATION_RESEARCH_PLAN.md)
+
+Done as code reads (hours, no runs). Result: **the three lost-wake hypotheses are largely ruled
+out** — the kernel has *layered* rescues, so a single lost wake self-heals. That is itself the
+finding: the residual stall is not a naive lost wake, so the modelling should target the
+*rescue-gap × ethr_event interleaving*, not the raw wake path.
+
+- **H14 (lost IPI / AP without timer): mostly ruled out.** APs *do* arm local APIC timers
+  (`apic::init_ap`, periodic 100 Hz). `CALIBRATED_TICKS` is set by the BSP in `init_bsp`
+  (`main.rs`) **before** AP bringup, and x86-TSO makes the store visible to the AP — so the
+  `if CALIBRATED_TICKS > 0` guard is satisfied. `send_ipi` waits on ICR delivery-status (bit 12),
+  so loss isn't at the sender. *Residual smell:* the guard has **no `else` and no error** — an AP
+  that ever reached `init_ap` before the store would silently run tickless. Latent, not active.
+- **H15 (idle-loop `cli`/`sti`/`hlt`): a real check-then-sleep smell, but timer-rescued — a
+  latency, not the permanent hang.** `cpu_idle_loop` does `sti; hlt` then pops the queue *after*
+  `hlt` — it never re-checks the queue immediately before sleeping. A wake landing in the
+  (drain → `hlt`) window whose IPI is consumed by an ISR before `hlt` leaves a runnable thread
+  queued while the CPU sleeps. **But** the 100 Hz timer (`timer_handler` always EOIs at the top;
+  idle `ip` is kernel so it just `timer_tick`s and `iret`s back to the post-`hlt` pop) wakes the
+  CPU within ≤10 ms and the pop runs the thread. So H15 alone = ≤10 ms latency on an all-timers
+  system, **not** a permanent hang. (The pre-`hlt` re-check is still worth adding.)
+- **H16 (second wake channel / epoll): ruled out — it doesn't block.** `sys_epoll_wait` **yield-
+  loops** (`net::poll()` each iteration; "we don't have eventfd-style blocking, just keep
+  yielding"), so a scheduler in `epoll_wait` is never parked waiting for a poke it could miss.
+
+- **The futex itself looks correct for Property 1.** In `futex_wait_until`, the value load and the
+  `State::Blocked` mark are under the **same bucket lock**, and `pending_wake_consume` handles
+  wake-before-wait. A wake cannot slip between check and block.
+
+- **Where the permanent hang must live (refocused hypothesis).** The watchdog (`watchdog_wake`,
+  every tick) rescues a Blocked thread on **`value_changed`** (`*futex_addr != futex_val` — the
+  10 ms lost-wake backstop), `timed_out`, or **`stale` (Blocked > 5 s on an infinite wait)**. The
+  *classic* lost wake — waker mutates the value to ON but skips `futex_wake` — is caught by
+  `value_changed` within one tick. The gap: **if a lost wake leaves `*futex_addr == futex_val`
+  (the ethr_event OFF_WAITER-stuck case), `value_changed` never fires and only the 5-second
+  `stale` backstop rescues it.** A 5 s stall on cold boot likely exceeds the boot-reliability
+  sweep's timeout — so the ~3% "failures" may be **self-healing-but-slow**, not permanent, which
+  fits "retry always succeeds." *Whether that interleaving actually occurs is precisely the §4.2
+  refinement question* — not settleable by more code reading; it is what the TLA+ model (Phase 1)
+  should decide, with `value_changed`/`stale` modelled as the rescue and the ethr_event ON/OFF/
+  OFF_WAITER states modelled explicitly. Next code read before modelling: confirm what value the
+  ethr_event address actually holds at the stuck moment (instrument `stale`-triggered rescues to
+  log `current` vs `futex_val`) — one datum that says whether `value_changed` *should* have fired.
+
 **Also ruled out as not-a-fix:** mapping more memory (pointers were already corrupt in registers,
 not unmapped); bigger stacks (symptoms are too consistent for overflow).
 
