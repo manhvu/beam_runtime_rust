@@ -76,12 +76,14 @@ assert_md5 "chk/65536/8 (multi-send)"   "$B/chk/65536/8"   "$CHK_65536_8_MD5"
 assert_md5 "chk/130000/16 (multi-send)" "$B/chk/130000/16" "$CHK_130000_16_MD5"
 
 echo "-- Concurrency (large-asset back-pressure is where partial-write bugs hide) --"
-mapfile -t hashes < <(seq 1 "$CONCURRENCY" | xargs -P"$CONCURRENCY" -I{} sh -c "curl -s --max-time 60 $B$BIG_BIN_PATH | md5sum | cut -d' ' -f1")
-uniq_ok=$(printf '%s\n' "${hashes[@]}" | sort -u)
-if [ "$(printf '%s\n' "${hashes[@]}" | wc -l)" = "$CONCURRENCY" ] && [ "$uniq_ok" = "$BIG_BIN_MD5" ]; then
+# Portable (bash 3.2 / macOS has no `mapfile`): collect md5s into a plain string.
+conc_md5s=$(seq 1 "$CONCURRENCY" | xargs -P"$CONCURRENCY" -I{} sh -c "curl -s --max-time 60 $B$BIG_BIN_PATH | md5sum | cut -d' ' -f1")
+conc_total=$(printf '%s\n' "$conc_md5s" | grep -c .)
+conc_distinct=$(printf '%s\n' "$conc_md5s" | sort -u)
+if [ "$conc_total" = "$CONCURRENCY" ] && [ "$conc_distinct" = "$BIG_BIN_MD5" ]; then
   ok "N=${CONCURRENCY} concurrent big.bin: all ${CONCURRENCY} identical + correct"
 else
-  bad "N=${CONCURRENCY} concurrent big.bin" "${CONCURRENCY}x ${BIG_BIN_MD5}" "$(printf '%s\n' "${hashes[@]}" | sort | uniq -c | tr '\n' '|')"
+  bad "N=${CONCURRENCY} concurrent big.bin" "${CONCURRENCY}x ${BIG_BIN_MD5}" "$(printf '%s\n' "$conc_md5s" | sort | uniq -c | tr '\n' '|')"
 fi
 
 echo "-- WebSocket / LiveView --"
