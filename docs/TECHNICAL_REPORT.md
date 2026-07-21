@@ -198,9 +198,16 @@ same harness and N.
 
 - **Harness.** 0/32 is on TCG `-smp 1`, a harness we have repeatedly called degenerate. It is the
   same evidence *class* as the diagnostic runs — good, not gold. The reliability claim must not
-  propagate to a real-hardware assertion before a c5.metal-KVM-amplifier (or Nitro) A/B of this build
-  vs. the shipped default. That A/B is the correct next spend precisely because `1cac02f` is the
-  thing that ships.
+  propagate to a real-hardware assertion before a bare-metal-KVM-amplifier (or Nitro) A/B of this
+  build vs. the shipped default. That A/B is the correct next spend precisely because `1cac02f` is the
+  thing that ships. **Attempted and deferred (hardware):** we launched a `c5.metal` for exactly this
+  A/B (two disks differing only in the valve, ready to sweep) and drew a **Cascade Lake 8275CL** —
+  the CPU this project's own hardware matrix documents as having a QEMU/KVM virtio-DMA-coherence bug.
+  Confirmed empirically on the box: early boot is clean but the serial stream corrupts (BEAM bytecode
+  leaks in at ~21 KB), so no clean fingerprint measurement was possible. The one documented-*working*
+  CPU (Broadwell `i3.metal`) is no longer offered in the region; the remaining metal types are newer
+  CPUs whose behavior with this kernel is untested. So the metal A/B is **deferred on hardware
+  availability, not skipped** — the falsifier below stands, stated but not yet run.
 - **Mechanism.** *Cause identified, mechanism unpinned, mitigated.* We know real blocking during init
   causes it and spin-yield removes it; we have **not** pinned the exact circular wait (the shape: a
   scheduler blocks on a post-registration init lock whose owner is itself parked). Why the
