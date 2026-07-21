@@ -115,7 +115,7 @@ Tyn runs a real, unmodified OTP 27 + Phoenix stack, but it is a specialized runt
 
 ERTS is built from unmodified OTP 27 source — no patches, no special defines — via the pinned, reproducible build in [`beam-build/`](beam-build/) (Alpine 3.19, GCC 13.2, musl 1.2.4, static, `--enable-jit --without-ssl`).
 
-Tyn uses a hybrid futex strategy: during ERTS init (~2 s) `futex_wait` spin-yields, avoiding a thread-progress registration deadlock; afterwards it blocks properly and idle CPUs enter `HLT`. The switch is automatic once boot modules are loaded.
+Tyn uses a conservative futex valve: `futex_wait` **spin-yields through boot** — avoiding a rare init-time thread-progress deadlock that real blocking exposes — then switches to real blocking (so idle CPUs enter `HLT`) once the app has finished starting, signalled by the boot harness's `serial_shell ready` marker. The trigger is deliberately late and past the whole init window; earlier proxies (module-open count, `managed_count`, listen-port) each fired *before* the deadlock and reintroduced the stall. On the GCC-14 boot-stress amplifier this takes the stall from ~15% to **0/32**. Full diagnosis, the five ruled-out mechanisms, and the workaround-hygiene backstory are in [`docs/FUTEX_HISTORY.md`](docs/FUTEX_HISTORY.md).
 
 More: [module structure](docs/module-structure.md) · [boot flow](docs/boot-flow.md) · [runtime architecture](docs/runtime-arch.md)
 
