@@ -230,16 +230,44 @@ pub fn num_cpus() -> usize {
     NUM_CPUS.load(Ordering::Relaxed)
 }
 
-/// When false, futex_wait returns immediately (spin-yield mode for ERTS init).
-/// Switched to true once ERTS finishes thread-progress registration.
+/// Conservative futex valve. `false` = `futex_wait` spin-yields (never really
+/// blocks); `true` = real blocking with `HLT` idle. It starts `false` so the
+/// ENTIRE ERTS/app init window runs under spin-yield — this avoids a rare
+/// (~3%) cold-boot deadlock in an init-time thread-progress wait that real
+/// blocking exposes (root cause in docs/FUTEX_HISTORY.md; spin-yield eliminated
+/// it 0/32 on the GCC-14 amplifier). It is flipped to `true` by
+/// `enable_blocking_futex()` on the boot harness's `serial_shell ready` marker
+/// (syscall.rs), an observable "the app finished booting" signal, deliberately
+/// LATE and past the whole deadlock window. **Do not arm this earlier**:
+/// open-count, `managed_count`, and listen-port triggers all proved to fire
+/// *before* the deadlock and reintroduced the stall; the exact init edge is
+/// unpinned, so the trigger is conservative by design.
 static FUTEX_BLOCKING: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(true);
+    core::sync::atomic::AtomicBool::new(false);
 
-/// Enable blocking futex. Called once ERTS init is past the thread-progress barrier.
+/// Arm real blocking. The PRIMARY caller is the `serial_shell ready` marker in
+/// `syscall.rs` (the boot harness's app-is-up signal). **That trigger is a
+/// tyn_boot.erl print, NOT a property of ERTS** — so if the boot script is
+/// reordered, the marker text changes, or an app fails before `apply_config`
+/// succeeds, this may never fire. The `watchdog_wake` elapsed-time backstop
+/// arms it anyway after `BLOCKING_ARM_FALLBACK_NS` so no boot path spins
+/// forever. Idempotent; safe to call from either site.
 pub fn enable_blocking_futex() {
-    FUTEX_BLOCKING.store(true, core::sync::atomic::Ordering::Release);
-    crate::serial_println!("[sched] blocking futex enabled");
+    if !FUTEX_BLOCKING.swap(true, core::sync::atomic::Ordering::Release) {
+        crate::serial_println!("[sched] blocking futex enabled");
+    }
 }
+
+/// Monotonic-ns timestamp of the first real spin-yield (set once in
+/// `futex_wait_until`). 0 = none yet. The watchdog uses it to arm blocking
+/// after a generous bound if the `serial_shell ready` marker never arrives.
+static FIRST_SPINYIELD_NS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// Belt-and-braces: if the boot marker never prints, arm blocking this long
+/// after the first spin-yield so idle CPUs eventually reach HLT instead of
+/// spinning forever. Generous — well past a healthy boot (~10–60 s under TCG),
+/// so it never pre-empts the real marker on a normal boot.
+const BLOCKING_ARM_FALLBACK_NS: u64 = 120_000_000_000; // 120 s
 
 fn futex_bucket(addr: u64) -> usize {
     (addr as usize / 4) % FUTEX_BUCKETS
@@ -272,8 +300,23 @@ extern "C" fn cpu_idle_loop() -> ! {
         // to take the futex / thread / queue locks the rescue needs.
         process_rescues();
 
-        x86_64::instructions::interrupts::enable();
-        x86_64::instructions::hlt();
+        // Check-then-sleep, race-free. Disable interrupts, re-check the run
+        // queue, and only HLT if it is still empty — `enable_and_hlt` makes the
+        // `sti; hlt` pair atomic against a wake IPI landing in the window (the
+        // sti-shadow defers the interrupt until after hlt). The 100 Hz timer
+        // papers over a naive check-then-sleep within ≤10 ms today; this closes
+        // the window outright so it can't degrade into a hang if the timer
+        // discipline ever changes.
+        x86_64::instructions::interrupts::disable();
+        let empty = {
+            let _qlock = CPU_QUEUE_LOCKS[cpu].lock();
+            unsafe { CPU_QUEUES[cpu].queue.is_empty() }
+        };
+        if empty {
+            x86_64::instructions::interrupts::enable_and_hlt();
+        } else {
+            x86_64::instructions::interrupts::enable();
+        }
 
         // Unified resume: a woken thread is ALWAYS in the run queue.
         // futex_wake pushes to queue regardless of in_idle_ctx state.
@@ -680,6 +723,12 @@ pub fn futex_wait_until(addr: u64, val: u32, deadline: Option<u64>) -> i64 {
     // During ERTS init, yield and return (spin-yield) to avoid
     // the thread-progress registration deadlock. After init, block properly.
     if !FUTEX_BLOCKING.load(core::sync::atomic::Ordering::Acquire) {
+        // Stamp the first spin-yield so the watchdog can arm blocking after a
+        // generous bound if the `serial_shell ready` marker never prints.
+        FIRST_SPINYIELD_NS
+            .compare_exchange(0, crate::syscall::monotonic_ns(),
+                              Ordering::Relaxed, Ordering::Relaxed)
+            .ok();
         drop(flock_guard);
         yield_current();
         return 0;
@@ -893,6 +942,25 @@ pub fn watchdog_wake() {
     // it can take the futex / thread / queue locks in the same order
     // as `futex_wake`.
     let now_ns = crate::syscall::monotonic_ns();
+
+    // Belt-and-braces valve backstop: the primary arm is the `serial_shell
+    // ready` marker (syscall.rs). If that never prints (boot reordered, app
+    // failed before apply_config, marker text changed), arm blocking anyway a
+    // generous bound after the first spin-yield so idle CPUs reach HLT instead
+    // of spinning forever. Only fires while still in spin-yield mode.
+    if !FUTEX_BLOCKING.load(Ordering::Acquire) {
+        let t0 = FIRST_SPINYIELD_NS.load(Ordering::Relaxed);
+        if t0 != 0 && now_ns >= t0 + BLOCKING_ARM_FALLBACK_NS {
+            FUTEX_BLOCKING.store(true, Ordering::Release);
+            crate::serial::set_quiet(false);
+            crate::serial_println!(
+                "[sched] FALLBACK: arming blocking futex {}s after first spin-yield \
+                 (serial_shell ready marker never seen — check tyn_boot boot path)",
+                BLOCKING_ARM_FALLBACK_NS / 1_000_000_000
+            );
+        }
+    }
+
     unsafe {
         for i in 0..MAX_THREADS {
             // Snapshot read — interrupt context, no locks.

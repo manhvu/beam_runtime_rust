@@ -682,14 +682,34 @@ fn sys_write(fd: i32, buf: *const u8, count: usize) -> i64 {
             }
         }
         // Boot-complete signal: when the boot eval prints "serial_shell ready"
-        // (its last line), go quiet so routine kernel logs stop garbling the
-        // serial-console shell. The marker (underscore) doesn't match the shell
-        // banner ("Tyn serial shell"), so it only fires once, post-boot.
+        // (its last line, emitted by tyn_boot.erl only AFTER the app started
+        // successfully — apply_config returned), (1) go quiet so routine kernel
+        // logs stop garbling the serial-console shell, and (2) arm the
+        // conservative futex-blocking valve. The marker (underscore) doesn't
+        // match the shell banner ("Tyn serial shell"), so it fires once,
+        // post-boot.
+        //
+        // (2) is the honest re-arm trigger for FUTEX_BLOCKING (see sched.rs and
+        // docs/FUTEX_HISTORY.md): the kernel spin-yields `futex_wait` through the
+        // whole of ERTS/app init to dodge the init-time thread-progress deadlock
+        // that real blocking exposes, then switches to real blocking (HLT idle)
+        // here — the boot harness's own "the app is up" declaration, reached only
+        // if init completed (a stall never prints this). Do NOT arm earlier:
+        // listen-port, open-count, and managed_count triggers all proved to fire
+        // before the deadlock window closes and reintroduced the stall.
+        //
+        // ⚠️ COUPLING: correct futex behaviour now depends on `tyn_boot.erl`
+        // printing EXACTLY this byte string as its success marker. If you change
+        // that message, reorder the boot so it prints before the app is up, or
+        // run an app that never reaches it, the valve arms wrong or never — and
+        // it's silent. `watchdog_wake`'s elapsed-time fallback (sched.rs) is the
+        // backstop for "never," but keep this string in sync with tyn_boot.erl.
         const MARK: &[u8] = b"serial_shell ready";
         if !crate::serial::is_quiet() && count >= MARK.len() {
             // SAFETY: buf points to `count` bytes of identity-mapped user memory.
             let s = unsafe { core::slice::from_raw_parts(buf, count) };
             if s.windows(MARK.len()).any(|w| w == MARK) {
+                crate::sched::enable_blocking_futex();
                 crate::serial::set_quiet(true);
             }
         }

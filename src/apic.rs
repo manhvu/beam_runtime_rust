@@ -138,15 +138,28 @@ pub fn init_ap() {
         // Accept all interrupts
         apic_write(APIC_TPR, 0);
 
-        // Start periodic timer using BSP's calibrated value
+        let id = apic_read(APIC_ID) >> 24;
+
+        // Start periodic timer using BSP's calibrated value. CALIBRATED_TICKS
+        // is set by the BSP before any AP is brought up, so a zero here means
+        // this AP would come up with NO local timer — an invisible catastrophe:
+        // the CPU never preempts, and a lost wake to a thread homed on it is not
+        // self-healing (nothing ever wakes the CPU to re-check its run queue).
+        // Never leave that silent.
         if CALIBRATED_TICKS > 0 {
             apic_write(APIC_TIMER_DIVIDE, 0x03);
             apic_write(APIC_LVT_TIMER, (1 << 17) | TIMER_VECTOR as u32);
             apic_write(APIC_TIMER_INIT, CALIBRATED_TICKS);
+            serial_println!("[apic] AP Local APIC ID={} enabled, timer=100Hz", id);
+        } else {
+            crate::serial::set_quiet(false);
+            serial_println!(
+                "[apic] FATAL: AP Local APIC ID={} came up with CALIBRATED_TICKS=0 \
+                 — local timer NOT armed (no preemption; wakes to threads homed \
+                 here are not self-healing)",
+                id
+            );
         }
-
-        let id = apic_read(APIC_ID) >> 24;
-        serial_println!("[apic] AP Local APIC ID={} enabled, timer=100Hz", id);
     }
 }
 

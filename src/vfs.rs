@@ -155,15 +155,11 @@ pub fn open(path: &[u8]) -> i64 {
             if let Ok(s) = core::str::from_utf8(path) {
                 serial_println!("[vfs] open {} cpio_off={:#x} ({} bytes)", s, x.0, x.1);
             }
-            // After enough modules are loaded, switch from spin-yield to
-            // blocking futex. The init phase loads ~80 .beam files; after
-            // that, lock contention is brief and blocking is safe.
-            static OPEN_COUNT: core::sync::atomic::AtomicU64 =
-                core::sync::atomic::AtomicU64::new(0);
-            let n = OPEN_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            if n == 99999 { // disabled — blocking futex deadlocks gen_server calls
-                crate::sched::enable_blocking_futex();
-            }
+            // (The futex-blocking valve is re-armed on the boot harness's
+            // `serial_shell ready` marker, not on a module-open count — see
+            // sched.rs FUTEX_BLOCKING, syscall.rs, and docs/FUTEX_HISTORY.md.
+            // Open-count proved to fire before the init deadlock and
+            // reintroduced the stall.)
             x
         }
         None => return -2, // -ENOENT
