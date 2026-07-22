@@ -95,6 +95,31 @@ test**, never as the confirmed mechanism.
 - **Empirical (recommended):** an ERTS-side probe of the lock/wait dependency graph at a live stall —
   the datum the model needs and cannot invent. Pins the mechanism; then the model encodes the *pinned*
   graph and reproduces it (closing the report's one honest gap).
+  - **Probe-design finding (verified, not assumed):** a frozen-memory walk alone is *insufficient*.
+    The contended mutex in the trace (`0x…3964`, `flgs=0x2`) is an `ethr_mutex`; its struct
+    (`ethr_mutex_base_`, `erts/include/internal/ethr_mutex.h`) stores `flgs` + a waiter queue `q`,
+    but **no owner field**. So freezing at the stall yields *who waits* (via `q`) but not *who owns* —
+    and the owner is the edge that matters (the parked thread whose release would unblock the waiter).
+    Pinning the graph therefore needs ERTS-side **ownership instrumentation** (record, per lock, the
+    owner tid; per thread, what it is blocked acquiring / on which event), then freeze at the stall
+    (`stop` on the QEMU monitor) and read those fields in one atomic pass. A rebuild (Alpine-3.21,
+    the amplifier) is required.
+  - **⚠️ This crosses the perturbation line — everything to date did not.** Every read used so far is
+    *non-perturbing*: QEMU-monitor extraction, in-memory rings dumped off the hot path, memory walks
+    of existing structures. Adding fields to `erl_process`/`ethr_mutex` and rebuilding **instruments
+    the runtime under test** — and this bug is timing-sensitive enough that GCC version alone moves it
+    8/8 → 2/8. The added fields may shift timing so the stall changes character or vanishes.
+    **Mandatory first check before any graph read is trusted:** A/B the instrumented build vs. the
+    current amplifier — *does it still amplify with the ownership fields compiled in?* If the stall
+    rate collapses, the instrumentation changed the experiment and the graph read means nothing. Do
+    not skip this (it is exactly the check that gets skipped when pushing to a close). Start this
+    fresh, not tired.
+  - **Capture discipline:** freeze first, then walk in a single pass (a graph read across an evolving
+    stall can show edges that never coexisted — the `-0x70`-offset trap again). Classify each chain's
+    terminus into the three outcomes, do not assume a cycle: (a) genuine cycle; (b) a
+    *runnable-but-never-satisfied* thread (rescue-livelock / scheduling, not a lock cycle — the
+    `-smp 1` repro and the "quiescence, no work to poke" finding are both consistent with this);
+    (c) a thread waiting on I/O or a timer (outside the model).
 - **Modelling (optional, hypothesis-labelled):** extend `InitLiveness` with candidate structures
   (≥3 threads; lock-held-across-wait; cyclic dependency) to see which produce a *(uni, block)-only*
   deadlock — informative about plausibility, but not a substitute for the empirical datum.
