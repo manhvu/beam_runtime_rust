@@ -1,4 +1,6 @@
-# The bug was in the composition, not the components
+# Verifying the Wrong Thing: choosing what to prove at the OS/runtime boundary
+
+**The bug was in the composition, not the components.**
 
 *A technical report on a rare cold-boot stall in Tyn, and what chasing it across five scope-pivots
 says about picking verification targets. Draft — arXiv skeleton. Written while the reasoning is
@@ -259,7 +261,10 @@ project keeps hitting: *verification claims that were sincere, tested, and attac
 artifact* (a "static assets ✅" against a hand-patched app; an AMI that didn't contain the tested
 image; a config file gitignored so the repo built for no one but the author). A machine-checked proof
 is a structural response because its validity does not depend on anyone's report of what they ran —
-but only if it is pointed at the artifact that ships.
+but only if it is pointed at the artifact that ships. These AI-assisted-development observations are
+from a single project, a single human director, and no control condition, and the author is a
+participant in the phenomenon described rather than a neutral observer — they are reported as
+observation, not generalized to a claim about AI-assisted development at large.
 
 **The thesis recurs a third time, at the modelling layer.** Phase 1 built a TLA+ model of the
 init-phase protocol *as understood* and ran it without tuning; it stayed live under all four
@@ -275,28 +280,57 @@ demonstrated at three layers (the human's suspicion, the verification target, th
 The corollary is concrete and is the report's one open gap: pinning the mechanism needs an *empirical*
 read of the actual lock/wait dependency graph at a live stall, not a better-guessed model.
 
-## 9. Related work (sketch — to be filled before arXiv)
+## 9. Related work
 
-This is a draft; the section is stubbed to fix the *positioning*, which is where the obvious attacks
-land:
+**Unikernels and single-application OSes.** The library-OS lineage — MirageOS [Madhavapeddy et al.,
+ASPLOS '13] through IncludeOS, OSv, and Unikraft [Kuenzer et al., EuroSys '21] — runs one
+application against a thin, specialized OS layer, and Tyn sits in that family. But the contribution
+here is not a unikernel-category claim; those systems already establish the density and
+attack-surface arguments. Two things differ. First, most of that work either targets a
+language-specific runtime it co-designs (MirageOS is OCaml-specific) or invests heavily in a POSIX
+compatibility layer to run *unmodified* binaries (Unikraft, OSv). Tyn does neither: it hosts a
+single unmodified production runtime — stock ERTS — and the subject is precisely the OS surface
+*that one runtime actually exercises*, empirically characterized by what breaks when each syscall is
+subtly wrong. This is closer in spirit to studies of real API usage and compatibility (e.g. Tsai et
+al.'s Linux API study [EuroSys '16]) than to a new unikernel design. Second, those papers report
+performance; this one reports a debugging and verification narrative, which is rarely the published
+artifact.
 
-- **Unikernels are not new**, and this is not a unikernel-category claim. MirageOS, IncludeOS, OSv,
-  Unikraft, and Nanos all run a single application against a thin OS layer; the novelty here is not
-  the artifact category but (a) the empirical characterization of the OS surface an *unmodified*
-  production managed runtime needs, and (b) the differential result on one primitive. Cite them to
-  disclaim scale novelty, not to compete on it.
-- **LING** is the direct ancestor — a BEAM-on-a-unikernel that reimplemented the emulator. Its
-  failure mode (you inherit the maintenance and the bugs of a second VM) is exactly the motivation
-  for running *stock* ERTS, which is what makes this a statement about the OS boundary rather than
-  about a new runtime.
-- **seL4** verified a microkernel far more thoroughly than anything here. Position honestly: this is
-  a *narrow* differential-refinement result on a single primitive, in a kernel that was not designed
-  for provability from day one. The interesting part is the *differential* spec (borrow Linux's
-  semantics, which ERTS is production-correct against) and the finding that the defect was not in the
-  primitive at all — not scale, not rigor relative to seL4.
-- **Differential / relational specification** (borrowing a trusted reference implementation's
-  observable behavior as the spec) is the lineage for §1's approach; the contribution is applying it
-  to the OS/runtime boundary and reporting what it caught (a mis-*chosen* target).
+**BEAM on a unikernel.** LING (Erlang-on-Xen) is the direct ancestor: a BEAM-on-a-unikernel that
+*reimplemented* the emulator. That choice is the cautionary tale motivating Tyn's central
+constraint — a reimplemented VM inherits the maintenance burden and the bug surface of a second
+runtime and struggles to track upstream OTP. Running the stock `beam.smp` is what makes Tyn's story
+a statement about the OS/runtime *boundary* rather than about a new VM, and it is why "the futex
+must faithfully refine Linux" is even a well-posed specification: the runtime above it is
+production-correct against Linux by construction.
+
+**Verified kernels.** seL4 [Klein et al., SOSP '09] is the reference point and the honest contrast.
+It is a machine-checked functional-correctness proof of a complete microkernel — and, strikingly,
+at ~8,700 lines of C it is almost exactly Tyn's ~8,000 lines of Rust. The comparison is instructive
+precisely because the ambition is opposite. seL4 was co-designed with its proof from the first line;
+Tyn was not, and this report makes no whole-kernel correctness claim. What we describe is narrower
+in scope and different in kind: a *differential* specification for a single primitive (borrow the
+observable `FUTEX_WAIT`/`FUTEX_WAKE` semantics of a trusted reference — Linux — that the runtime
+above is already correct against), and — more to the point — a finding that the defect was not in
+the primitive we set out to verify at all. seL4's lesson is that verifying a kernel is possible with
+enough up-front design discipline; this report's lesson is about what happens to verification when
+that discipline is absent and the target must be *chosen* rather than assumed.
+
+**Differential and relational specification.** Using a trusted implementation's observable behavior
+as the specification for another is an established idea (refinement and data refinement [de Roever &
+Engelhardt]; relational/differential verification broadly). The modest contribution here is applying
+it at the OS/runtime boundary — where the "reference" is Linux's syscall behavior and the "evidence"
+that the reference is correct is decades of the runtime running on it — and then reporting the
+outcome honestly: the differential frame was sound, but the *target selection* was where the risk
+actually lived. That is a claim about verification methodology, not about the futex.
+
+**Model checking for concurrency.** TLA+ [Lamport] and TLC are standard for exactly the class of
+interleaving bug at issue here; our use is unremarkable except in two respects worth recording. The
+teeth-test (re-introduce a known-real bug and confirm the model catches it before trusting a green
+run) is basic hygiene that is nonetheless often skipped. And the negative result — a faithful,
+un-tuned model that stays *live* and thereby bounds where the bug is *not* — is the more useful
+outcome to report, because a model hand-built until it reproduces the target proves only that the
+author could build such a model.
 
 ## 10. Next
 
@@ -308,6 +342,23 @@ land:
 - **Verus**, later, on the futex proper (~300 lines) and other self-contained primitives (fd table,
   cpio parser, ring arithmetic) — the algorithmic cores, with the concurrency argument carried by
   the model and the asm/device layer declared out of scope.
+
+## References
+
+- **[Klein et al., SOSP '09]** G. Klein et al. "seL4: Formal Verification of an OS Kernel." *SOSP '09*,
+  pp. 207–220. DOI 10.1145/1629575.1629596.
+- **[Madhavapeddy et al., ASPLOS '13]** A. Madhavapeddy et al. "Unikernels: Library Operating Systems
+  for the Cloud." *ASPLOS '13*.
+- **[Kuenzer et al., EuroSys '21]** S. Kuenzer et al. "Unikraft: Fast, Specialized Unikernels the Easy
+  Way." *EuroSys '21*. DOI 10.1145/3447786.3456248.
+- **[Tsai et al., EuroSys '16]** C.-C. Tsai et al. "A Study of Modern Linux API Usage and Compatibility:
+  What to Support When You're Supporting." *EuroSys '16*.
+- **[Lamport]** L. Lamport. *Specifying Systems: The TLA+ Language and Tools.* Addison-Wesley, 2002.
+- **[de Roever & Engelhardt]** W.-P. de Roever and K. Engelhardt. *Data Refinement: Model-Oriented
+  Proof Methods and their Comparison.* Cambridge University Press, 1998.
+- **LING (Erlang-on-Xen)** — project/repository (no canonical paper): https://github.com/cloudozer/ling
+- **MirageOS** — https://mirage.io · **IncludeOS** — https://www.includeos.org ·
+  **OSv** — https://github.com/cloudius-systems/osv · **Nanos** — https://nanos.org
 
 ---
 
