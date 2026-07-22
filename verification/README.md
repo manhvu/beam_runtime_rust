@@ -110,10 +110,23 @@ test**, never as the confirmed mechanism.
     the runtime under test** — and this bug is timing-sensitive enough that GCC version alone moves it
     8/8 → 2/8. The added fields may shift timing so the stall changes character or vanishes.
     **Mandatory first check before any graph read is trusted:** A/B the instrumented build vs. the
-    current amplifier — *does it still amplify with the ownership fields compiled in?* If the stall
-    rate collapses, the instrumentation changed the experiment and the graph read means nothing. Do
-    not skip this (it is exactly the check that gets skipped when pushing to a close). Start this
-    fresh, not tired.
+    current amplifier — *does it still amplify with the ownership fields compiled in?*
+  - **RESULT (2026-07-21) — the probe is perturbation-trapped; gate not passed.** Built the ownership
+    instrumentation (a side table keyed by mutex-addr hash, owner's `gettid` recorded on the inline
+    fast-path acquire/release — verified: `ethr_mutex` fast path is an inline `cmpxchg`, and note the
+    kernel `gettid` returns `tid+1` vs the logs' `tid`, an off-by-one to correct for). It compiled
+    clean in static-musl. The gate A/B (TCG `-smp 1`, always-block kernel, amplifier cpio, N=16 each):
+    the plain baseline amplifier beam (md5 `d2d37d77`, byte-identical to the preserved amplifier)
+    stalled **0/16**; the ownership beam stalled **0/16**; a positive control on the heavy
+    `erl_process` ring beam stalled **4/6 (67%)** under the identical harness. So the stall rate is
+    **dominated by build-specific timing perturbation** (~67× swing by instrumentation alone), not by
+    the presence of the ownership fields per se. The bind: the stall is reliably observable only under
+    instrumentation (the ring) heavy enough to doubt it is the *same* bug as the real ~3% stall, while
+    the light ownership instrumentation that would be trustworthy does not reliably produce it to read.
+    **A non-perturbing owner-capture would sidestep this** — e.g. reconstruct ownership from the mutex
+    `q` waiter-queue plus a scheduler-state cross-reference at a *naturally-occurring* stall — and is
+    the honest next design, not more instrumentation. Assets preserved on the build host
+    (`disk_own.raw`, `disk_ref.raw`, `kernel_own`, `kernel_ref`, `beam.own.smp`, `Dockerfile.own`).
   - **Capture discipline:** freeze first, then walk in a single pass (a graph read across an evolving
     stall can show edges that never coexisted — the `-0x70`-offset trap again). Classify each chain's
     terminus into the three outcomes, do not assume a cycle: (a) genuine cycle; (b) a

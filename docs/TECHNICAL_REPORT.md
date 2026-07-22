@@ -214,6 +214,23 @@ same harness and N.
   interleaving is reachable on Tyn but not Linux — Tyn's cooperative `-smp 1` scheduling admits
   orderings real parallelism does not — is the open research question, and now a *small, confirmed*
   target for a model.
+  - **Mechanism probe attempted; blocked by the perturbation trap (empirically demonstrated).** The
+    plan to pin the graph was an ERTS-side ownership instrumentation (record per-lock owner, so a
+    frozen read at the stall gives the owner the `ethr_mutex` struct does not store) — see
+    `verification/README.md`. Its mandatory first gate — *does the amplifier still amplify with the
+    ownership fields compiled in?* — produced a decisive and cautionary result. Under TCG `-smp 1`,
+    always-block kernel, N=16 each: the plain baseline amplifier beam (byte-identical to the preserved
+    amplifier) stalled **0/16**; the ownership-instrumented beam stalled **0/16**; but the earlier
+    heavy `erl_process` ring-instrumented beam stalled **4/6 (67%)** under the identical harness. The
+    stall rate is therefore **dominated by build-specific timing perturbation** — a ~67× swing driven
+    only by which instrumentation is compiled in. This traps the probe: the stall is reliably present
+    only under instrumentation heavy enough to cast doubt on whether it is the *same* bug as the real
+    ~3% Nitro stall, while the light instrumentation that would be trustworthy to read does not
+    reliably produce it. This is not a failure of effort; it is a measured property of the bug, and it
+    is the concrete reason the mechanism remains unpinned by this method. Pinning it likely needs a
+    *non-perturbing* owner-capture (e.g. reconstructing ownership from the mutex waiter queue plus a
+    scheduler-state cross-reference at a naturally-occurring stall), or acceptance that a
+    perturbation-dominated bug resists this class of probe.
 - **n = 1.** Single project, single human director, no control condition. The observations about
   AI-assisted development below are reported, not generalized; the author is a participant in the
   thing described, not a neutral observer, and the report says so.
