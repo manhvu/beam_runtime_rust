@@ -244,6 +244,20 @@ image; a config file gitignored so the repo built for no one but the author). A 
 is a structural response because its validity does not depend on anyone's report of what they ran —
 but only if it is pointed at the artifact that ships.
 
+**The thesis recurs a third time, at the modelling layer.** Phase 1 built a TLA+ model of the
+init-phase protocol *as understood* and ran it without tuning; it stayed live under all four
+scheduling×valve combinations, including the one the stall supposedly needs (`verification/`,
+`InitLiveness.tla`). That negative result — a faithful model, un-tuned, that does not reproduce the
+bug — is more trustworthy than a reproduced deadlock from a hand-built model, which always carries
+the suspicion it was shaped to appear. And it is live *substantially by construction* (produce-before-
+wait cannot cycle), so it confirms the understood pieces compose safely and **almost nothing** about
+the pieces it does not contain. The lesson is the thesis again, one layer deeper: Phase 0 said *don't
+verify a target you picked by intuition*; Phase 1 says *don't model a structure you inferred rather
+than observed*. Same failure mode, same discipline — mis-chosen target, mis-inferred structure — now
+demonstrated at three layers (the human's suspicion, the verification target, the model's structure).
+The corollary is concrete and is the report's one open gap: pinning the mechanism needs an *empirical*
+read of the actual lock/wait dependency graph at a live stall, not a better-guessed model.
+
 ## 9. Related work (sketch — to be filled before arXiv)
 
 This is a draft; the section is stubbed to fix the *positioning*, which is where the obvious attacks

@@ -40,11 +40,63 @@ the shipped fix removes it. This is the plan's gate for trusting the model, now 
 standalone paper artifact (contribution: *this class of concurrency bug is trivially found by a model
 checker*).
 
-## Next (not yet built)
+### `InitLiveness.tla` — the mechanism-pinning experiment (DONE — negative result)
 
-- **The init-phase liveness model** — the one that could *pin the mechanism* Phase 0 left unpinned:
-  model threads that must make progress (not block) until an "init complete" point, a mutex whose
-  owner may itself be parked, and the spin-yield valve; check whether *always-block* admits the
-  circular-wait deadlock that *valve-on* avoids. If TLC produces that deadlock, the shape is
-  confirmed; if not, the model is missing something real.
-- Remaining futex safety properties: lock-handoff exactness, no-stale-context-resume, no-lost-wake.
+A liveness model parameterized over `Sched ∈ {uni, smp}` × `Valve ∈ {block, spinyield}`: two ERTS
+threads that each acquire a shared init lock, publish a readiness event (ethr_event, with the
+`OFF→WAITER` cmpxchg-abort), then wait on the other's event. `uni` = cooperative uniprocessor (a
+real-blocked thread is not runnable; a model of Tyn `-smp 1`); `smp` = free interleaving (a model of
+Linux's parallelism). Property: `Terminates == <>AllDone`, under weak fairness per thread (we do
+**not** assume the wake is fair — that would assume away the lost-wake question). Run with `-deadlock`
+(TLC's structural deadlock check conflates *successful termination* — a terminal all-done state — with
+a real stuck state; the temporal property and the `NotAllBlocked` invariant are the real signals).
+
+| Sched | Valve | result |
+| --- | --- | --- |
+| uni | block | **No error** — terminates |
+| uni | spinyield | **No error** — terminates |
+| smp | block | **No error** — terminates |
+| smp | spinyield | **No error** — terminates |
+
+**Negative result, and it is a real one (not a failed run).** A faithful encoding of the init
+protocol *as currently understood* is **live under all four combinations — including (uni, block),
+the combination the stall supposedly needs.** The model was NOT tuned to reproduce the bug and was
+not tweaked afterward to force it; whether the deadlock appeared was the experiment. It didn't.
+
+What this establishes — stated at its true (modest) strength: the model is live **substantially by
+construction**. Each thread publishes its readiness event (`Crit`) *before* it waits, so a partner
+can never be parked on an unset event with its waker also parked — produce-before-wait leaves no
+reachable cycle. The "live" verdict is therefore close to *tautological for the structure the model
+contains*; TLC did not discover liveness through a deep interleaving argument, it confirmed a
+structural property. So the honest reading is narrow: **the model confirms the understood pieces
+compose safely, and confirms almost nothing about the pieces it does not contain.** That is still
+worth having — it matches, mechanically, Phase 0's component-wise exoneration — but it is a bound,
+not a mechanism.
+
+The real deadlock lives in **structure this model does not capture**, i.e. structure not yet
+empirically pinned. The honest lesson: **you cannot model your way to a mechanism you have not
+empirically pinned** — the model can validate understood pieces (the teeth-test) and bound where the
+bug is *not* (here), but it cannot conjure the unknown dependency graph. This is the paper's own
+thesis recurring a third time: Phase 0 said *don't verify a target you picked by intuition*; this
+says *don't model a structure you inferred rather than observed* — same failure mode, same
+discipline, now at the modelling layer.
+
+Concretely, the model abstracts away things the real init has and that could carry the cycle: more
+than two threads (the trace has ~13, with a mutex victim behind which schedulers park), a dependency
+graph that is not simple produce-then-wait pairing, and the possibility of a lock **held across** a
+wait. Which of these carries the deadlock is an *empirical* question — the right next step is an
+ERTS-side probe of the actual lock/wait dependency graph at the stall (who owns `0x…3964`, what each
+parked thread is transitively waiting on), not more speculative modelling. Modelling a *hypothesized*
+graph (e.g. lock-held-across-wait) is a legitimate follow-up **only if labelled as a hypothesis
+test**, never as the confirmed mechanism.
+
+## Next
+
+- **Empirical (recommended):** an ERTS-side probe of the lock/wait dependency graph at a live stall —
+  the datum the model needs and cannot invent. Pins the mechanism; then the model encodes the *pinned*
+  graph and reproduces it (closing the report's one honest gap).
+- **Modelling (optional, hypothesis-labelled):** extend `InitLiveness` with candidate structures
+  (≥3 threads; lock-held-across-wait; cyclic dependency) to see which produce a *(uni, block)-only*
+  deadlock — informative about plausibility, but not a substitute for the empirical datum.
+- Remaining futex safety properties (lower priority — Phase 0 trusts the futex): lock-handoff
+  exactness, no-stale-context-resume, no-lost-wake.
