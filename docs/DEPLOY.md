@@ -118,6 +118,12 @@ Tyn packages a standard **Mix release** into a bootable image with `tyn-pack` â†
   asdf install elixir 1.18.3-otp-27 && asdf global elixir 1.18.3-otp-27
   ```
 
+  These exact versions are pinned in the repo's committed [`.tool-versions`](../.tool-versions), so
+  from the repo root a bare `asdf install` (after the two `apt`/`asdf plugin add` steps above)
+  installs the right toolchain with no version arguments â€” the machine-readable complement to this
+  prose. (The versions must not exceed Tyn's base OTP 27.3.4.2 / ERTS 15.2.7.1; `tyn-pack` rejects a
+  release that does.)
+
 - **AWS CLI v2** (for `deploy-ami.sh`) + credentials (`aws configure`, or an instance role):
 
   ```bash
