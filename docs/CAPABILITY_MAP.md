@@ -17,7 +17,7 @@ actually booted and hit the wall.
 | # | Probe (real app) | Boots? | Works? | First wall | Root cause (traced) | Missing primitive | Evidence |
 |---|---|---|---|---|---|---|---|
 | 5a | **Ecto + Postgres, plaintext TCP** | yes | **DB: YES — raw Postgrex *and* standard eager Ecto Repo** | two walls, both packaging — **RESOLVED** | stale base-image artifacts (missing `elixir.app`; stale `tyn_boot.beam`) | none kernel-side; base-image packaging fixes | **CONFIRMED — Postgrex on Nitro; eager Ecto local→same VPC DB** |
-| 2 | Phoenix + file write | yes | no (write fails) | `open(O_CREAT)`/write to a file path | VFS is read-only cpio; `sys_write` has no file case, `sys_open` no create path | writable filesystem (tmpfs) | source-predicted |
+| 2 | **Phoenix + file write** (temp files, uploads) | yes | **no — degrades gracefully (node survives)** | `System.tmp_dir/0` → `nil`, then every write path errors | read-only cpio VFS: `sys_open` ignores `O_CREAT` (→ `ENOENT`), `sys_write` else-arm (→ `EBADF`), `mkdir`/`unlink`/`rename` unhandled (→ `ENOSYS`) | writable filesystem (tmpfs) | **CONFIRMED — local boot** |
 | 3 | NIF-bearing dep (bcrypt/argon2) | fails `load_nif` | no | `load_nif` → "Dynamic loading not supported" | static-musl beam, no dynamic loading; `tyn-pack` wires only the crypto shim, not user NIFs | per-user-NIF static-link packaging | prior-observed (exact error seen) |
 | 4 | Shells out (`System.cmd`, `os_mon`) | os_mon degraded; `cmd` fails | partial | `execve` → UNHANDLED/ENOSYS | no fork/exec; `erl_child_setup` can't spawn (see `inet_gethost`, below) | subprocess/exec | prior-observed |
 | 6 | oban / distribution | single-node yes; dist fatal | — | epmd / distributed Erlang absent | no epmd, no `inet_dist` in source | distributed Erlang / epmd | source-predicted |
@@ -75,6 +75,52 @@ roadmap more than the connectivity answer itself:
   primitive: either subprocess/exec (to run `inet_gethost`) or a default inet config that never
   selects `native` — the latter is already in `tyn_boot`.*
 
+## Probe 2 — file write, in detail (CONFIRMED on a local boot)
+
+Artifact: kernel = shipped valve `1cac02f` (`tyn-kernel-fix2`), cpio = a minimal app whose only
+job is to attempt filesystem writes several ways and report the raw result. FS behavior is pure kernel
+VFS (the read-only cpio) — identical local vs Nitro — so a local QEMU boot is a faithful confirmation;
+no Nitro run is needed for this row. Serial output (`node_alive` is `Process.alive?` at the end):
+
+```
+PB tmp_dir: nil
+PB File.write /tmp/pb.txt:                {:error, :enoent}
+PB File.open /tmp/pb.txt [:write]:        {:error, :enoent}
+PB raw open+write /tmp/upload.tmp:        {:error, :enoent}     % Plug.Upload's write path
+PB File.mkdir /tmp/pbdir:                 {:error, :enosys}
+PB raw open+write existing ./boot.config: {:opened_then_write, {:error, :ebadf}}  % open OK, write fails
+PB File.rename:                           {:error, :enosys}
+PB File.rm /tmp/pb.txt:                   {:error, :enosys}
+PB_END node_alive=true
+```
+
+**The BEAM-side errno returns are one-to-one with the read-only VFS (source-verified in `src/syscall.rs`):**
+
+| Operation | Kernel path | Returns | BEAM sees |
+|---|---|---|---|
+| Create a new file (`O_CREAT` ignored) | `sys_open` flags ignored → lookup miss | `-2 ENOENT` | `{:error, :enoent}` |
+| Write to an existing cpio file opened "for write" | `vfs::open` hands back a **read** fd; `sys_write` else-arm | `-9 EBADF` | open succeeds, then `{:error, :ebadf}` |
+| `mkdir` / `rename` / `unlink` / `ftruncate` | no dispatch arm → `UNHANDLED` | `-38 ENOSYS` | `{:error, :enosys}` |
+
+Two things the source read alone would have missed:
+
+- **The first wall is `System.tmp_dir/0` returning `nil`, not the write itself.** Elixir probes
+  `$TMPDIR`/`$TEMP`/`$TMP`/`/tmp` for a *writable* directory, finds none, and returns `nil`. So a real
+  upload/temp-file library hits the wall at **tmp-dir resolution**, before any `open`: `Plug.Upload`
+  calls `System.tmp_dir` and has no destination, and `System.tmp_dir!/0` *raises* `RuntimeError`. The
+  missing primitive is a writable path that tmp-dir probing accepts.
+- **The wall degrades; it does not crash the node.** `node_alive=true` — every failure is a catchable
+  `{:error, _}` tuple, so an app faults only in whatever process attempted the write (its own
+  supervision decides what happens). This is materially different from Wall B's `inet_gethost`, which
+  takes the whole node down (`exit_group(1)`). *A file-write wall is survivable; a native-resolver
+  wall is fatal.* (Aside: `mremap` (nr 25) is also unhandled → `ENOSYS`; ERTS normally tolerates it,
+  but it triggered one transient `{load_failed,[erl_lint]}` boot abort under TCG before a clean retry —
+  a latent sharp edge, not part of the FS story.)
+
+*Missing primitive: a small writable tmpfs mounted at `/tmp` (plus `mkdir`/`unlink`/`rename`/
+`ftruncate` syscalls and a create path in `sys_open`/`sys_write`). Scope is bounded — enough for
+`System.tmp_dir` to resolve and for temp-file/upload writes to land.*
+
 ## Synthesis — what to build next
 
 **Because plaintext Postgrex works *and* the standard eager Ecto Repo works once the base image is
@@ -90,13 +136,17 @@ they unblock:
    expected next wall: managed Postgres (RDS/Supabase) requires TLS, and the wall-clock-at-1970 issue
    would also fail cert dates. Turns "plaintext only" into "works with a managed DB." **Now the
    highest-value *unknown*.**
-3. **Writable tmpfs** — breadth (any disk touch), independent of the DB story. → Probe B.
+3. **Writable tmpfs** — breadth (any disk touch), independent of the DB story. **Probe B (row 2) is
+   now boot-confirmed:** the wall is graceful (`{:error, _}`, node survives) and surfaces first at
+   `System.tmp_dir/0 → nil`. A small writable `/tmp` (create path in `sys_open`/`sys_write` +
+   `mkdir`/`unlink`/`rename`) unblocks temp files and uploads without a full disk stack.
 
 The one-sentence version: **stateful DB-backed apps are reachable on Tyn today — raw Postgrex over
 plaintext TCP is Nitro-confirmed, and the *standard eager Ecto Repo* works too once two stale
 base-image artifacts (`elixir.app`, `tyn_boot.beam`) are re-packaged (local-confirmed against the real
 VPC DB) — so the next real unknowns are TLS-to-DB for managed databases and a writable FS, not the
-database plumbing or the ORM.**
+database plumbing or the ORM — and a file-write wall (row 2, boot-confirmed) degrades gracefully
+rather than crashing, surfacing first at `System.tmp_dir/0 → nil`.**
 
 ---
 
@@ -106,6 +156,7 @@ packaging/config fix, which is network-agnostic — the ENA path is Nitro-confir
 clean Nitro re-run of the full eager-Ecto path is the natural next confirmation but was not burned for
 a packaging fix. Wall A fix artifacts: base cpio + Elixir `.app` files (`elixir`/`logger`/`eex`/`mix`/
 `iex`) + recompiled `tyn_boot.beam` from `src/erl/tyn_boot.erl`; app = minimal `ecto_sql`+`postgrex`
-release with `MyApp.Repo` in the tree and DB config in `runtime.exs`. Rows 2/3/4/6 are source-predicted
-or prior-observed and labelled as such — hypotheses until an app boots into each wall. DB target +
-toolchain remain standing on the build host for the follow-on probes.*
+release with `MyApp.Repo` in the tree and DB config in `runtime.exs`. Probe 2 (file write) is
+boot-confirmed on a local boot (FS behavior is pure kernel VFS, identical local vs Nitro). Rows 3/4/6
+are prior-observed or source-predicted and labelled as such — hypotheses until an app boots into each
+wall. DB target + toolchain remain standing on the build host for the follow-on probes.*
