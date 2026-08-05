@@ -165,11 +165,31 @@ CPIO=my_app.cpio ./build-disk.sh          # -> a bootable raw disk image
 # AWS:   CPIO=my_app.cpio ./deploy-ami.sh  # S3 -> import-snapshot -> register AMI -> launch
 ```
 
-### Two things every real deployment needs
+### Three things every real deployment needs
 
-- **Terminate TLS at the load balancer.** Tyn has no in-guest TLS (`ssl`/`public_key`/`asn1`
-  are stubs). Put an ALB/NLB in front, terminate HTTPS there, and serve plain HTTP in-guest
-  (`scheme: "http"`). An `https:` listener starts then `:undef`s at request time.
+- **Terminate inbound TLS at the load balancer.** Tyn has no in-guest TLS: `:ssl` and `:public_key`
+  load, but the crypto NIF is a partial shim, so `:ssl` can't negotiate (it dies at
+  `:crypto.supports/0`). Put an ALB/NLB in front, terminate HTTPS there, and serve plain HTTP in-guest
+  (`scheme: "http"`). An `https:` listener starts then fails at request time.
+- **Reach a TLS-required database through a sidecar** *(the outbound analogue of the LB above)*. Tyn
+  speaks **plaintext** Postgres fine (Ecto/Postgrex confirmed), but the same crypto-NIF gap means
+  `Postgrex ssl: true` can't do TLS in-guest. Managed Postgres (RDS/Supabase) requires TLS *from the
+  client*, so terminate it in a small proxy beside the instance — **stunnel**, or **pgbouncer** with a
+  TLS upstream — in the same VPC/trust boundary. The app connects plaintext to the proxy; the proxy
+  originates TLS to the database and validates its certificate with a real clock:
+
+  ```elixir
+  # runtime.exs — point Ecto at the local TLS-terminating sidecar, not the DB directly
+  config :my_app, MyApp.Repo,
+    hostname: "127.0.0.1", port: 6432,   # the stunnel/pgbouncer listener
+    ssl: false                            # plaintext hop to the sidecar; sidecar does TLS upstream
+  ```
+
+  **RDS Proxy does not remove this requirement** — it still demands TLS from *its* clients, so the
+  sidecar (the actual TLS originator) is what satisfies RDS, not RDS Proxy. This keeps all crypto out
+  of the guest and sidesteps the epoch-clock cert-date problem entirely. (In-guest TLS is a separate,
+  larger investment — a real crypto NIF *and* a real wall clock; see `docs/CAPABILITY_MAP.md` Probe 5b
+  and `docs/WALL_CLOCK.md`.)
 - **Set `check_origin` for LiveView.** On a bare IP or any host that doesn't match the endpoint's
   configured URL host, Phoenix returns `403` on the LiveView WebSocket. In `runtime.exs`:
 

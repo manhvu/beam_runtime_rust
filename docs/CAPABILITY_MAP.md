@@ -137,19 +137,23 @@ observed until Wall 1 is lifted. The failure is graceful: the connection process
   on the clock (Wall 2)** — without a real wall clock, cert validation fails even once crypto works
   (mitigable per-connection with `verify: :verify_none`, but that is not a real managed-DB posture).
   Upside: unlocks in-guest crypto broadly (TLS, and NIF-crypto deps like bcrypt), not just DB TLS.
-- **Path B — TLS-terminating sidecar (offload, like inbound).** Inbound TLS is already terminated at
-  an ALB/NLB; the outbound-to-DB analogue is a small in-VPC proxy (stunnel / pgbouncer-with-TLS-
-  upstream): Tyn speaks **plaintext** to the proxy (already proven, `[[42]]`), the proxy originates
-  TLS to the managed DB and validates the cert with its own real clock. *Cost/risk: low* — no ERTS
-  rebuild, no crypto NIF, no in-guest clock dependency. Operational cost: run the proxy next to each
-  instance. Note for RDS specifically: RDS requires TLS *from its client*, and **RDS Proxy does not
-  remove that** — the sidecar (the actual TLS originator) is what satisfies it. This is the pragmatic
-  near-term unlock for managed Postgres with zero kernel work.
+- **Path B — TLS-terminating sidecar (offload, like inbound) — CHOSEN as the near-term pattern.**
+  Inbound TLS is already terminated at an ALB/NLB; the outbound-to-DB analogue is a small in-VPC proxy
+  (stunnel / pgbouncer-with-TLS-upstream): Tyn speaks **plaintext** to the proxy (already proven,
+  `[[42]]`), the proxy originates TLS to the managed DB and validates the cert with its own real clock.
+  *Cost/risk: low* — no ERTS rebuild, no crypto NIF, no in-guest clock dependency. Operational cost:
+  run the proxy next to each instance. RDS requires TLS *from its client*, and **RDS Proxy does not
+  remove that** — the sidecar (the actual TLS originator) is what satisfies it. This is now documented
+  as a deployment pattern (`docs/DEPLOY.md` → "Reach a TLS-required database through a sidecar"),
+  parallel to inbound LB termination.
 
-**Recommendation to decide next session:** Path B unblocks managed Postgres now with no kernel risk;
-Path A is the larger, higher-value investment (in-guest crypto generally) but must be sequenced with
-the wall-clock work (kvmclock/RTC) or it fails at cert dates. The clock is now a *named* dependency on
-the roadmap, not a surprise.
+**Path A's decision is held** until the crypto shim's `:bad_lib` is fixed. Right now the shim fails at
+the *first* missing declaration (`strong_rand_bytes/1`); we do not yet know the *full* remaining crypto
+surface `:ssl` needs (cipher/KDF/RNG primitives), so we cannot size Path A honestly. The next-session
+sequence resolves this: **declare the missing NIF function(s) in the shim → re-run Probe 5b → read the
+*next* wall** (another missing primitive, or the handshake finally reaching the epoch-clock cert wall).
+Only then is Path A (full static-OpenSSL crypto NIF) a decision with real numbers behind it — and it
+remains gated on the wall clock either way (see `docs/WALL_CLOCK.md`).
 
 ## Probe 2 — file write, in detail (CONFIRMED on a local boot)
 
@@ -242,10 +246,10 @@ a packaging fix. **Wall A fixes are now in the committed build path** — base c
 from-source `tyn_boot.beam` with the `[file, dns]` resolver default); the eager-Ecto app image was
 packed with plain `tyn-pack` (no surgery, `cpio -t`-verified) and is a minimal `ecto_sql`+`postgrex`
 release with `MyApp.Repo` in the tree and DB config in `runtime.exs`. Probe 5b (TLS-to-DB) is
-boot-confirmed on a local boot against the standing Postgres with **TLS enabled** for the probe
-(self-signed cert, `ssl=on`; `psql sslmode=require` verified a real TLSv1.3 handshake server-side;
-plaintext still works, so row 5a is unaffected — TLS left enabled on the standing DB for future
-probes). Probe 2 (file write) is boot-confirmed on a local boot (FS behavior is pure kernel VFS,
+boot-confirmed on a local boot against the standing Postgres with **TLS enabled** (self-signed cert,
+`ssl=on`; `psql sslmode=require` verified a real TLSv1.3 handshake server-side; plaintext still works,
+so row 5a is unaffected). **TLS is now a permanent fixture on the standing DB** — it costs nothing and
+both plaintext (5a) and TLS (5b) probes need it, so it stays on. Probe 2 (file write) is boot-confirmed on a local boot (FS behavior is pure kernel VFS,
 identical local vs Nitro). Rows 3/4/6 are prior-observed or source-predicted and labelled as such —
 hypotheses until an app boots into each wall. DB target + toolchain remain standing on the build host
 for the follow-on probes.*
