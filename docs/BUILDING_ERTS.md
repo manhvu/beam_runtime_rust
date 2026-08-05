@@ -74,9 +74,48 @@ cd staging && find . -type f | sed 's|^\./||' | cpio -o -H newc > ../src/otp-roo
 curl -L -o elixir.zip \
   https://github.com/elixir-lang/elixir/releases/download/v1.18.3/elixir-otp-27.zip
 unzip elixir.zip -d elixir
-cp elixir/lib/elixir/ebin/*.beam elixir/lib/iex/ebin/*.beam staging/
+# The .beam files — AND the OTP-app .app resource files. The .app files are not
+# optional cosmetics: without elixir.app the application controller can't resolve
+# `elixir` as a started app, and any dep that inspects it at init (Ecto's Repo
+# calls Code.ensure_loaded?/1) fails with "module Code is not available". Ship
+# elixir/logger/eex/iex/mix .app alongside the beams.
+for a in elixir logger eex iex mix; do
+  cp elixir/lib/$a/ebin/*.beam staging/ 2>/dev/null || true
+  cp elixir/lib/$a/ebin/$a.app  staging/
+done
 cd staging && find . -type f | sed 's|^\./||' | cpio -o -H newc > ../src/otp-rootfs.cpio
 ```
+
+### `tyn_boot.beam` — always compile from source
+
+The base cpio also carries `tyn_boot.beam` (the app-agnostic boot entry the kernel `-eval`s).
+It is compiled from [`src/erl/tyn_boot.erl`](../src/erl/tyn_boot.erl) and **must be rebuilt whenever
+that source changes** — a stale beam once silently disabled `runtime.exs` evaluation and the
+boot-time resolver config, which broke the standard eager-Ecto path in a way no error message named:
+
+```bash
+erlc -o staging src/erl/tyn_boot.erl   # overwrites the flat-root tyn_boot.beam
+```
+
+### The committed, reproducible path: `build-rootfs.sh`
+
+Rather than run the two source-derived steps above by hand (which is how they went stale),
+[`build-rootfs.sh`](../build-rootfs.sh) does them reproducibly: it seeds from the current
+`src/otp-rootfs.cpio`, **always recompiles `tyn_boot.beam`** from source (`erlc +deterministic`),
+**adds the Elixir `.app` files** from the pinned toolchain (see [`.tool-versions`](../.tool-versions)),
+repacks, and byte-checks that all of them are present in the *output*. The repack is
+**byte-reproducible** — zeroed mtimes + sorted member order — so the output `md5` is a stable
+fingerprint (rebuilding from the committed cpio is a fixpoint: same bytes out). Requires
+`erlc`/`elixir` on `PATH`.
+
+```bash
+./build-rootfs.sh                          # rewrite src/otp-rootfs.cpio in place, print md5
+OUT=/tmp/new.cpio ./build-rootfs.sh        # write elsewhere (validate before committing)
+```
+
+Fully regenerating the accreted dependency beams (Phoenix/Bandit/telemetry/…) from a mix build is
+a separate, larger task; `build-rootfs.sh` refreshes only the two components that must derive from
+source, and preserves the rest of the proven base.
 
 ---
 

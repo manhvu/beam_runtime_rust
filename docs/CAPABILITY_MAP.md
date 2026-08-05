@@ -16,7 +16,7 @@ actually booted and hit the wall.
 
 | # | Probe (real app) | Boots? | Works? | First wall | Root cause (traced) | Missing primitive | Evidence |
 |---|---|---|---|---|---|---|---|
-| 5a | **Ecto + Postgres, plaintext TCP** | yes | **DB: YES — raw Postgrex *and* standard eager Ecto Repo** | two walls, both packaging — **RESOLVED** | stale base-image artifacts (missing `elixir.app`; stale `tyn_boot.beam`) | none kernel-side; base-image packaging fixes | **CONFIRMED — Postgrex on Nitro; eager Ecto local→same VPC DB** |
+| 5a | **Ecto + Postgres, plaintext TCP** | yes | **DB: YES — raw Postgrex *and* standard eager Ecto Repo** | two walls, both packaging — **RESOLVED in the shipped build** | stale base-image artifacts (missing `elixir.app`; stale `tyn_boot.beam`) — now fixed by `build-rootfs.sh` | none kernel-side; base-image packaging fixes (landed) | **CONFIRMED — Postgrex on Nitro; eager Ecto on the shipped build path (cpio `d30fb612`)** |
 | 2 | **Phoenix + file write** (temp files, uploads) | yes | **no — degrades gracefully (node survives)** | `System.tmp_dir/0` → `nil`, then every write path errors | read-only cpio VFS: `sys_open` ignores `O_CREAT` (→ `ENOENT`), `sys_write` else-arm (→ `EBADF`), `mkdir`/`unlink`/`rename` unhandled (→ `ENOSYS`) | writable filesystem (tmpfs) | **CONFIRMED — local boot** |
 | 3 | NIF-bearing dep (bcrypt/argon2) | fails `load_nif` | no | `load_nif` → "Dynamic loading not supported" | static-musl beam, no dynamic loading; `tyn-pack` wires only the crypto shim, not user NIFs | per-user-NIF static-link packaging | prior-observed (exact error seen) |
 | 4 | Shells out (`System.cmd`, `os_mon`) | os_mon degraded; `cmd` fails | partial | `execve` → UNHANDLED/ENOSYS | no fork/exec; `erl_child_setup` can't spawn (see `inet_gethost`, below) | subprocess/exec | prior-observed |
@@ -60,20 +60,31 @@ roadmap more than the connectivity answer itself:
      Repo gets its real config.
 
   With both fixed, the **standard eager Ecto pattern** — `MyApp.Repo` in the supervision tree, DB
-  config from `runtime.exs` — connects and queries: `EAGER_ECTO_RESULT: OK rows=[[42]]` against the
-  real VPC Postgres. (Boot: local QEMU on the in-VPC build host, NAT'd to the *same* VPC Postgres the
-  Nitro probe used — the DB, wire protocol, and full Ecto/DBConnection/Postgrex stack are real; only
-  the L2 path differs from the pivotal ENA row, which is separately Nitro-confirmed.) *No missing
-  primitive: this was packaging, cheap, and it unblocks the standard ORM path — the change that turns
-  "raw Postgrex works" into "a normal Phoenix+Ecto app runs."*
+  config from `runtime.exs`, **no app-side workarounds** — connects and queries:
+  `EAGER_ECTO_RESULT: OK rows=[[42]]` against the real VPC Postgres. (Boot: local QEMU on the in-VPC
+  build host, NAT'd to the *same* VPC Postgres the Nitro probe used — the DB, wire protocol, and full
+  Ecto/DBConnection/Postgrex stack are real; only the L2 path differs from the pivotal ENA row, which
+  is separately Nitro-confirmed.) *No missing primitive: this was packaging, cheap, and it unblocks
+  the standard ORM path — the change that turns "raw Postgrex works" into "a normal Phoenix+Ecto app
+  runs."*
+
+  **Now landed in the shipped build, not a surgical image.** Both fixes are produced by the committed
+  [`build-rootfs.sh`](../../build-rootfs.sh) (always recompiles `tyn_boot.beam` from source; adds the
+  Elixir `.app` files from the pinned toolchain), documented in `BUILDING_ERTS.md §3`. The result
+  above was re-confirmed on a base cpio built by that script (`md5 d30fb612…`) and packed with plain
+  `tyn-pack` — the `elixir.app`/`tyn_boot.beam` in the app image came from the base build, verified by
+  `cpio -t`, with *zero* hand-editing. This is the same discipline as the hand-patched
+  `thousand_island`: the capability is only honest when the committed build path produces it.
 - **Wall B — native resolver on connect.** postgrex's default connect path spawns `inet_gethost`
   (ERTS's native DNS port program), which Tyn cannot exec (`ebadf`) → the node **crashes**
   (`exit_group(1)`). Even a literal-IP hostname triggered it until the inet lookup method was forced
   off `native`: `:inet_db.set_lookup([:file, :dns])` before connecting makes it use the pure-Erlang
-  resolver and the connection succeeds. `tyn_boot`'s `configure_dns/0` already runs before
-  `start_apps`, so a fresh `tyn_boot.beam` (the Wall A #2 fix) also settles this at boot. *Missing
-  primitive: either subprocess/exec (to run `inet_gethost`) or a default inet config that never
-  selects `native` — the latter is already in `tyn_boot`.*
+  resolver and the connection succeeds. **This is now the boot default:** `tyn_boot`'s
+  `configure_dns/0` (which runs before `start_apps`) sets `inet_db:set_lookup([file, dns])` —
+  `native` is never in the lookup order, so no app can spawn `inet_gethost`. The eager-Ecto probe
+  above needed *no* app-side `set_lookup`; it resolved and connected on the boot default alone.
+  *Missing primitive: none for the crash — a default inet config that never selects `native` is in
+  `tyn_boot`. (Full `System.cmd`/exec is a separate, unrelated gap — row 4.)*
 
 ## Probe 2 — file write, in detail (CONFIRMED on a local boot)
 
@@ -127,11 +138,13 @@ Two things the source read alone would have missed:
 re-packaged, DB connectivity is *not* the blocker and Ecto is *not* the blocker.** Re-ranked by what
 they unblock:
 
-1. **Land the Wall A packaging fixes in the base image (cheap, done-in-principle).** Ship Elixir's
-   `.app` files (`elixir`/`logger`/`eex`/`mix`/`iex`) in the base cpio, and rebuild `tyn_boot.beam`
-   from current source as part of the image build (`BUILDING_ERTS.md` packs Elixir `.beam` but not
-   `.app`, and nothing recompiles `tyn_boot.erl`). This is what turns "raw Postgrex works" into "a
-   normal Phoenix+Ecto app runs" — validated locally against the real VPC DB (`[[42]]`).
+1. **Wall A packaging fixes — LANDED.** Elixir's `.app` files (`elixir`/`logger`/`eex`/`iex`/`mix`)
+   and a from-source `tyn_boot.beam` are now produced by the committed `build-rootfs.sh` (base cpio
+   `md5 d30fb612…`), with the resolver `[file, dns]` default folded into `tyn_boot`. Shipped-path
+   eager Ecto queries the real VPC DB (`[[42]]`) with no surgery. This is the change that turns "raw
+   Postgrex works" into "a normal Phoenix+Ecto app runs." *(Remaining: fully regenerating the
+   accreted dependency beams from a mix build is a separate reproducibility task; `build-rootfs.sh`
+   refreshes only the two source-derived components.)*
 2. **TLS-to-DB (the managed-Postgres unlock).** Not yet tested, but `--without-ssl` makes it the
    expected next wall: managed Postgres (RDS/Supabase) requires TLS, and the wall-clock-at-1970 issue
    would also fail cert dates. Turns "plaintext only" into "works with a managed DB." **Now the
@@ -154,8 +167,10 @@ rather than crashing, surfacing first at `System.tmp_dir/0 → nil`.**
 resolution is confirmed on a local QEMU boot NAT'd to the *same* VPC Postgres (a fair proxy for the
 packaging/config fix, which is network-agnostic — the ENA path is Nitro-confirmed separately). The
 clean Nitro re-run of the full eager-Ecto path is the natural next confirmation but was not burned for
-a packaging fix. Wall A fix artifacts: base cpio + Elixir `.app` files (`elixir`/`logger`/`eex`/`mix`/
-`iex`) + recompiled `tyn_boot.beam` from `src/erl/tyn_boot.erl`; app = minimal `ecto_sql`+`postgrex`
+a packaging fix. **Wall A fixes are now in the committed build path** — base cpio built by
+[`build-rootfs.sh`](../../build-rootfs.sh) (`md5 d30fb612…`, ships the Elixir `.app` files + a
+from-source `tyn_boot.beam` with the `[file, dns]` resolver default); the eager-Ecto app image was
+packed with plain `tyn-pack` (no surgery, `cpio -t`-verified) and is a minimal `ecto_sql`+`postgrex`
 release with `MyApp.Repo` in the tree and DB config in `runtime.exs`. Probe 2 (file write) is
 boot-confirmed on a local boot (FS behavior is pure kernel VFS, identical local vs Nitro). Rows 3/4/6
 are prior-observed or source-predicted and labelled as such — hypotheses until an app boots into each

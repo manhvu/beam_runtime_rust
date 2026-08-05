@@ -81,8 +81,9 @@ start_shells() ->
 %%
 %% Two things matter, both learned the hard way:
 %%
-%%  1. set_lookup([dns]) — drop 'native' from the lookup order entirely, so no
-%%     code path can ever spawn inet_gethost after boot.
+%%  1. set_lookup([file, dns]) — drop 'native' from the lookup order entirely,
+%%     so no code path can ever spawn inet_gethost after boot ('file' first for
+%%     localhost/hosts, then 'dns' via inet_res).
 %%
 %%  2. set_resolv_conf("/tyn/resolv.conf") — point inet at the kernel's file and
 %%     let inet own the parsing. This is NOT interchangeable with the obvious
@@ -97,13 +98,19 @@ start_shells() ->
 %% (The boot-time native-lookup hazard is handled separately by the kernel
 %% giving the node a dotted hostname — see src/syscall.rs sys_uname.)
 configure_dns() ->
-    inet_db:set_lookup([dns]),
+    %% [file, dns] — never `native`. `native` would spawn ERTS's inet_gethost
+    %% port program, which Tyn cannot exec (ebadf) and which crashes the node the
+    %% moment any app resolves a host (Postgrex's default connect path hit this).
+    %% `file` first lets localhost/loopback and any /etc/hosts entries resolve
+    %% without a DNS round-trip; `dns` handles everything else via inet_res. This
+    %% is the boot-time default so no app has to set it manually.
+    inet_db:set_lookup([file, dns]),
     case try_paths(["/tyn/resolv.conf"]) of
         {ok, Bin} ->
             case has_nameserver(Bin) of
                 true ->
                     inet_db:set_resolv_conf("/tyn/resolv.conf"),
-                    io:format("tyn_boot: DNS -> [dns] via /tyn/resolv.conf ~p~n",
+                    io:format("tyn_boot: DNS -> [file, dns] via /tyn/resolv.conf ~p~n",
                               [inet_db:res_option(nameservers)]);
                 false ->
                     io:format("tyn_boot: /tyn/resolv.conf has no nameservers; "
