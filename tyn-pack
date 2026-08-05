@@ -55,7 +55,15 @@ EOF
   exit 2
 }
 
-REL=""; OUT=""; BASE="src/otp-rootfs.cpio"; TYN_ERL="src/erl"
+# Resolve default asset paths relative to THIS script, not the caller's CWD.
+# tyn-pack is normally invoked from an app's build dir (e.g. `bash ~/kernel/tyn-pack`
+# run from _build/...), so CWD-relative defaults silently missed the crypto shim and
+# base cpio: `src/erl/crypto.beam` didn't exist under the app dir, the `[ -f ] && cp`
+# skipped it, and the release's STOCK crypto.beam stayed at the cpio root — where it
+# fails to load against Tyn's Rust crypto NIF (built for the shim's function set),
+# taking :crypto (and therefore :ssl) down. Script-relative defaults fix that.
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+REL=""; OUT=""; BASE="$SCRIPT_DIR/src/otp-rootfs.cpio"; TYN_ERL="$SCRIPT_DIR/src/erl"
 APP=""; PORT=8080; PLUG=""; START_MFA=""; ENV_VARS=""
 # OTP lib dir to source core .app files (compiler/sasl/...) not bundled by an
 # include_erts:false release. Defaults to the build host's system OTP.

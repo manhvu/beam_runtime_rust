@@ -168,9 +168,10 @@ CPIO=my_app.cpio ./build-disk.sh          # -> a bootable raw disk image
 ### Three things every real deployment needs
 
 - **Terminate inbound TLS at the load balancer.** Tyn has no in-guest TLS: `:ssl` and `:public_key`
-  load, but the crypto NIF is a partial shim, so `:ssl` can't negotiate (it dies at
-  `:crypto.supports/0`). Put an ALB/NLB in front, terminate HTTPS there, and serve plain HTTP in-guest
-  (`scheme: "http"`). An `https:` listener starts then fails at request time.
+  load, but the crypto shim is **symmetric-only** (no RSA/ECDSA/ECDHE/curves), so `:ssl` can't
+  negotiate — it fails building its signature-algorithm set (`:ssl.opt_signature_algs`). Put an
+  ALB/NLB in front, terminate HTTPS there, and serve plain HTTP in-guest (`scheme: "http"`). An
+  `https:` listener starts then fails at request time.
 - **Reach a TLS-required database through a sidecar** *(the outbound analogue of the LB above)*. Tyn
   speaks **plaintext** Postgres fine (Ecto/Postgrex confirmed), but the same crypto-NIF gap means
   `Postgrex ssl: true` can't do TLS in-guest. Managed Postgres (RDS/Supabase) requires TLS *from the

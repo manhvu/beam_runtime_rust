@@ -17,7 +17,7 @@ actually booted and hit the wall.
 | # | Probe (real app) | Boots? | Works? | First wall | Root cause (traced) | Missing primitive | Evidence |
 |---|---|---|---|---|---|---|---|
 | 5a | **Ecto + Postgres, plaintext TCP** | yes | **DB: YES — raw Postgrex *and* standard eager Ecto Repo** | two walls, both packaging — **RESOLVED in the shipped build** | stale base-image artifacts (missing `elixir.app`; stale `tyn_boot.beam`) — now fixed by `build-rootfs.sh` | none kernel-side; base-image packaging fixes (landed) | **CONFIRMED — Postgrex on Nitro; eager Ecto on the shipped build path (cpio `d30fb612`)** |
-| 5b | **Ecto/Postgrex, TLS** (managed PG) | yes | **no — crypto NIF incomplete (node survives)** | `:ssl.connect` → `:crypto.supports/0` `UndefinedFunctionError` at option setup | Tyn's crypto *shim* declares a narrow NIF surface (no `strong_rand_bytes/1`); real `:crypto`'s `on_load` fails `:bad_lib` → `:crypto` unavailable; `:ssl` needs it *before* any handshake, so cert/clock (Wall 2) is never reached | full crypto NIF (OpenSSL static) **or** a TLS-terminating sidecar; wall clock is a further prereq for *in-guest* TLS | **CONFIRMED — local boot vs TLS-enabled PG** |
+| 5b | **Ecto/Postgrex, TLS** (managed PG) | yes | **no — shim is symmetric-only (node survives)** | `:ssl.opt_signature_algs/3` `MatchError` — `:crypto.supports` returns `public_keys: []`, `curves: []` | Tyn's crypto shim implements only **symmetric** crypto (SHA/HMAC/AEAD/PBKDF2, for Phoenix cookies); it has **no asymmetric surface** (RSA/ECDSA/ECDHE/curves), which TLS requires — `:ssl` can't build a signature-alg set. (Cert/clock Wall 2 still further in, unreached.) | the full public-key crypto surface (≈ static OpenSSL) **or** a TLS-terminating sidecar; wall clock a further prereq for *in-guest* TLS | **CONFIRMED — local boot vs TLS-enabled PG** |
 | 2 | **Phoenix + file write** (temp files, uploads) | yes | **no — degrades gracefully (node survives)** | `System.tmp_dir/0` → `nil`, then every write path errors | read-only cpio VFS: `sys_open` ignores `O_CREAT` (→ `ENOENT`), `sys_write` else-arm (→ `EBADF`), `mkdir`/`unlink`/`rename` unhandled (→ `ENOSYS`) | writable filesystem (tmpfs) | **CONFIRMED — local boot** |
 | 3 | NIF-bearing dep (bcrypt/argon2) | fails `load_nif` | no | `load_nif` → "Dynamic loading not supported" | static-musl beam, no dynamic loading; `tyn-pack` wires only the crypto shim, not user NIFs | per-user-NIF static-link packaging | prior-observed (exact error seen) |
 | 4 | Shells out (`System.cmd`, `os_mon`) | os_mon degraded; `cmd` fails | partial | `execve` → UNHANDLED/ENOSYS | no fork/exec; `erl_child_setup` can't spawn (see `inet_gethost`, below) | subprocess/exec | prior-observed |
@@ -96,47 +96,68 @@ clock fails certificate dates). The probe was designed to separate them.
 Setup: the standing VPC Postgres was TLS-enabled (self-signed cert, `ssl=on`); a control `psql
 sslmode=require` confirmed a real server-side handshake (`TLSv1.3, TLS_AES_256_GCM_SHA384`), and
 `sslmode=disable` still returns `42` (the plaintext row 5a is unaffected). Then a `Postgrex` client
-with `ssl: true` was booted on Tyn against it. The `Postgrex.Protocol` connection process crashed at
-`{:connect, :init}`:
+with `ssl: true` was booted on Tyn against it. Reaching the real wall took peeling off a bug of our
+own first.
+
+**Layer 0 — our own bug (fixed): the crypto shim wasn't being applied.** The first probe crashed with
+`Unable to load crypto library: :bad_lib, Function not declared as nif crypto:strong_rand_bytes/1` and
+`(crypto 5.5.3) :crypto.supports/0` undefined. Root cause was **not** the shim — it was `tyn-pack`
+resolving its shim path (`TYN_ERL=src/erl`) relative to the **caller's CWD** instead of the script.
+Packed from an app's build dir, the `[ -f "$TYN_ERL/crypto.beam" ] && cp` silently skipped, so the
+release's **stock** `crypto-5.5.3` beam stayed at the cpio root — and stock crypto's `on_load` demands
+the full OpenSSL NIF, which mismatches Tyn's Rust NIF (built for the shim's 8-function set) → `:bad_lib`
+→ `:crypto` unavailable → `:ssl.default_versions` dies at `:crypto.supports/0`. Fixed by making
+`tyn-pack` resolve its assets relative to the script (`SCRIPT_DIR`), so the shim always wins. This was
+"blocked by our own bug"; it is not a real capability wall.
+
+**Layer 1 — the real wall: the shim is symmetric-only.** With the shim correctly applied, `:crypto`
+loads (`{:module, :crypto}`) and `:crypto.supports()` returns:
 
 ```
-[error] Unable to load crypto library: :bad_lib, Function not declared as nif crypto:strong_rand_bytes/1
-[error] :gen_statem (Postgrex.Protocol) terminating
-  ** (RuntimeError) connect raised UndefinedFunctionError
-     (crypto 5.5.3) :crypto.supports/0
-     ssl.erl:3958: :ssl.default_versions/1   ← :ssl asks :crypto which TLS versions exist
-     ssl.erl:3947: :ssl.opt_versions/3
-     ssl.erl:3815: :ssl.process_options/3
-     ssl.erl:3902: :ssl.handle_options/5     ← still in OPTION SETUP; no socket, no handshake yet
+hashs:  [sha, sha224, sha256, sha384, sha512]
+ciphers:[aes_128_gcm, aes_256_gcm, chacha20_poly1305]
+macs:   [hmac]
+public_keys: []      ← no RSA / DSS / ECDSA
+curves:      []      ← no named curves, no ECDHE
 ```
 
-A direct `:ssl` probe corroborates: `:ssl` and `:public_key` load and `ssl:connect/4` is exported,
-but `:code.ensure_loaded(:crypto)` → `{:error, :on_load_failure}` and `:crypto.supports()` →
-*"module :crypto is not available."*
+`:ssl` now gets past `default_versions` and dies further in, still during option processing:
 
-**Wall 1, precisely: the crypto NIF is a partial shim, not `:ssl` being a stub.** ERTS was built
-`--without-ssl`, so there is no OpenSSL-linked crypto NIF. Tyn ships a crypto *shim* that declares
-just the NIF surface the demo needs (cookie/session signing); it does **not** declare
-`crypto:strong_rand_bytes/1` (and the rest), so the stock `crypto.beam`'s `on_load` fails with
-`:bad_lib` and `:crypto` is unavailable process-wide. `:ssl` calls `:crypto.supports/0` in
-`:ssl.default_versions` during **option processing** — the very first step of `:ssl.connect`, before a
-socket is opened. So TLS fails at setup.
+```
+** (RuntimeError) connect raised MatchError
+   ssl.erl:4389: :ssl.opt_signature_algs/3     ← builds the TLS signature-algorithm set
+   ssl.erl:3821: :ssl.process_options/3
+   ssl.erl:3902: :ssl.handle_options/5
+   ssl.erl:2221: :ssl.connect/3
+   (postgrex) Postgrex.Protocol.ssl_connect/3
+```
 
-**Therefore Wall 2 (the epoch clock) is currently unreachable.** Certificate `notBefore`/`notAfter`
-validation lives deep inside a TLS handshake that never begins. The 1970 clock is a real, *named*
-prerequisite for any in-guest TLS — it will fail cert dates the moment crypto works — but it cannot be
-observed until Wall 1 is lifted. The failure is graceful: the connection process dies, the node lives.
+The shim implements exactly the **symmetric** crypto the Phoenix demo needs (hashes, HMAC for cookie
+signing, AEAD ciphers, PBKDF2). It has **no asymmetric surface** — no RSA, no ECDSA, no ECDHE, no named
+curves — so `public_keys`/`curves` are empty and `:ssl.opt_signature_algs` MatchErrors on the empty
+set. TLS fundamentally needs asymmetric crypto (key exchange + certificate signatures), so this is not
+a one-function gap; it is the entire public-key half of `:crypto` being absent. *This is the honest row
+5b: in-guest TLS needs the full public-key crypto surface (≈ static OpenSSL), not a small shim patch.*
+
+**Wall 2 (the epoch clock) is still unreachable** — cert `notBefore`/`notAfter` validation is inside a
+handshake that never begins (the crash is in *option processing*, before the socket). The 1970 clock
+remains a *named* prerequisite for in-guest TLS (see `docs/WALL_CLOCK.md`); it will bite the moment the
+asymmetric crypto exists. The failure is graceful: the connection process dies, the node lives.
 
 ### Two paths to TLS-to-DB (assessed, not built)
 
-- **Path A — real in-ERTS `:ssl` (fix `:crypto`).** Rebuild ERTS `--with-ssl` (or complete the crypto
-  NIF) linked against a **static musl OpenSSL**, so `:crypto`'s `on_load` succeeds and `:ssl` works
-  in-guest. *Cost/risk: high.* It reopens the crypto-NIF/OpenSSL coexistence question the shim was
-  created to avoid — a full OpenSSL NIF needs entropy (Tyn has a CSPRNG/`getrandom`), threads, `mmap`,
-  and time to behave on Tyn's syscall surface; `beam.smp` grows by OpenSSL's static size. **Also gated
-  on the clock (Wall 2)** — without a real wall clock, cert validation fails even once crypto works
-  (mitigable per-connection with `verify: :verify_none`, but that is not a real managed-DB posture).
-  Upside: unlocks in-guest crypto broadly (TLS, and NIF-crypto deps like bcrypt), not just DB TLS.
+- **Path A — real in-ERTS `:ssl` (add the asymmetric crypto surface).** The probe pins the remaining
+  surface concretely: the shim covers symmetric crypto; TLS needs the **public-key half** —
+  RSA + ECDSA signatures, ECDHE/DHE key exchange, named curves, and the `supports(public_keys)` /
+  `supports(curves)` these feed. Extending the hand-rolled Rust shim to cover all of that is
+  effectively reimplementing OpenSSL's asymmetric stack, so the realistic form is **rebuild ERTS
+  `--with-ssl` against a static musl OpenSSL** (or link OpenSSL into the NIF). *Cost/risk: high.* It
+  reopens the crypto-NIF/OpenSSL coexistence question the shim was created to avoid — a full OpenSSL
+  NIF needs entropy (Tyn has a CSPRNG/`getrandom`), threads, `mmap`, and time to behave on Tyn's
+  syscall surface; `beam.smp` grows by OpenSSL's static size. **Also gated on the clock (Wall 2)** —
+  without a real wall clock, cert validation fails even once crypto works (`verify: :verify_none`
+  sidesteps it per-connection but is not a real managed-DB posture). Upside: unlocks in-guest crypto
+  broadly (TLS, and NIF-crypto deps like bcrypt/argon2), not just DB TLS.
 - **Path B — TLS-terminating sidecar (offload, like inbound) — CHOSEN as the near-term pattern.**
   Inbound TLS is already terminated at an ALB/NLB; the outbound-to-DB analogue is a small in-VPC proxy
   (stunnel / pgbouncer-with-TLS-upstream): Tyn speaks **plaintext** to the proxy (already proven,
@@ -147,13 +168,12 @@ observed until Wall 1 is lifted. The failure is graceful: the connection process
   as a deployment pattern (`docs/DEPLOY.md` → "Reach a TLS-required database through a sidecar"),
   parallel to inbound LB termination.
 
-**Path A's decision is held** until the crypto shim's `:bad_lib` is fixed. Right now the shim fails at
-the *first* missing declaration (`strong_rand_bytes/1`); we do not yet know the *full* remaining crypto
-surface `:ssl` needs (cipher/KDF/RNG primitives), so we cannot size Path A honestly. The next-session
-sequence resolves this: **declare the missing NIF function(s) in the shim → re-run Probe 5b → read the
-*next* wall** (another missing primitive, or the handshake finally reaching the epoch-clock cert wall).
-Only then is Path A (full static-OpenSSL crypto NIF) a decision with real numbers behind it — and it
-remains gated on the wall clock either way (see `docs/WALL_CLOCK.md`).
+**Path A's scope is now known** (the "held" question is answered). The masking `tyn-pack` bug is
+fixed, the shim loads, and the re-run shows the real gap is the **entire asymmetric crypto surface**,
+not a handful of primitives. So Path A is not a small shim extension — it is a static-OpenSSL-class
+build, plus the wall clock (`docs/WALL_CLOCK.md`). That is a genuine, sizeable investment; **Path B
+(sidecar) remains the near-term answer**, and Path A is justified only when in-guest crypto breadth
+(TLS *and* bcrypt/argon2-style NIF deps, row 3) is worth an OpenSSL integration on its own.
 
 ## Probe 2 — file write, in detail (CONFIRMED on a local boot)
 
@@ -215,13 +235,15 @@ they unblock:
    accreted dependency beams from a mix build is a separate reproducibility task; `build-rootfs.sh`
    refreshes only the two source-derived components.)*
 2. **TLS-to-DB (the managed-Postgres unlock) — now boot-confirmed as row 5b.** The wall is **not**
-   `--without-ssl`-means-`:ssl`-is-a-stub; `:ssl`/`:public_key` load fine. It is the **crypto NIF
-   shim** being incomplete (no `strong_rand_bytes/1` → `:crypto` `on_load` fails `:bad_lib`), so
-   `:ssl.connect` dies at `:crypto.supports/0` during option setup — *upstream of the handshake and the
-   epoch-clock cert wall, which is therefore unreachable*. Two paths (detail in Probe 5b): **Path B**
-   (TLS-terminating sidecar) unblocks managed Postgres now with **no kernel work**; **Path A** (real
-   in-ERTS `:ssl` via static OpenSSL) is the larger crypto investment and **must be sequenced with the
-   wall-clock (kvmclock/RTC) work** or it fails cert dates. Clock is now a *named* prerequisite.
+   `:ssl` being a stub (`:ssl`/`:public_key` load fine), and **not** a one-function shim gap. With the
+   crypto shim correctly applied (after fixing a `tyn-pack` path bug that had let stock crypto load),
+   `:crypto` works for **symmetric** ops but advertises `public_keys: []`, `curves: []` — it has no
+   asymmetric crypto, so `:ssl.opt_signature_algs` MatchErrors during option setup, *upstream of the
+   handshake and the epoch-clock cert wall*. The real gap is the entire public-key surface. Two paths
+   (detail in Probe 5b): **Path B** (TLS-terminating sidecar) unblocks managed Postgres now with **no
+   kernel work**; **Path A** (static-OpenSSL-class crypto) is a sizeable investment and **must be
+   sequenced with the wall-clock (kvmclock/RTC) work** or it fails cert dates. Clock is a *named*
+   prerequisite (`docs/WALL_CLOCK.md`).
 3. **Writable tmpfs** — breadth (any disk touch), independent of the DB story. **Probe B (row 2) is
    now boot-confirmed:** the wall is graceful (`{:error, _}`, node survives) and surfaces first at
    `System.tmp_dir/0 → nil`. A small writable `/tmp` (create path in `sys_open`/`sys_write` +
@@ -230,9 +252,10 @@ they unblock:
 The one-sentence version: **stateful DB-backed apps are reachable on Tyn today — raw Postgrex over
 plaintext TCP is Nitro-confirmed, and the *standard eager Ecto Repo* now works on the committed build
 path (`elixir.app` + from-source `tyn_boot.beam` via `build-rootfs.sh`, `[[42]]`, no surgery); the
-remaining walls are all boot-confirmed and specific — TLS-to-DB fails at an incomplete *crypto NIF*
-(not `:ssl`), upstream of the epoch-clock cert wall, and is unblockable now via a TLS sidecar or later
-via static-OpenSSL-plus-clock; and a file-write wall degrades gracefully, surfacing first at
+remaining walls are all boot-confirmed and specific — TLS-to-DB works symmetrically but lacks the
+*asymmetric* half of `:crypto` (`public_keys`/`curves` empty → `:ssl.opt_signature_algs` fails), still
+upstream of the epoch-clock cert wall, and is unblockable now via a TLS sidecar or later via
+static-OpenSSL-plus-clock; and a file-write wall degrades gracefully, surfacing first at
 `System.tmp_dir/0 → nil` — none of it is the database plumbing or the ORM.**
 
 ---
@@ -249,7 +272,10 @@ release with `MyApp.Repo` in the tree and DB config in `runtime.exs`. Probe 5b (
 boot-confirmed on a local boot against the standing Postgres with **TLS enabled** (self-signed cert,
 `ssl=on`; `psql sslmode=require` verified a real TLSv1.3 handshake server-side; plaintext still works,
 so row 5a is unaffected). **TLS is now a permanent fixture on the standing DB** — it costs nothing and
-both plaintext (5a) and TLS (5b) probes need it, so it stays on. Probe 2 (file write) is boot-confirmed on a local boot (FS behavior is pure kernel VFS,
+both plaintext (5a) and TLS (5b) probes need it, so it stays on. Reaching row 5b's real wall required
+fixing a `tyn-pack` bug (shim path resolved from CWD, not the script), which had let stock crypto
+shadow the shim; with the shim applied, `:crypto` loads symmetrically and the wall is the missing
+asymmetric surface (`:ssl.opt_signature_algs`). Probe 2 (file write) is boot-confirmed on a local boot (FS behavior is pure kernel VFS,
 identical local vs Nitro). Rows 3/4/6 are prior-observed or source-predicted and labelled as such —
 hypotheses until an app boots into each wall. DB target + toolchain remain standing on the build host
 for the follow-on probes.*
