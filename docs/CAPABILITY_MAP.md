@@ -17,6 +17,7 @@ actually booted and hit the wall.
 | # | Probe (real app) | Boots? | Works? | First wall | Root cause (traced) | Missing primitive | Evidence |
 |---|---|---|---|---|---|---|---|
 | 5a | **Ecto + Postgres, plaintext TCP** | yes | **DB: YES — raw Postgrex *and* standard eager Ecto Repo** | two walls, both packaging — **RESOLVED in the shipped build** | stale base-image artifacts (missing `elixir.app`; stale `tyn_boot.beam`) — now fixed by `build-rootfs.sh` | none kernel-side; base-image packaging fixes (landed) | **CONFIRMED — Postgrex on Nitro; eager Ecto on the shipped build path (cpio `d30fb612`)** |
+| 5b | **Ecto/Postgrex, TLS** (managed PG) | yes | **no — crypto NIF incomplete (node survives)** | `:ssl.connect` → `:crypto.supports/0` `UndefinedFunctionError` at option setup | Tyn's crypto *shim* declares a narrow NIF surface (no `strong_rand_bytes/1`); real `:crypto`'s `on_load` fails `:bad_lib` → `:crypto` unavailable; `:ssl` needs it *before* any handshake, so cert/clock (Wall 2) is never reached | full crypto NIF (OpenSSL static) **or** a TLS-terminating sidecar; wall clock is a further prereq for *in-guest* TLS | **CONFIRMED — local boot vs TLS-enabled PG** |
 | 2 | **Phoenix + file write** (temp files, uploads) | yes | **no — degrades gracefully (node survives)** | `System.tmp_dir/0` → `nil`, then every write path errors | read-only cpio VFS: `sys_open` ignores `O_CREAT` (→ `ENOENT`), `sys_write` else-arm (→ `EBADF`), `mkdir`/`unlink`/`rename` unhandled (→ `ENOSYS`) | writable filesystem (tmpfs) | **CONFIRMED — local boot** |
 | 3 | NIF-bearing dep (bcrypt/argon2) | fails `load_nif` | no | `load_nif` → "Dynamic loading not supported" | static-musl beam, no dynamic loading; `tyn-pack` wires only the crypto shim, not user NIFs | per-user-NIF static-link packaging | prior-observed (exact error seen) |
 | 4 | Shells out (`System.cmd`, `os_mon`) | os_mon degraded; `cmd` fails | partial | `execve` → UNHANDLED/ENOSYS | no fork/exec; `erl_child_setup` can't spawn (see `inet_gethost`, below) | subprocess/exec | prior-observed |
@@ -86,6 +87,70 @@ roadmap more than the connectivity answer itself:
   *Missing primitive: none for the crash — a default inet config that never selects `native` is in
   `tyn_boot`. (Full `System.cmd`/exec is a separate, unrelated gap — row 4.)*
 
+## Probe 5b — TLS-to-DB, in detail (CONFIRMED on a local boot vs a TLS-enabled Postgres)
+
+The managed-Postgres question: *can Tyn open a TLS connection to a database?* Two walls could answer
+"no" and they must not be collapsed — **Wall 1** (no working TLS stack) and **Wall 2** (the epoch
+clock fails certificate dates). The probe was designed to separate them.
+
+Setup: the standing VPC Postgres was TLS-enabled (self-signed cert, `ssl=on`); a control `psql
+sslmode=require` confirmed a real server-side handshake (`TLSv1.3, TLS_AES_256_GCM_SHA384`), and
+`sslmode=disable` still returns `42` (the plaintext row 5a is unaffected). Then a `Postgrex` client
+with `ssl: true` was booted on Tyn against it. The `Postgrex.Protocol` connection process crashed at
+`{:connect, :init}`:
+
+```
+[error] Unable to load crypto library: :bad_lib, Function not declared as nif crypto:strong_rand_bytes/1
+[error] :gen_statem (Postgrex.Protocol) terminating
+  ** (RuntimeError) connect raised UndefinedFunctionError
+     (crypto 5.5.3) :crypto.supports/0
+     ssl.erl:3958: :ssl.default_versions/1   ← :ssl asks :crypto which TLS versions exist
+     ssl.erl:3947: :ssl.opt_versions/3
+     ssl.erl:3815: :ssl.process_options/3
+     ssl.erl:3902: :ssl.handle_options/5     ← still in OPTION SETUP; no socket, no handshake yet
+```
+
+A direct `:ssl` probe corroborates: `:ssl` and `:public_key` load and `ssl:connect/4` is exported,
+but `:code.ensure_loaded(:crypto)` → `{:error, :on_load_failure}` and `:crypto.supports()` →
+*"module :crypto is not available."*
+
+**Wall 1, precisely: the crypto NIF is a partial shim, not `:ssl` being a stub.** ERTS was built
+`--without-ssl`, so there is no OpenSSL-linked crypto NIF. Tyn ships a crypto *shim* that declares
+just the NIF surface the demo needs (cookie/session signing); it does **not** declare
+`crypto:strong_rand_bytes/1` (and the rest), so the stock `crypto.beam`'s `on_load` fails with
+`:bad_lib` and `:crypto` is unavailable process-wide. `:ssl` calls `:crypto.supports/0` in
+`:ssl.default_versions` during **option processing** — the very first step of `:ssl.connect`, before a
+socket is opened. So TLS fails at setup.
+
+**Therefore Wall 2 (the epoch clock) is currently unreachable.** Certificate `notBefore`/`notAfter`
+validation lives deep inside a TLS handshake that never begins. The 1970 clock is a real, *named*
+prerequisite for any in-guest TLS — it will fail cert dates the moment crypto works — but it cannot be
+observed until Wall 1 is lifted. The failure is graceful: the connection process dies, the node lives.
+
+### Two paths to TLS-to-DB (assessed, not built)
+
+- **Path A — real in-ERTS `:ssl` (fix `:crypto`).** Rebuild ERTS `--with-ssl` (or complete the crypto
+  NIF) linked against a **static musl OpenSSL**, so `:crypto`'s `on_load` succeeds and `:ssl` works
+  in-guest. *Cost/risk: high.* It reopens the crypto-NIF/OpenSSL coexistence question the shim was
+  created to avoid — a full OpenSSL NIF needs entropy (Tyn has a CSPRNG/`getrandom`), threads, `mmap`,
+  and time to behave on Tyn's syscall surface; `beam.smp` grows by OpenSSL's static size. **Also gated
+  on the clock (Wall 2)** — without a real wall clock, cert validation fails even once crypto works
+  (mitigable per-connection with `verify: :verify_none`, but that is not a real managed-DB posture).
+  Upside: unlocks in-guest crypto broadly (TLS, and NIF-crypto deps like bcrypt), not just DB TLS.
+- **Path B — TLS-terminating sidecar (offload, like inbound).** Inbound TLS is already terminated at
+  an ALB/NLB; the outbound-to-DB analogue is a small in-VPC proxy (stunnel / pgbouncer-with-TLS-
+  upstream): Tyn speaks **plaintext** to the proxy (already proven, `[[42]]`), the proxy originates
+  TLS to the managed DB and validates the cert with its own real clock. *Cost/risk: low* — no ERTS
+  rebuild, no crypto NIF, no in-guest clock dependency. Operational cost: run the proxy next to each
+  instance. Note for RDS specifically: RDS requires TLS *from its client*, and **RDS Proxy does not
+  remove that** — the sidecar (the actual TLS originator) is what satisfies it. This is the pragmatic
+  near-term unlock for managed Postgres with zero kernel work.
+
+**Recommendation to decide next session:** Path B unblocks managed Postgres now with no kernel risk;
+Path A is the larger, higher-value investment (in-guest crypto generally) but must be sequenced with
+the wall-clock work (kvmclock/RTC) or it fails at cert dates. The clock is now a *named* dependency on
+the roadmap, not a surprise.
+
 ## Probe 2 — file write, in detail (CONFIRMED on a local boot)
 
 Artifact: kernel = shipped valve `1cac02f` (`tyn-kernel-fix2`), cpio = a minimal app whose only
@@ -145,21 +210,26 @@ they unblock:
    Postgrex works" into "a normal Phoenix+Ecto app runs." *(Remaining: fully regenerating the
    accreted dependency beams from a mix build is a separate reproducibility task; `build-rootfs.sh`
    refreshes only the two source-derived components.)*
-2. **TLS-to-DB (the managed-Postgres unlock).** Not yet tested, but `--without-ssl` makes it the
-   expected next wall: managed Postgres (RDS/Supabase) requires TLS, and the wall-clock-at-1970 issue
-   would also fail cert dates. Turns "plaintext only" into "works with a managed DB." **Now the
-   highest-value *unknown*.**
+2. **TLS-to-DB (the managed-Postgres unlock) — now boot-confirmed as row 5b.** The wall is **not**
+   `--without-ssl`-means-`:ssl`-is-a-stub; `:ssl`/`:public_key` load fine. It is the **crypto NIF
+   shim** being incomplete (no `strong_rand_bytes/1` → `:crypto` `on_load` fails `:bad_lib`), so
+   `:ssl.connect` dies at `:crypto.supports/0` during option setup — *upstream of the handshake and the
+   epoch-clock cert wall, which is therefore unreachable*. Two paths (detail in Probe 5b): **Path B**
+   (TLS-terminating sidecar) unblocks managed Postgres now with **no kernel work**; **Path A** (real
+   in-ERTS `:ssl` via static OpenSSL) is the larger crypto investment and **must be sequenced with the
+   wall-clock (kvmclock/RTC) work** or it fails cert dates. Clock is now a *named* prerequisite.
 3. **Writable tmpfs** — breadth (any disk touch), independent of the DB story. **Probe B (row 2) is
    now boot-confirmed:** the wall is graceful (`{:error, _}`, node survives) and surfaces first at
    `System.tmp_dir/0 → nil`. A small writable `/tmp` (create path in `sys_open`/`sys_write` +
    `mkdir`/`unlink`/`rename`) unblocks temp files and uploads without a full disk stack.
 
 The one-sentence version: **stateful DB-backed apps are reachable on Tyn today — raw Postgrex over
-plaintext TCP is Nitro-confirmed, and the *standard eager Ecto Repo* works too once two stale
-base-image artifacts (`elixir.app`, `tyn_boot.beam`) are re-packaged (local-confirmed against the real
-VPC DB) — so the next real unknowns are TLS-to-DB for managed databases and a writable FS, not the
-database plumbing or the ORM — and a file-write wall (row 2, boot-confirmed) degrades gracefully
-rather than crashing, surfacing first at `System.tmp_dir/0 → nil`.**
+plaintext TCP is Nitro-confirmed, and the *standard eager Ecto Repo* now works on the committed build
+path (`elixir.app` + from-source `tyn_boot.beam` via `build-rootfs.sh`, `[[42]]`, no surgery); the
+remaining walls are all boot-confirmed and specific — TLS-to-DB fails at an incomplete *crypto NIF*
+(not `:ssl`), upstream of the epoch-clock cert wall, and is unblockable now via a TLS sidecar or later
+via static-OpenSSL-plus-clock; and a file-write wall degrades gracefully, surfacing first at
+`System.tmp_dir/0 → nil` — none of it is the database plumbing or the ORM.**
 
 ---
 
@@ -171,7 +241,11 @@ a packaging fix. **Wall A fixes are now in the committed build path** — base c
 [`build-rootfs.sh`](../../build-rootfs.sh) (`md5 d30fb612…`, ships the Elixir `.app` files + a
 from-source `tyn_boot.beam` with the `[file, dns]` resolver default); the eager-Ecto app image was
 packed with plain `tyn-pack` (no surgery, `cpio -t`-verified) and is a minimal `ecto_sql`+`postgrex`
-release with `MyApp.Repo` in the tree and DB config in `runtime.exs`. Probe 2 (file write) is
-boot-confirmed on a local boot (FS behavior is pure kernel VFS, identical local vs Nitro). Rows 3/4/6
-are prior-observed or source-predicted and labelled as such — hypotheses until an app boots into each
-wall. DB target + toolchain remain standing on the build host for the follow-on probes.*
+release with `MyApp.Repo` in the tree and DB config in `runtime.exs`. Probe 5b (TLS-to-DB) is
+boot-confirmed on a local boot against the standing Postgres with **TLS enabled** for the probe
+(self-signed cert, `ssl=on`; `psql sslmode=require` verified a real TLSv1.3 handshake server-side;
+plaintext still works, so row 5a is unaffected — TLS left enabled on the standing DB for future
+probes). Probe 2 (file write) is boot-confirmed on a local boot (FS behavior is pure kernel VFS,
+identical local vs Nitro). Rows 3/4/6 are prior-observed or source-predicted and labelled as such —
+hypotheses until an app boots into each wall. DB target + toolchain remain standing on the build host
+for the follow-on probes.*
