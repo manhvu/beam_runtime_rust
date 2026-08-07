@@ -21,7 +21,7 @@ actually booted and hit the wall.
 | 2 | **Phoenix + file write** (temp files, uploads) | yes | **no — degrades gracefully (node survives)** | `System.tmp_dir/0` → `nil`, then every write path errors | read-only cpio VFS: `sys_open` ignores `O_CREAT` (→ `ENOENT`), `sys_write` else-arm (→ `EBADF`), `mkdir`/`unlink`/`rename` unhandled (→ `ENOSYS`) | writable filesystem (tmpfs) | **CONFIRMED — local boot** |
 | 3 | NIF-bearing dep (bcrypt/argon2) | fails `load_nif` | no | `load_nif` → "Dynamic loading not supported" | static-musl beam, no dynamic loading; `tyn-pack` wires only the crypto shim, not user NIFs | per-user-NIF static-link packaging | prior-observed (exact error seen) |
 | 4 | Shells out (`System.cmd`, `os_mon`) | os_mon degraded; `cmd` fails | partial | `execve` → UNHANDLED/ENOSYS | no fork/exec; `erl_child_setup` can't spawn (see `inet_gethost`, below) | subprocess/exec | prior-observed |
-| 6 | **Distributed Erlang** (native clustering) | yes | **no — accept-side handshake stalls, then wedges the node** | dist handshake TCP-connects but stalls → `net_setuptime` 7 s timeout → `connect_node` `false` | the earlier "epmd/`inet_dist` absent" guess was **wrong** — all dist modules load, epmd-less config works, the node goes distributed and binds the listener; the break is Tyn's **accept-side** handshake path (a known-good native OTP node fails identically connecting *to* Tyn) | a working dist accept/handshake data path (likely related to but distinct from the `gen_tcp:accept` fix — the dist listener's own accept path) | **CONFIRMED — 2× Nitro t3.small + native OTP peer** |
+| 6 | **Distributed Erlang** (native clustering) | yes | **no — pinned to ONE BIF: `erlang:statistics(wall_clock)`** | the acceptor sends `send_status` then hangs in `dist_util:gen_challenge/0` at `erlang:statistics(wall_clock)`, which **busy-spins forever** → handshake times out at `net_setuptime` (7 s) | `statistics(wall_clock)` busy-spins on Tyn (a clock-subsystem BIF), wedging the scheduler. *Every other time BIF works* (`os:timestamp`, `erlang:timestamp`, `statistics(runtime)`, …). The node-wedge is the **same spin**, not a separate bug | fix `statistics(wall_clock)`'s ERTS time path on Tyn — clock-adjacent, feeds `docs/WALL_CLOCK.md`. Bounded; not a missing subsystem | **CONFIRMED — Nitro + byte-level tap + BIF isolation** |
 | 1 | Plain Plug (no Phoenix) | yes | yes | — (floor) | — | — | follows from working Phoenix demo |
 
 ---
@@ -275,19 +275,46 @@ data. Every variant returned `<<"hello">>`:
 
 So the socket layer is *not* the bug: sync accept, **async accept**, `{packet,2}` **both directions**,
 `controlling_process` handoff, active-mode, passive recv, and acceptor send-flush all work in isolation.
-The stall is **deeper than the socket ops** — in the dist handshake's *multi-round sequencing* or the
-**distribution controller** (`erlang:dist_ctrl_*` — the ERTS dist port driver that takes the socket over
-during handshake, a genuinely Tyn-untested subsystem). Plain `gen_tcp` can't reproduce that; pinning the
-exact step needs a **live `dist_util`/`dist_ctrl` trace on a real connection** — SLIRP-confounded locally
-(node-name/address mismatch), so it wants 2 Nitro nodes. That trace is now the cheap next step, with the
-whole socket layer cleared underneath it.
+The stall is above the transport.
 
-**Second finding — a distinct bug: a stalled handshake wedges the node.** After the attempts, both
-nodes' eval shells stopped responding (TCP still accepted, no eval reply). A stalled *socket receive*
-should not freeze a scheduler — this says the stall holds a lock or blocks a scheduler other work
-needs, and it deserves its own trace rather than being assumed a side effect of suspect (1). On its
-own, "a failed join destabilises the runtime" is disqualifying for the mesh pitch, independent of the
-handshake bug.
+**Pinned — a byte-level tap + BIF isolation, single node, no Nitro.** Rather than jump to a two-node
+Nitro trace, the next rung: a `{packet,2}` proxy taps the handshake between a known-good native OTP
+initiator and Tyn (over hostfwd), and the handshake reproduces one layer up with full visibility. The
+tap shows exactly where Tyn goes silent:
+
+```
+INIT→TYN  tag 'N'  send_name       ← initiator sends its name
+TYN→INIT  tag 's'  send_status "sok" ← Tyn CONSUMES it and REPLIES  ✅
+(then nothing from Tyn for 7 s; initiator times out)
+```
+
+So Tyn reaches step 2 (consumes `send_name`, emits `send_status`) and hangs before **step 3
+(`send_challenge`)** — the exact round the initial theory flagged as clock-adjacent. The acceptor code
+between those two (`dist_util:handshake_other_started`, lines 215-217) is `auth:get_cookie/1` →
+`gen_challenge/0` → `send_challenge/2`. Calling each BIF `gen_challenge/0` uses, in isolation on a live
+node, pins it to **one**:
+
+| BIF | Result |
+|---|---|
+| `phash2`, `monotonic_time`, `unique_integer`, `statistics(reductions)`, `statistics(gc)`, `statistics(runtime)` | ✅ all return |
+| `os:timestamp`, `erlang:timestamp`, `system_time`, `calendar:universal_time` | ✅ all return |
+| **`erlang:statistics(wall_clock)`** | ❌ **hangs forever, wedges the node** |
+
+**`erlang:statistics(wall_clock)` busy-spins on Tyn — that single BIF is the entire distributed-Erlang
+wall.** It is the sixth line of `gen_challenge/0` (`{F,_} = erlang:statistics(wall_clock)`), so the
+acceptor hangs there, never sends the challenge, and the handshake times out at 7 s. **The node-wedge is
+the same spin, not a second bug** — on `-smp 1` the spin monopolises the only scheduler; on multi-scheduler
+Nitro it wedged both nodes' shells too, so the spin also holds a lock other schedulers need (the ERTS
+time-correction lock is the likely candidate). Every *other* clock BIF works (they return the epoch-1970
+value; they don't hang), so this is not "the wall clock is broken" broadly — it is specifically
+`statistics(wall_clock)`'s ERTS time path (elapsed-since-node-start via the time-correction subsystem)
+spinning on Tyn's clock behaviour. Blast radius beyond dist: any app that calls `statistics(wall_clock)`
+(some scheduler/monitoring tools) will wedge the same way; the stock demo does not call it, which is why
+it runs.
+
+*(The node-wedge that first looked like a second, independent bug is resolved as the same root cause:
+the `statistics(wall_clock)` spin freezes the scheduler / holds the time lock. Fixing the one BIF fixes
+both the handshake and the wedge.)*
 
 **The cookie sub-wall (fully proven, and the reason for a kernel change).** Distribution wouldn't even
 *start* until the cookie was provided as a **boot arg**. Every file-based cookie path is structurally
@@ -305,17 +332,18 @@ the dist port for real isolation. `application:set_env(kernel, epmd_module, tyn_
 `net_kernel:start/2` (or a `-kernel` arg). This brings a node up distributed and binds the listener
 correctly — the config is *not* the blocker; the accept-side handshake is.
 
-**Verdict for positioning: FAR as-is; still plausibly near, but the easy theory is now refuted.** FAR
-is the honest map row *today* — clustering does not work and a failed join destabilises the node. The
-first theory (a socket-layer bug in the accept→handoff→active-flip sequence) was the *bounded-fix*
-hope, in the family of the `gen_tcp:accept` fix / `writev` / `sendfile` readiness. **The discriminator
-tested it and refuted it:** the entire socket surface the acceptor uses — including `prim_inet:async_
-accept` and `{packet,2}` both ways — works in isolation. That is *encouraging* for the transport (the
-hard parts work) but it moves the bug up a layer, into the dist handshake sequencing / the
-`erlang:dist_ctrl_*` controller. Whether that is bounded is now the open question, and it needs a live
-`dist_util`/`dist_ctrl` trace on 2 Nitro nodes to pin — a session, not a project, but a deeper one than
-the socket reproduction. The node-wedge is a second, independent bug on the same path (a stalled recv
-should not freeze a scheduler) and deserves its own trace.
+**Verdict for positioning: NEAR — the wall is one BIF, pinned and clock-adjacent.** FAR was the honest
+row while the cause was unknown; it is now pinned to `erlang:statistics(wall_clock)` busy-spinning, a
+single, well-localised ERTS time-path bug on Tyn's clock — not a missing subsystem, not the socket
+layer, not `dist_ctrl`. The whole dist stack around it works: modules load, the node goes distributed,
+the listener binds, the transport is proven end-to-end, the handshake reaches step 2, and the wedge is
+the same spin. Fixing that one time-path (make `statistics(wall_clock)` return instead of spin) should
+let the handshake complete and the wedge disappear together. It is **clock-adjacent** — the same
+subsystem as `docs/WALL_CLOCK.md` (kvmclock/RTC), and this is now a *concrete, high-value* reason to do
+that work: it converts "45 MB nodes, 5 s boot, native Erlang mesh" from blocked to buildable. Caveat
+before declaring the pitch shippable: after the fix, the remaining handshake rounds (challenge-reply,
+ack) and the `dist_ctrl` controller takeover are still unexercised — the tap cleared everything *up to*
+step 3, so re-run the two-node Nitro handshake once the BIF is fixed to confirm it completes end-to-end.
 
 ## Synthesis — what to build next
 

@@ -78,18 +78,41 @@ active-mode, passive recv, and acceptor send-flush all work in isolation. The ac
 **distribution controller** (`erlang:dist_ctrl_*`, the ERTS dist port driver that takes the socket over
 during handshake) — a genuinely Tyn-untested subsystem that plain `gen_tcp` can't reproduce.
 
-## Next step (was the fallback branch, now the main line)
+## PINNED (host-driven, one node — no Nitro needed after all)
 
-Pin the exact handshake step with a **live `dist_util` / `dist_ctrl` trace** on a real connection:
-enable a *capturing* trace (a `dbg` tracer forwarding to a registered collector, since post-boot quiet
-mode suppresses serial) of `dist_util:handshake_other_started` and the `erlang:dist_ctrl_*` calls on
-the Tyn acceptor, have a peer connect, and read the last call before the 7 s timeout. This is
-**SLIRP-confounded locally** (the node-name/address the initiator resolves won't match a hostfwd'd
-loopback), so it wants **2 Nitro nodes** — but the whole socket layer is now cleared underneath it, so
-the trace has a small surface to search.
+A `{packet,2}` byte-level proxy tapped the handshake between a known-good native OTP initiator and
+Tyn's acceptor over hostfwd. The tap showed Tyn reaching **step 2** and hanging before **step 3**:
 
-## Deliverable
+```
+INIT→TYN  'N' send_name         ← initiator
+TYN→INIT  's' send_status "sok" ← Tyn consumes it and replies  ✅
+(silence for 7 s → initiator times out)
+```
 
-- Which `dist_util`/`dist_ctrl` step stalls (booted trace evidence).
-- Whether the node-wedge is the same root cause or distinct (trace it independently).
-- Update Probe 6: FAR → NEAR only if the pinned bug looks bounded.
+Step 3 (`send_challenge`) is preceded by `auth:get_cookie/1` → `gen_challenge/0`. Calling each BIF
+`gen_challenge/0` uses, in isolation on a live node, pins it to exactly one:
+
+- ✅ `phash2`, `monotonic_time`, `unique_integer`, `statistics(reductions|gc|runtime)`,
+  `os:timestamp`, `erlang:timestamp`, `system_time`, `calendar:universal_time` — all return.
+- ❌ **`erlang:statistics(wall_clock)` — hangs forever, wedges the node.**
+
+**Root cause: `erlang:statistics(wall_clock)` busy-spins on Tyn.** It is the 6th line of
+`gen_challenge/0`, on the acceptor's critical path, so the handshake hangs there. The node-wedge is the
+**same spin** (monopolises the scheduler on `-smp 1`; holds the ERTS time lock on multi-scheduler
+Nitro), *not* a separate bug. Every other clock BIF works, so this is not a broad "wall clock broken" —
+it is specifically `statistics(wall_clock)`'s time-correction/elapsed path spinning on Tyn's clock.
+
+## The fix + what remains
+
+- **Fix:** make `statistics(wall_clock)` return instead of spin — an ERTS time-path bug on Tyn's clock
+  behaviour. This is **clock-adjacent**: same subsystem as `docs/WALL_CLOCK.md` (kvmclock/RTC), and now
+  a concrete, high-value reason to do that work (it unblocks native clustering).
+- **Confirm after the fix:** the tap cleared everything *up to* step 3; the later rounds
+  (challenge-reply, ack) and the `dist_ctrl` controller takeover are still unexercised. Re-run the
+  two-node Nitro handshake once the BIF is fixed to confirm end-to-end join + traffic + liveness.
+
+## Deliverable — DONE
+
+- Pinned round: hangs at step 3 (`gen_challenge` → `statistics(wall_clock)`).
+- Node-wedge: same root cause (the spin), resolved.
+- Probe 6 verdict: FAR → **NEAR** (bounded, clock-adjacent, feeds `docs/WALL_CLOCK.md`).

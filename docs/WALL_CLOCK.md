@@ -26,6 +26,16 @@ specifically about **absolute / wall-clock** time.
    set in-app rather than by the DB, JWT `exp`/`iat`, signed-URL expiry, log/telemetry timestamps,
    cache TTLs keyed on wall time, cookie `Max-Age` vs `Expires`) are all wrong by ~55 years. Most are
    silent — which is why this keeps surfacing late.
+3. **`erlang:statistics(wall_clock)` busy-spins → native distributed Erlang is blocked** (capability
+   map Probe 6 / `docs/DIST_ACCEPT_HUNT.md`). This is not the epoch *offset* — every other clock BIF
+   returns fine. It is a distinct symptom in the *same* time subsystem: `statistics(wall_clock)`'s
+   elapsed-time path (via ERTS time correction) **hangs** on Tyn's clock behaviour, wedging the
+   scheduler. `dist_util:gen_challenge/0` calls it on the handshake critical path, so two Tyn nodes
+   cannot cluster and a failed join wedges the node. Fixing the clock/time-correction path here is the
+   concrete unblock for the "native Erlang mesh" positioning — a high-value, bounded reason to do this
+   ticket. Whether the kvmclock/RTC base alone fixes the spin, or the ERTS time-correction interaction
+   needs its own fix, is the open question; investigate `statistics(wall_clock)`'s ERTS path
+   (`erts_get_time`/time-correction) against Tyn's `clock_gettime` behaviour.
 
 ## The ask
 
