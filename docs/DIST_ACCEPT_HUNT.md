@@ -114,14 +114,36 @@ Advancing from 1970 (~2 s deltas over a 2 s sleep; abs value ≈ uptime). So per
 subtler case — and the CPU-idle measurement sharpens it from "reads a value it doesn't expect" to
 "blocks on a lock that never releases." The kvmclock/RTC *offset* fix would not touch it.
 
-## Step 2 — what's left to pin
+## Ladder (WALLCLOCK_LADDER) — cheapest-first, and where it stopped
 
-The exact futex/lock deadlock is not yet localised — the github source shows the top-level function is
-straight-line and calls the same `get_time` that `monotonic_time` (which works) uses, so the divergence
-is in a build-config `#ifdef` or a lock the wall-clock path takes that the fast monotonic path skips.
-Pinning needs **kernel futex instrumentation** (which futex/addr blocks, and whether a wake is lost) or
-a **build-matched ERTS source**. Fix at the source (the lost wake / the lock), not by special-casing
-the BIF.
+- **Rung 1 (`system_info`) — config is NORMAL, not a mismatch.** `time_correction=true`,
+  `time_warp_mode=multi_time_warp`, both sources `clock_gettime` (`CLOCK_REALTIME`/`CLOCK_MONOTONIC`) at
+  ns resolution, **`parallel=yes`** (reads meant to be lockless). Nothing a normal Linux ERTS wouldn't
+  report. So the deadlock is not a config/source mismatch — no cheap collapse.
+- **Deadlock vs crash — it's a deadlock.** After a `statistics(wall_clock)` call the serial log shows
+  **no** `exit_group`/crash/error (even accounting for quiet mode), and QEMU CPU is **0 %**. The
+  emulator is alive but frozen — a genuine block, not an abort.
+- **Rung 2 (source-diff) — version-EXACT, and it does NOT explain the block.** `erl_time_sup.c` in the
+  OTP-27.3.4.2 tag is `VSN = 15.2.7.1` = exactly Tyn's beam (no version skew — the trap the ladder
+  warned about is ruled out). In that source, `statistics(wall_clock)` → `erts_wall_clock_elapsed_both`
+  is **lockless straight-line** and calls the **same** `time_sup.r.o.get_time` pointer that
+  `erlang:monotonic_time` (via `erts_get_monotonic_time`) uses — and monotonic *works*. Both paths share
+  the one lockless getter; only `wall_clock` blocks. The C source therefore does **not** account for the
+  deadlock: it is neither a config mismatch, nor version skew, nor a lock the wall-clock C path uniquely
+  takes.
+
+**Checkpoint reached (per the ladder's "don't grind on momentum").** What remains is genuinely a deep
+runtime/futex interaction: the source says these two paths are identical below `get_time`, so the
+divergence is not visible at the C level — it needs **kernel-side futex instrumentation** (Rung 4: which
+futex address the `wall_clock` call blocks on and whether a wake is ever issued — the `ever=0`/lost-wake
+technique from the boot-stall work) or a **disassembly of the beam's `statistics` BIF**. That is a real
+diagnostic session, not a cheap rung. Decision deferred to the user: keep chasing (Rung 4) now, or bank
+this as a documented **NEAR** (deadlock pinned to `statistics(wall_clock)` on the dist critical path,
+root-cause not yet localised) and move the roadmap to tmpfs / TLS-sidecar.
+
+*(Rung 3 — "is the correction updater running?" — is largely mooted by Rung 2: the shared getter is
+lockless and monotonic already reads corrected time fine, so a not-running updater would break monotonic
+too. Worth a glance during Rung 4 but not the leading hypothesis anymore.)*
 
 ## Step 3/4 (after the fix)
 

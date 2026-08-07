@@ -315,11 +315,16 @@ takes `erts_get_time_mtx` (a **futex-based mutex**) — a wait that never wakes.
 **futex / thread-progress** subsystem (the family behind the boot-stall saga and the `FUTEX_BLOCKING`
 valve), *not* the wall-clock offset. The node-wedge is the same deadlock: the time subsystem is needed
 by every scheduler/timer, so a block holding/awaiting its lock freezes the whole node (hence both Nitro
-shells froze too). Why `statistics(wall_clock)` hits it while `monotonic_time` (same `get_time` in the
-github source) does not is the open question — likely a build-config `#ifdef` or a lock the wall-clock
-path takes that the fast monotonic path skips; pinning it needs kernel futex instrumentation or a
-build-matched ERTS source. Blast radius beyond dist: any caller of `statistics(wall_clock)` (some
-scheduler/monitoring tools) deadlocks the same way; the stock demo doesn't call it, which is why it runs.
+shells froze too). **The C source does not explain *why* only `wall_clock` blocks** — and it is
+version-exact (`erl_time_sup.c` `VSN = 15.2.7.1` = Tyn's beam, so the version-skew trap is ruled out):
+`statistics(wall_clock)` and `erlang:monotonic_time` share the **same lockless `time_sup.r.o.get_time`
+pointer**, yet only the former hangs. So it is not a config mismatch (Rung-1 `system_info` is normal:
+`time_correction=true`, `multi_time_warp`, `parallel=yes`), not version skew, and not a lock the
+wall-clock C path uniquely takes. Localising it needs **kernel-side futex instrumentation** (which
+address blocks / whether a wake is lost) or a **beam disassembly** — a real diagnostic session, and the
+conscious checkpoint (below) where the hunt paused rather than grind on momentum. Blast radius beyond
+dist: any caller of `statistics(wall_clock)` (some scheduler/monitoring tools) deadlocks the same way;
+the stock demo doesn't call it, which is why it runs.
 
 **The cookie sub-wall (fully proven, and the reason for a kernel change).** Distribution wouldn't even
 *start* until the cookie was provided as a **boot arg**. Every file-based cookie path is structurally
