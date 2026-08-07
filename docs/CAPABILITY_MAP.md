@@ -21,7 +21,7 @@ actually booted and hit the wall.
 | 2 | **Phoenix + file write** (temp files, uploads) | yes | **no — degrades gracefully (node survives)** | `System.tmp_dir/0` → `nil`, then every write path errors | read-only cpio VFS: `sys_open` ignores `O_CREAT` (→ `ENOENT`), `sys_write` else-arm (→ `EBADF`), `mkdir`/`unlink`/`rename` unhandled (→ `ENOSYS`) | writable filesystem (tmpfs) | **CONFIRMED — local boot** |
 | 3 | NIF-bearing dep (bcrypt/argon2) | fails `load_nif` | no | `load_nif` → "Dynamic loading not supported" | static-musl beam, no dynamic loading; `tyn-pack` wires only the crypto shim, not user NIFs | per-user-NIF static-link packaging | prior-observed (exact error seen) |
 | 4 | Shells out (`System.cmd`, `os_mon`) | os_mon degraded; `cmd` fails | partial | `execve` → UNHANDLED/ENOSYS | no fork/exec; `erl_child_setup` can't spawn (see `inet_gethost`, below) | subprocess/exec | prior-observed |
-| 6 | **Distributed Erlang** (native clustering) | yes | **no — pinned to ONE BIF: `erlang:statistics(wall_clock)`** | the acceptor sends `send_status` then hangs in `dist_util:gen_challenge/0` at `erlang:statistics(wall_clock)`, which **busy-spins forever** → handshake times out at `net_setuptime` (7 s) | `statistics(wall_clock)` busy-spins on Tyn (a clock-subsystem BIF), wedging the scheduler. *Every other time BIF works* (`os:timestamp`, `erlang:timestamp`, `statistics(runtime)`, …). The node-wedge is the **same spin**, not a separate bug | fix `statistics(wall_clock)`'s ERTS time path on Tyn — clock-adjacent, feeds `docs/WALL_CLOCK.md`. Bounded; not a missing subsystem | **CONFIRMED — Nitro + byte-level tap + BIF isolation** |
+| 6 | **Distributed Erlang** (native clustering) | yes | **no — pinned to ONE BIF: `erlang:statistics(wall_clock)`** | the acceptor sends `send_status` then hangs in `dist_util:gen_challenge/0` at `erlang:statistics(wall_clock)`, which **deadlocks** (blocks, CPU idle) → handshake times out at `net_setuptime` (7 s) | `statistics(wall_clock)` **deadlocks** on `erts_get_time_mtx` (futex-based) in the ERTS time-correction path — a wait that never wakes; wedges the node (same deadlock). *Every other time BIF works and the clock advances*, so **not** the offset. Futex/thread-progress-adjacent | resolve the time-correction lock deadlock (futex/thread-progress family, cf. `FUTEX_BLOCKING`) — **not** the kvmclock offset | **CONFIRMED — Nitro + byte-level tap + BIF isolation + CPU-idle measurement** |
 | 1 | Plain Plug (no Phoenix) | yes | yes | — (floor) | — | — | follows from working Phoenix demo |
 
 ---
@@ -298,23 +298,28 @@ node, pins it to **one**:
 |---|---|
 | `phash2`, `monotonic_time`, `unique_integer`, `statistics(reductions)`, `statistics(gc)`, `statistics(runtime)` | ✅ all return |
 | `os:timestamp`, `erlang:timestamp`, `system_time`, `calendar:universal_time` | ✅ all return |
-| **`erlang:statistics(wall_clock)`** | ❌ **hangs forever, wedges the node** |
+| **`erlang:statistics(wall_clock)`** | ❌ **deadlocks (blocks, CPU idle), wedges the node** |
 
-**`erlang:statistics(wall_clock)` busy-spins on Tyn — that single BIF is the entire distributed-Erlang
+**`erlang:statistics(wall_clock)` DEADLOCKS on Tyn — that single BIF is the entire distributed-Erlang
 wall.** It is the sixth line of `gen_challenge/0` (`{F,_} = erlang:statistics(wall_clock)`), so the
-acceptor hangs there, never sends the challenge, and the handshake times out at 7 s. **The node-wedge is
-the same spin, not a second bug** — on `-smp 1` the spin monopolises the only scheduler; on multi-scheduler
-Nitro it wedged both nodes' shells too, so the spin also holds a lock other schedulers need (the ERTS
-time-correction lock is the likely candidate). Every *other* clock BIF works (they return the epoch-1970
-value; they don't hang), so this is not "the wall clock is broken" broadly — it is specifically
-`statistics(wall_clock)`'s ERTS time path (elapsed-since-node-start via the time-correction subsystem)
-spinning on Tyn's clock behaviour. Blast radius beyond dist: any app that calls `statistics(wall_clock)`
-(some scheduler/monitoring tools) will wedge the same way; the stock demo does not call it, which is why
-it runs.
+acceptor hangs there, never sends the challenge, and the handshake times out at 7 s. Every *other* clock
+BIF returns fine and the wall clock itself **advances** (a read/sleep/read shows ~2 s deltas; it is just
+offset at 1970 + uptime), so this is not "the wall clock is broken" and not the epoch *offset*.
 
-*(The node-wedge that first looked like a second, independent bug is resolved as the same root cause:
-the `statistics(wall_clock)` spin freezes the scheduler / holds the time lock. Fixing the one BIF fixes
-both the handshake and the wedge.)*
+*Correction (the −0x70 lesson, applied to my own inference):* an earlier draft called this a "busy-spin"
+— it is **not**. Two artifacts overturn that: (1) the OTP-27 source for `erts_wall_clock_elapsed_both`
+(what `statistics(wall_clock)` calls) is **straight-line, no loop** — structurally identical to the
+`runtime` branch that works; (2) QEMU CPU is **0.0 % during the hang** (idle, HLT), so the process is
+**blocked, not spinning**. It deadlocks inside `time_sup.r.o.get_time` / the time-correction path, which
+takes `erts_get_time_mtx` (a **futex-based mutex**) — a wait that never wakes. That points at Tyn's
+**futex / thread-progress** subsystem (the family behind the boot-stall saga and the `FUTEX_BLOCKING`
+valve), *not* the wall-clock offset. The node-wedge is the same deadlock: the time subsystem is needed
+by every scheduler/timer, so a block holding/awaiting its lock freezes the whole node (hence both Nitro
+shells froze too). Why `statistics(wall_clock)` hits it while `monotonic_time` (same `get_time` in the
+github source) does not is the open question — likely a build-config `#ifdef` or a lock the wall-clock
+path takes that the fast monotonic path skips; pinning it needs kernel futex instrumentation or a
+build-matched ERTS source. Blast radius beyond dist: any caller of `statistics(wall_clock)` (some
+scheduler/monitoring tools) deadlocks the same way; the stock demo doesn't call it, which is why it runs.
 
 **The cookie sub-wall (fully proven, and the reason for a kernel change).** Distribution wouldn't even
 *start* until the cookie was provided as a **boot arg**. Every file-based cookie path is structurally
@@ -332,18 +337,21 @@ the dist port for real isolation. `application:set_env(kernel, epmd_module, tyn_
 `net_kernel:start/2` (or a `-kernel` arg). This brings a node up distributed and binds the listener
 correctly — the config is *not* the blocker; the accept-side handshake is.
 
-**Verdict for positioning: NEAR — the wall is one BIF, pinned and clock-adjacent.** FAR was the honest
-row while the cause was unknown; it is now pinned to `erlang:statistics(wall_clock)` busy-spinning, a
-single, well-localised ERTS time-path bug on Tyn's clock — not a missing subsystem, not the socket
-layer, not `dist_ctrl`. The whole dist stack around it works: modules load, the node goes distributed,
-the listener binds, the transport is proven end-to-end, the handshake reaches step 2, and the wedge is
-the same spin. Fixing that one time-path (make `statistics(wall_clock)` return instead of spin) should
-let the handshake complete and the wedge disappear together. It is **clock-adjacent** — the same
-subsystem as `docs/WALL_CLOCK.md` (kvmclock/RTC), and this is now a *concrete, high-value* reason to do
-that work: it converts "45 MB nodes, 5 s boot, native Erlang mesh" from blocked to buildable. Caveat
-before declaring the pitch shippable: after the fix, the remaining handshake rounds (challenge-reply,
-ack) and the `dist_ctrl` controller takeover are still unexercised — the tap cleared everything *up to*
-step 3, so re-run the two-node Nitro handshake once the BIF is fixed to confirm it completes end-to-end.
+**Verdict for positioning: NEAR — the wall is one BIF, pinned to a deadlock in the ERTS time-correction
+lock.** FAR was the honest row while the cause was unknown; it is now pinned to
+`erlang:statistics(wall_clock)` **deadlocking** on `erts_get_time_mtx` (futex-based) in the
+time-correction path — not a missing subsystem, not the socket layer, not `dist_ctrl`, and not the
+wall-clock offset (the clock advances). The whole dist stack around it works: modules load, the node
+goes distributed, the listener binds, the transport is proven end-to-end, the handshake reaches step 2,
+and the wedge is the same deadlock. Resolving that one blocking wait should let the handshake complete
+and the wedge disappear together. It is **futex/thread-progress-adjacent** — the same subsystem family as
+the boot-stall/`FUTEX_BLOCKING` work, and a lost-wake there is historically a *bounded* fix once
+localised, which keeps NEAR credible. (It is **not** the `docs/WALL_CLOCK.md` kvmclock/RTC offset work —
+that would not touch this deadlock; corrected below.) Two honest caveats before calling the pitch
+shippable: (1) the exact futex/lock deadlock is not yet pinned — that is the next diagnostic session
+(kernel futex instrumentation or a build-matched ERTS source); (2) even after it, the later handshake
+rounds (challenge-reply, ack) and the `dist_ctrl` controller takeover are still unexercised — the tap
+cleared everything *up to* step 3, so re-run the two-node Nitro handshake once the BIF is fixed.
 
 ## Synthesis — what to build next
 

@@ -94,25 +94,45 @@ Step 3 (`send_challenge`) is preceded by `auth:get_cookie/1` → `gen_challenge/
 
 - ✅ `phash2`, `monotonic_time`, `unique_integer`, `statistics(reductions|gc|runtime)`,
   `os:timestamp`, `erlang:timestamp`, `system_time`, `calendar:universal_time` — all return.
-- ❌ **`erlang:statistics(wall_clock)` — hangs forever, wedges the node.**
+- ❌ **`erlang:statistics(wall_clock)` — hangs, wedges the node.**
 
-**Root cause: `erlang:statistics(wall_clock)` busy-spins on Tyn.** It is the 6th line of
+**Root cause: `erlang:statistics(wall_clock)` DEADLOCKS on Tyn (not a spin).** It is the 6th line of
 `gen_challenge/0`, on the acceptor's critical path, so the handshake hangs there. The node-wedge is the
-**same spin** (monopolises the scheduler on `-smp 1`; holds the ERTS time lock on multi-scheduler
-Nitro), *not* a separate bug. Every other clock BIF works, so this is not a broad "wall clock broken" —
-it is specifically `statistics(wall_clock)`'s time-correction/elapsed path spinning on Tyn's clock.
+**same deadlock**, not a separate bug.
 
-## The fix + what remains
+*Corrected characterisation (verify the artifact):* an earlier draft said "busy-spins." It does not.
+(1) The OTP-27 source for `erts_wall_clock_elapsed_both` is straight-line — no loop — structurally the
+same as the `runtime` branch that works. (2) **QEMU CPU is 0.0 % during the hang** (idle/HLT), so it is
+**blocked, not spinning**. It deadlocks inside `time_sup.r.o.get_time` / the time-correction path, which
+takes `erts_get_time_mtx` (a **futex-based mutex**) — a wait that never wakes. The wall clock *advances*
+(read/sleep/read → ~2 s deltas; just offset at 1970), so this is **not** the kvmclock offset. It is
+**futex / thread-progress** family — the same subsystem as the boot-stall/`FUTEX_BLOCKING` work.
 
-- **Fix:** make `statistics(wall_clock)` return instead of spin — an ERTS time-path bug on Tyn's clock
-  behaviour. This is **clock-adjacent**: same subsystem as `docs/WALL_CLOCK.md` (kvmclock/RTC), and now
-  a concrete, high-value reason to do that work (it unblocks native clustering).
-- **Confirm after the fix:** the tap cleared everything *up to* step 3; the later rounds
-  (challenge-reply, ack) and the `dist_ctrl` controller takeover are still unexercised. Re-run the
-  two-node Nitro handshake once the BIF is fixed to confirm end-to-end join + traffic + liveness.
+## Step 1 (frozen vs advancing) — ANSWERED
 
-## Deliverable — DONE
+Advancing from 1970 (~2 s deltas over a 2 s sleep; abs value ≈ uptime). So per the plan's own map, the
+subtler case — and the CPU-idle measurement sharpens it from "reads a value it doesn't expect" to
+"blocks on a lock that never releases." The kvmclock/RTC *offset* fix would not touch it.
+
+## Step 2 — what's left to pin
+
+The exact futex/lock deadlock is not yet localised — the github source shows the top-level function is
+straight-line and calls the same `get_time` that `monotonic_time` (which works) uses, so the divergence
+is in a build-config `#ifdef` or a lock the wall-clock path takes that the fast monotonic path skips.
+Pinning needs **kernel futex instrumentation** (which futex/addr blocks, and whether a wake is lost) or
+a **build-matched ERTS source**. Fix at the source (the lost wake / the lock), not by special-casing
+the BIF.
+
+## Step 3/4 (after the fix)
+
+The tap cleared everything *up to* step 3; the later rounds (challenge-reply, ack) and the `dist_ctrl`
+controller takeover are still unexercised. Re-run the single-node tap, then the two-node Nitro handshake,
+once the deadlock is fixed.
+
+## Deliverable — DONE (this session)
 
 - Pinned round: hangs at step 3 (`gen_challenge` → `statistics(wall_clock)`).
-- Node-wedge: same root cause (the spin), resolved.
-- Probe 6 verdict: FAR → **NEAR** (bounded, clock-adjacent, feeds `docs/WALL_CLOCK.md`).
+- Mechanism: a **deadlock** (CPU idle) in the ERTS time-correction lock, **not** a spin, **not** the
+  clock offset — futex/thread-progress family. Corrected from the earlier "busy-spin" claim.
+- Node-wedge: same root cause (the deadlock), resolved.
+- Probe 6 verdict: FAR → **NEAR** (bounded-if-a-lost-wake; futex/thread-progress-adjacent).
