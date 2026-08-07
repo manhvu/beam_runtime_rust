@@ -21,7 +21,7 @@ actually booted and hit the wall.
 | 2 | **Phoenix + file write** (temp files, uploads) | yes | **no — degrades gracefully (node survives)** | `System.tmp_dir/0` → `nil`, then every write path errors | read-only cpio VFS: `sys_open` ignores `O_CREAT` (→ `ENOENT`), `sys_write` else-arm (→ `EBADF`), `mkdir`/`unlink`/`rename` unhandled (→ `ENOSYS`) | writable filesystem (tmpfs) | **CONFIRMED — local boot** |
 | 3 | NIF-bearing dep (bcrypt/argon2) | fails `load_nif` | no | `load_nif` → "Dynamic loading not supported" | static-musl beam, no dynamic loading; `tyn-pack` wires only the crypto shim, not user NIFs | per-user-NIF static-link packaging | prior-observed (exact error seen) |
 | 4 | Shells out (`System.cmd`, `os_mon`) | os_mon degraded; `cmd` fails | partial | `execve` → UNHANDLED/ENOSYS | no fork/exec; `erl_child_setup` can't spawn (see `inet_gethost`, below) | subprocess/exec | prior-observed |
-| 6 | oban / distribution | single-node yes; dist fatal | — | epmd / distributed Erlang absent | no epmd, no `inet_dist` in source | distributed Erlang / epmd | source-predicted |
+| 6 | **Distributed Erlang** (native clustering) | yes | **no — accept-side handshake stalls, then wedges the node** | dist handshake TCP-connects but stalls → `net_setuptime` 7 s timeout → `connect_node` `false` | the earlier "epmd/`inet_dist` absent" guess was **wrong** — all dist modules load, epmd-less config works, the node goes distributed and binds the listener; the break is Tyn's **accept-side** handshake path (a known-good native OTP node fails identically connecting *to* Tyn) | a working dist accept/handshake data path (likely related to but distinct from the `gen_tcp:accept` fix — the dist listener's own accept path) | **CONFIRMED — 2× Nitro t3.small + native OTP peer** |
 | 1 | Plain Plug (no Phoenix) | yes | yes | — (floor) | — | — | follows from working Phoenix demo |
 
 ---
@@ -221,6 +221,83 @@ Two things the source read alone would have missed:
 `ftruncate` syscalls and a create path in `sys_open`/`sys_write`). Scope is bounded — enough for
 `System.tmp_dir` to resolve and for temp-file/upload writes to land.*
 
+## Probe 6 — Distributed Erlang, in detail (CONFIRMED on 2× Nitro + a native OTP peer)
+
+The positioning question: *can two Tyn nodes form a native Erlang cluster?* Artifacts: two Nitro
+t3.small (`probe_a@172.31.26.231`, `probe_b@172.31.29.10`) from an AMI built with a kernel carrying a
+`-setcookie` arg + a base cpio with a static epmd-less `tyn_epmd` module; a stock OTP-27 node
+(`bh@172.31.5.221`) on the build host as a known-good peer. Result by escalating level:
+
+| Level | Result |
+|---|---|
+| Node starts distributed | **yes** — `is_alive()` → `true`, `node()` correct, `get_cookie()` correct, `net_kernel` up (both nodes, real Nitro) |
+| Dist listener binds (fixed port 9100) | **yes** — `net_kernel:start` succeeds; port accepts (`nc -zv`) |
+| Raw TCP node↔node on 9100 | **yes** — node A `gen_tcp:connect(B, 9100)` → `{ok, Port}` |
+| **Handshake (`connect_node`)** | **NO** — returns `false` after exactly **7001 ms** (`net_setuptime`); `nodes()` stays `[]` |
+
+**The break is Tyn's accept-side handshake, bisected with the native peer.** The handshake TCP-connects
+but then stalls waiting for protocol data (a 7 s *timeout*, not a refusal and not a cookie rejection —
+those fail fast). A **known-good native OTP node connecting *to* Tyn `probe_b` fails identically**
+(`false`, 7004 ms), so the broken half is Tyn *accepting* an incoming dist connection and running the
+handshake — not the initiator, not TCP, not the cookie. Likely the dist listener's own accept/handshake
+data path (related to but distinct from the earlier `gen_tcp:accept` fix, which was for Bandit's
+listener).
+
+**What makes the accept side different from everything that works** (the suspects, in check order).
+The dist listener is *not* Bandit's `gen_tcp:accept` in a plain process loop — it's `inet_tcp_dist`
+(ERTS's own driver) doing an **async accept → controlling-process handoff → active-mode flip → handshake
+state machine** on the accepted socket. That combination is exercised by nothing else on Tyn. Three
+suspects:
+
+1. **The accepted socket never delivers its first data (most likely).** The initiator's `send_name`
+   goes out the instant the connection establishes; the acceptor stalls in a receive that never fires —
+   i.e. bytes reached Tyn's NIC but the acceptor never saw them. This is the readiness/epoll family we
+   have history in (the `gen_tcp:accept` fix, epoll-global-not-per-fd, the connecting-socket `POLLOUT`
+   case): readiness may follow the *listener* fd but not correctly attach to the *accepted* fd across
+   the controlling-process + active-mode flip.
+2. **`{packet, 2}` framing.** The handshake runs 2-byte length-prefixed packets (the driver sets
+   `{packet,2}` on the accepted socket). HTTP works because Bandit uses raw mode; if Tyn mishandles
+   `{packet,2}` reassembly on inbound data, the driver waits forever for a packet it never completes.
+3. **The `controlling_process/2` transfer.** Re-targeting which process receives the socket's messages;
+   if Tyn doesn't re-route readiness/ownership on that call, data is delivered to (or queued for) the
+   wrong process.
+
+All three are cheaply separable *outside* the dist machinery — see the discriminator experiment filed
+in `docs/DIST_ACCEPT_HUNT.md`.
+
+**Second finding — a distinct bug: a stalled handshake wedges the node.** After the attempts, both
+nodes' eval shells stopped responding (TCP still accepted, no eval reply). A stalled *socket receive*
+should not freeze a scheduler — this says the stall holds a lock or blocks a scheduler other work
+needs, and it deserves its own trace rather than being assumed a side effect of suspect (1). On its
+own, "a failed join destabilises the runtime" is disqualifying for the mesh pitch, independent of the
+handshake bug.
+
+**The cookie sub-wall (fully proven, and the reason for a kernel change).** Distribution wouldn't even
+*start* until the cookie was provided as a **boot arg**. Every file-based cookie path is structurally
+blocked on Tyn: no `HOME` → `filename:basedir` `badmatch`; a shipped cookie file fails `auth`'s
+owner-only check because Tyn's `sys_stat` reports a synthetic `0644`; and auto-generation dies on the
+read-only FS. `-setcookie` is therefore the *only* correct mechanism on Tyn — verified: with it, the
+node goes distributed cleanly. (Baked into the kernel binary here as spike scaffolding only — a cookie
+in the shared kernel is auth-lite, not isolation; the SG rule on the dist port is. Its real home is
+`boot.config` at pack time, per-image. See `src/main.rs` and `directions/DIST_SPIKE*.md`.)
+
+**epmd-less recipe (works up to the accept wall; documentation-worthy).** Fixed dist port on every node
+via a ~30-line static `epmd_module` (`listen_port_please` → the port; `address_please` →
+`{ok, Addr, Port, 6}`), `-setcookie` boot arg, longnames with IP literals, and a security-group rule on
+the dist port for real isolation. `application:set_env(kernel, epmd_module, tyn_epmd)` before
+`net_kernel:start/2` (or a `-kernel` arg). This brings a node up distributed and binds the listener
+correctly — the config is *not* the blocker; the accept-side handshake is.
+
+**Verdict for positioning: FAR as-is, plausibly NEAR once the accept-path bug is pinned.** FAR is the
+honest map row *today* — clustering does not work and a failed join destabilises the node. But the
+evidence has the shape of a **socket-layer bug, not a missing subsystem**: the modules are all present,
+the node goes distributed, the listener binds, raw TCP flows — only the accept→handoff→active-flip
+sequence stalls. Every bug in this family so far (the `gen_tcp:accept` fix, `writev`, `sendfile`
+readiness) turned out to be a *bounded* fix once localised. The discriminator experiment
+(`docs/DIST_ACCEPT_HUNT.md`) reproduces the exact socket-op sequence in ~30 lines outside the
+dist machinery and separates the three suspects immediately — it is a session, not a project, and it
+decides which positioning is true. The node-wedge is a second, independent bug on the same path.
+
 ## Synthesis — what to build next
 
 **Because plaintext Postgrex works *and* the standard eager Ecto Repo works once the base image is
@@ -276,6 +353,7 @@ both plaintext (5a) and TLS (5b) probes need it, so it stays on. Reaching row 5b
 fixing a `tyn-pack` bug (shim path resolved from CWD, not the script), which had let stock crypto
 shadow the shim; with the shim applied, `:crypto` loads symmetrically and the wall is the missing
 asymmetric surface (`:ssl.opt_signature_algs`). Probe 2 (file write) is boot-confirmed on a local boot (FS behavior is pure kernel VFS,
-identical local vs Nitro). Rows 3/4/6 are prior-observed or source-predicted and labelled as such —
-hypotheses until an app boots into each wall. DB target + toolchain remain standing on the build host
-for the follow-on probes.*
+identical local vs Nitro). Probe 6 (distributed Erlang) is boot-confirmed on 2× Nitro t3.small + a
+native OTP peer (now terminated; AMI/snapshot/S3 cleaned up) — it **corrected** the earlier
+source-predicted "dist modules absent" guess. Rows 3/4 remain prior-observed. DB target + toolchain
+remain standing on the build host for the follow-on probes.*
