@@ -62,9 +62,34 @@ node-wedge says the stall holds a lock or blocks a scheduler other work needs. I
 cause with suspect 1 or be a distinct liveness issue; trace it on its own. "A failed join destabilises
 the runtime" is disqualifying for the mesh pitch regardless of the handshake fix.
 
+## Result (run — one QEMU node, host sending framed/raw data)
+
+**All socket-op suspects REFUTED — "A works, go deeper."** Every variant returned `<<"hello">>`:
+
+- A (`{packet,2}` + handoff), B (no `{packet,2}`), C (no handoff), D (control) → all `<<"hello">>`.
+- **E** — `prim_inet:async_accept` (the call `inet_tcp_dist` *actually* uses, not `gen_tcp:accept`):
+  accepted and delivered the data. **Works.**
+- **F** — acceptor recv-then-send-back a framed reply: node saw `{recvd,<<"hello">>,sent,ok}` and the
+  host received the `{packet,2}` "reply" frame. Full bidirectional round-trip. **Works.**
+
+So sync accept, **async accept**, `{packet,2}` **both directions**, `controlling_process` handoff,
+active-mode, passive recv, and acceptor send-flush all work in isolation. The accept-side stall is
+**not the socket layer.** It is deeper: the dist handshake's multi-round sequencing or the
+**distribution controller** (`erlang:dist_ctrl_*`, the ERTS dist port driver that takes the socket over
+during handshake) — a genuinely Tyn-untested subsystem that plain `gen_tcp` can't reproduce.
+
+## Next step (was the fallback branch, now the main line)
+
+Pin the exact handshake step with a **live `dist_util` / `dist_ctrl` trace** on a real connection:
+enable a *capturing* trace (a `dbg` tracer forwarding to a registered collector, since post-boot quiet
+mode suppresses serial) of `dist_util:handshake_other_started` and the `erlang:dist_ctrl_*` calls on
+the Tyn acceptor, have a peer connect, and read the last call before the 7 s timeout. This is
+**SLIRP-confounded locally** (the node-name/address the initiator resolves won't match a hostfwd'd
+loopback), so it wants **2 Nitro nodes** — but the whole socket layer is now cleared underneath it, so
+the trace has a small surface to search.
+
 ## Deliverable
 
-- Which suspect the discriminator localises (or "sequence is fine, go deeper"), booted evidence.
-- Whether the node-wedge reproduces in the minimal harness (it shouldn't need dist to reproduce if it's
-  a scheduler/lock issue).
-- Update Probe 6 in the capability map: verdict FAR → NEAR if the localised bug looks bounded.
+- Which `dist_util`/`dist_ctrl` step stalls (booted trace evidence).
+- Whether the node-wedge is the same root cause or distinct (trace it independently).
+- Update Probe 6: FAR → NEAR only if the pinned bug looks bounded.

@@ -262,8 +262,25 @@ suspects:
    if Tyn doesn't re-route readiness/ownership on that call, data is delivered to (or queued for) the
    wrong process.
 
-All three are cheaply separable *outside* the dist machinery — see the discriminator experiment filed
-in `docs/DIST_ACCEPT_HUNT.md`.
+**Discriminator run — all three socket-op suspects REFUTED.** A ~30-line harness reproduced the exact
+sequence outside distribution (`docs/DIST_ACCEPT_HUNT.md`), booted on one QEMU node, host sending framed
+data. Every variant returned `<<"hello">>`:
+
+| Probe | Result |
+|---|---|
+| accept + `{packet,2}` + `controlling_process` + `{active,once}` (exact sequence) | ✅ `<<"hello">>` |
+| drop `{packet,2}` / drop the handoff / plain control | ✅ all `<<"hello">>` |
+| **`prim_inet:async_accept`** (what `inet_tcp_dist` *actually* calls) | ✅ accepted + delivered |
+| acceptor recv-then-**send-back** (framed reply to host) | ✅ host got the `{packet,2}` reply |
+
+So the socket layer is *not* the bug: sync accept, **async accept**, `{packet,2}` **both directions**,
+`controlling_process` handoff, active-mode, passive recv, and acceptor send-flush all work in isolation.
+The stall is **deeper than the socket ops** — in the dist handshake's *multi-round sequencing* or the
+**distribution controller** (`erlang:dist_ctrl_*` — the ERTS dist port driver that takes the socket over
+during handshake, a genuinely Tyn-untested subsystem). Plain `gen_tcp` can't reproduce that; pinning the
+exact step needs a **live `dist_util`/`dist_ctrl` trace on a real connection** — SLIRP-confounded locally
+(node-name/address mismatch), so it wants 2 Nitro nodes. That trace is now the cheap next step, with the
+whole socket layer cleared underneath it.
 
 **Second finding — a distinct bug: a stalled handshake wedges the node.** After the attempts, both
 nodes' eval shells stopped responding (TCP still accepted, no eval reply). A stalled *socket receive*
@@ -288,15 +305,17 @@ the dist port for real isolation. `application:set_env(kernel, epmd_module, tyn_
 `net_kernel:start/2` (or a `-kernel` arg). This brings a node up distributed and binds the listener
 correctly — the config is *not* the blocker; the accept-side handshake is.
 
-**Verdict for positioning: FAR as-is, plausibly NEAR once the accept-path bug is pinned.** FAR is the
-honest map row *today* — clustering does not work and a failed join destabilises the node. But the
-evidence has the shape of a **socket-layer bug, not a missing subsystem**: the modules are all present,
-the node goes distributed, the listener binds, raw TCP flows — only the accept→handoff→active-flip
-sequence stalls. Every bug in this family so far (the `gen_tcp:accept` fix, `writev`, `sendfile`
-readiness) turned out to be a *bounded* fix once localised. The discriminator experiment
-(`docs/DIST_ACCEPT_HUNT.md`) reproduces the exact socket-op sequence in ~30 lines outside the
-dist machinery and separates the three suspects immediately — it is a session, not a project, and it
-decides which positioning is true. The node-wedge is a second, independent bug on the same path.
+**Verdict for positioning: FAR as-is; still plausibly near, but the easy theory is now refuted.** FAR
+is the honest map row *today* — clustering does not work and a failed join destabilises the node. The
+first theory (a socket-layer bug in the accept→handoff→active-flip sequence) was the *bounded-fix*
+hope, in the family of the `gen_tcp:accept` fix / `writev` / `sendfile` readiness. **The discriminator
+tested it and refuted it:** the entire socket surface the acceptor uses — including `prim_inet:async_
+accept` and `{packet,2}` both ways — works in isolation. That is *encouraging* for the transport (the
+hard parts work) but it moves the bug up a layer, into the dist handshake sequencing / the
+`erlang:dist_ctrl_*` controller. Whether that is bounded is now the open question, and it needs a live
+`dist_util`/`dist_ctrl` trace on 2 Nitro nodes to pin — a session, not a project, but a deeper one than
+the socket reproduction. The node-wedge is a second, independent bug on the same path (a stalled recv
+should not freeze a scheduler) and deserves its own trace.
 
 ## Synthesis — what to build next
 
