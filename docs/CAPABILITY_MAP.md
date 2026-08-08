@@ -140,10 +140,15 @@ set. TLS fundamentally needs asymmetric crypto (key exchange + certificate signa
 a one-function gap; it is the entire public-key half of `:crypto` being absent. *This is the honest row
 5b: in-guest TLS needs the full public-key crypto surface (≈ static OpenSSL), not a small shim patch.*
 
-**Wall 2 (the epoch clock) is still unreachable** — cert `notBefore`/`notAfter` validation is inside a
-handshake that never begins (the crash is in *option processing*, before the socket). The 1970 clock
-remains a *named* prerequisite for in-guest TLS (see `docs/WALL_CLOCK.md`); it will bite the moment the
-asymmetric crypto exists. The failure is graceful: the connection process dies, the node lives.
+**Wall 2 (the epoch clock) — RESOLVED.** The 1970 clock *was* the second named prerequisite for
+in-guest TLS cert-date validation. It is now fixed: `src/rtc.rs` seeds `CLOCK_REALTIME` from the
+CMOS/RTC at boot, so `DateTime.utc_now` / `gettimeofday` serve **real UTC** — validated on QEMU and
+real Nitro (`utc_now` matches host time to the second; monotonic untouched; `docs/WALL_CLOCK.md`).
+Cert-date validation would now pass on dates (expected but unverified in-guest, since the handshake
+still can't begin — Wall 1). So **only Wall 1 (the asymmetric crypto surface) remains** for in-guest
+TLS; the clock no longer gates it. (Second-resolution, drifts over long uptimes — kvmclock is the
+documented precision follow-on.) The prior TLS failure is graceful either way: the connection process
+dies, the node lives.
 
 ### Two paths to TLS-to-DB (assessed, not built)
 

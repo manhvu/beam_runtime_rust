@@ -559,9 +559,9 @@ fn syscall_dispatch_inner(
         }
         SYS_GETRANDOM => sys_getrandom(a0 as *mut u8, a1 as usize),
         SYS_GETCWD => sys_getcwd(a0 as *mut u8, a1 as usize),
-        96 => { // gettimeofday
+        96 => { // gettimeofday — wall clock (real UTC once RTC-seeded)
             if a0 != 0 {
-                let ns = monotonic_ns();
+                let ns = realtime_ns();
                 unsafe {
                     *(a0 as *mut u64) = ns / 1_000_000_000; // tv_sec
                     *((a0 + 8) as *mut u64) = (ns / 1000) % 1_000_000; // tv_usec
@@ -2023,6 +2023,43 @@ fn sys_readlink(path: *const u8, buf: *mut u8, bufsiz: usize) -> i64 {
 /// Last returned nanosecond value — ensures monotonicity.
 static LAST_TIME_NS: AtomicU64 = AtomicU64::new(0);
 
+/// Wall-clock offset in ns: `WALL_OFFSET_NS + monotonic_ns()` = real UTC ns.
+/// 0 until `seed_wall_clock()` runs at boot — in which case `CLOCK_REALTIME`
+/// gracefully reads the old 1970+uptime instead of a garbage clock. Set exactly
+/// once from the RTC; never adjusted (a static boot offset, no smearing/no
+/// correction loop — the `wall_clock` saga's lesson: keep time boring).
+static WALL_OFFSET_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Read the RTC once at boot and set `WALL_OFFSET_NS` so `CLOCK_REALTIME` serves
+/// real UTC. Call from `main.rs` after `calibrate_tsc()` (so `monotonic_ns()` is
+/// meaningful). Idempotent-safe but intended to run once per boot; a reboot
+/// re-runs it and re-seeds from the (battery-backed) RTC.
+pub fn seed_wall_clock() {
+    match crate::rtc::read_rtc_unix_secs() {
+        Some(secs) => {
+            let wall_ns = secs.saturating_mul(1_000_000_000);
+            let mono = monotonic_ns();
+            WALL_OFFSET_NS.store(wall_ns.saturating_sub(mono), Ordering::SeqCst);
+            serial_println!(
+                "[clock] RTC seed: unix={}s (UTC) -> CLOCK_REALTIME now real; monotonic unchanged",
+                secs
+            );
+        }
+        None => {
+            serial_println!(
+                "[clock] RTC read failed/implausible -> CLOCK_REALTIME stays 1970+uptime"
+            );
+        }
+    }
+}
+
+/// Real wall-clock ns (UTC) = boot offset + monotonic. When unseeded the offset
+/// is 0, so this equals `monotonic_ns()` (1970+uptime) — the prior behavior.
+#[inline]
+fn realtime_ns() -> u64 {
+    monotonic_ns().wrapping_add(WALL_OFFSET_NS.load(Ordering::Relaxed))
+}
+
 /// Per-CPU last returned ns; used to detect kernel-level backwards regressions.
 static LAST_RETURNED_PER_CPU: [AtomicU64; 16] = {
     const Z: AtomicU64 = AtomicU64::new(0);
@@ -2235,7 +2272,7 @@ pub fn monotonic_ns() -> u64 {
     result
 }
 
-fn sys_clock_gettime(_clk_id: i32, tp: *mut u64) -> i64 {
+fn sys_clock_gettime(clk_id: i32, tp: *mut u64) -> i64 {
     // Track call rate to verify musl is hitting our syscall (not vDSO bypass).
     {
         static CG_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -2247,7 +2284,15 @@ fn sys_clock_gettime(_clk_id: i32, tp: *mut u64) -> i64 {
     if tp.is_null() {
         return -22; // -EINVAL
     }
-    let ns = monotonic_ns();
+    // Split the clock domains: only the REALTIME family gets the wall-clock
+    // offset; the MONOTONIC family (and BOOTTIME, and the CPU-time clocks) stay
+    // raw monotonic — untouched, so schedulers/timers/dist-tick are unaffected.
+    //   0 CLOCK_REALTIME, 5 CLOCK_REALTIME_COARSE -> wall
+    //   1 MONOTONIC, 4 MONOTONIC_RAW, 6 MONOTONIC_COARSE, 7 BOOTTIME, 2/3 CPUTIME -> monotonic
+    let ns = match clk_id {
+        0 | 5 => realtime_ns(),
+        _ => monotonic_ns(),
+    };
     unsafe {
         *tp = ns / 1_000_000_000;
         *(tp.add(1)) = ns % 1_000_000_000;

@@ -119,6 +119,11 @@ extern "C" fn main(mbi: *const u8) -> ! {
     // Calibrate TSC frequency against PIT (before APIC takes over PIT)
     tyn_kernel::syscall::calibrate_tsc();
 
+    // Seed the wall clock from the RTC now that monotonic_ns() is meaningful.
+    // CLOCK_REALTIME/gettimeofday serve real UTC after this; without it they'd
+    // read 1970 + uptime. Monotonic time is unaffected.
+    tyn_kernel::syscall::seed_wall_clock();
+
     // Discover CPUs via ACPI MADT and initialize APIC
     let acpi_info = tyn_kernel::acpi::discover_cpus();
     if let Some(ref info) = acpi_info {

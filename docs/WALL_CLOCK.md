@@ -1,8 +1,18 @@
 # Wall clock: give Tyn a real absolute time source (kvmclock / RTC)
 
-**Status:** open, unstarted. **Type:** named prerequisite — this ticket exists because the epoch
-clock keeps getting *rediscovered* mid-probe instead of being tracked as a dependency. It now gates at
-least two roadmap items; file it once, reference it from both.
+**Status: RTC boot-seed SHIPPED (`src/rtc.rs` + `syscall.rs` clk_id split).** `CLOCK_REALTIME` /
+`gettimeofday` now serve real UTC, seeded once from the CMOS/RTC at boot; `CLOCK_MONOTONIC` is
+untouched. Validated: QEMU full path (`DateTime.utc_now` → real 2026 time, advancing at the right
+rate, monotonic intact) and the Nitro RTC read (`[clock] RTC seed: unix=…s (UTC)` = real time on real
+hardware). **kvmclock** remains the documented precision follow-on (below), not built. Original
+"1970 + uptime" bug and the sizing analysis are kept below for the record.
+
+**Assumptions (documented, confirmed on the targets):** the RTC presents **UTC** (QEMU + Nitro/KVM —
+seed matched host UTC to the second); **BCD** encoding + **24-hour** mode (both auto-detected from
+status register B; binary/12-hour paths handled anyway); RTC year is two digits, century from register
+`0x32` if plausible else `20xx`. **Limitation:** second-resolution, and it drifts with the TSC over
+long uptimes (no NTP, no correction loop — that's the kvmclock upgrade). Fine for `utc_now`, log
+timestamps, and TLS cert-date checks.
 
 ## The problem
 
