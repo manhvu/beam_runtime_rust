@@ -26,15 +26,13 @@ specifically about **absolute / wall-clock** time.
    set in-app rather than by the DB, JWT `exp`/`iat`, signed-URL expiry, log/telemetry timestamps,
    cache TTLs keyed on wall time, cookie `Max-Age` vs `Expires`) are all wrong by ~55 years. Most are
    silent — which is why this keeps surfacing late.
-> **Not this ticket, but discovered next to it (cross-reference).** `erlang:statistics(wall_clock)`
-> **deadlocks** on Tyn (capability map Probe 6 / `docs/DIST_ACCEPT_HUNT.md`), which blocks native
-> distributed Erlang. It is **not** the epoch *offset* this ticket is about — the wall clock *advances*
-> (read/sleep/read shows ~2 s deltas), every other clock BIF returns fine, and QEMU CPU is 0 % during the
-> hang (a **block**, not a spin). It deadlocks in the ERTS time-**correction** path on `erts_get_time_mtx`
-> (a futex-based mutex) — a wait that never wakes. So the kvmclock/RTC base here would **not** fix it;
-> the fix belongs to the **futex / thread-progress** family (cf. the boot-stall / `FUTEX_BLOCKING` work).
-> Filed here only so the two clock-subsystem items aren't confused: doing kvmclock/RTC does not unblock
-> clustering, and fixing the dist deadlock does not fix the epoch offset. They are separate.
+> **Retraction — this was never a clock problem.** An earlier note here claimed
+> `erlang:statistics(wall_clock)` "deadlocks" and blocked native distributed Erlang. That was wrong
+> (a capture-bug misattribution; see Probe 6). The real dist blocker was `erlang:statistics(runtime)` →
+> `getrusage(RUSAGE_SELF)` → `ENOSYS` → `erts_exit` (a **missing syscall crash**, not a deadlock, not the
+> clock), now fixed with a `getrusage` stub. It has nothing to do with this ticket. This ticket is
+> purely the **1970 epoch offset** (kvmclock/RTC) — kept separate and still open on its own merits
+> (in-guest TLS cert dates + absolute-time correctness).
 
 ## The ask
 

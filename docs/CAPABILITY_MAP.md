@@ -21,7 +21,7 @@ actually booted and hit the wall.
 | 2 | **Phoenix + file write** (temp files, uploads) | yes | **no — degrades gracefully (node survives)** | `System.tmp_dir/0` → `nil`, then every write path errors | read-only cpio VFS: `sys_open` ignores `O_CREAT` (→ `ENOENT`), `sys_write` else-arm (→ `EBADF`), `mkdir`/`unlink`/`rename` unhandled (→ `ENOSYS`) | writable filesystem (tmpfs) | **CONFIRMED — local boot** |
 | 3 | NIF-bearing dep (bcrypt/argon2) | fails `load_nif` | no | `load_nif` → "Dynamic loading not supported" | static-musl beam, no dynamic loading; `tyn-pack` wires only the crypto shim, not user NIFs | per-user-NIF static-link packaging | prior-observed (exact error seen) |
 | 4 | Shells out (`System.cmd`, `os_mon`) | os_mon degraded; `cmd` fails | partial | `execve` → UNHANDLED/ENOSYS | no fork/exec; `erl_child_setup` can't spawn (see `inet_gethost`, below) | subprocess/exec | prior-observed |
-| 6 | **Distributed Erlang** (native clustering) | yes | **no — pinned to ONE BIF: `erlang:statistics(wall_clock)`** | the acceptor sends `send_status` then hangs in `dist_util:gen_challenge/0` at `erlang:statistics(wall_clock)`, which **deadlocks** (blocks, CPU idle) → handshake times out at `net_setuptime` (7 s) | `statistics(wall_clock)` **deadlocks** on `erts_get_time_mtx` (futex-based) in the ERTS time-correction path — a wait that never wakes; wedges the node (same deadlock). *Every other time BIF works and the clock advances*, so **not** the offset. Futex/thread-progress-adjacent | resolve the time-correction lock deadlock (futex/thread-progress family, cf. `FUTEX_BLOCKING`) — **not** the kvmclock offset | **CONFIRMED — Nitro + byte-level tap + BIF isolation + CPU-idle measurement** |
+| 6 | **Distributed Erlang** (native clustering) | yes | **YES — after a one-line kernel fix (missing `getrusage`)** | *(was)* `dist_util:gen_challenge/0` calls `erlang:statistics(runtime)` → `getrusage(RUSAGE_SELF)` → Tyn returned `ENOSYS` → ERTS treats getrusage failure as **fatal** (`erts_exit`) → node **exits** mid-handshake | Tyn was **missing the `getrusage(2)` syscall (nr 98)**. Not a deadlock, not the clock, not `dist_ctrl` — a missing syscall that ERTS aborts on. Added a zeroed-`rusage` stub → `statistics(runtime)` returns, `gen_challenge` completes | — (fixed: `getrusage` stub in `sys_syscall`) | **CONFIRMED — handshake completes end-to-end, nodes cluster (`connect_node`→`true`), traffic flows, node survives; single-node tap + native OTP peer** |
 | 1 | Plain Plug (no Phoenix) | yes | yes | — (floor) | — | — | follows from working Phoenix demo |
 
 ---
@@ -288,43 +288,37 @@ TYN→INIT  tag 's'  send_status "sok" ← Tyn CONSUMES it and REPLIES  ✅
 (then nothing from Tyn for 7 s; initiator times out)
 ```
 
-So Tyn reaches step 2 (consumes `send_name`, emits `send_status`) and hangs before **step 3
-(`send_challenge`)** — the exact round the initial theory flagged as clock-adjacent. The acceptor code
-between those two (`dist_util:handshake_other_started`, lines 215-217) is `auth:get_cookie/1` →
-`gen_challenge/0` → `send_challenge/2`. Calling each BIF `gen_challenge/0` uses, in isolation on a live
-node, pins it to **one**:
+So Tyn reaches step 2 (consumes `send_name`, emits `send_status`) and dies before **step 3
+(`send_challenge`)**. The acceptor code between those two (`dist_util:handshake_other_started`, lines
+215-217) is `auth:get_cookie/1` → `gen_challenge/0` → `send_challenge/2`, and `gen_challenge/0` calls a
+run of BIFs including `erlang:statistics(runtime)` (line 5) and `erlang:statistics(wall_clock)` (line 6).
 
-| BIF | Result |
-|---|---|
-| `phash2`, `monotonic_time`, `unique_integer`, `statistics(reductions)`, `statistics(gc)`, `statistics(runtime)` | ✅ all return |
-| `os:timestamp`, `erlang:timestamp`, `system_time`, `calendar:universal_time` | ✅ all return |
-| **`erlang:statistics(wall_clock)`** | ❌ **deadlocks (blocks, CPU idle), wedges the node** |
+**Root cause — a missing syscall, not a deadlock: `getrusage`.** `erlang:statistics(runtime)` →
+`erts_runtime_elapsed_both()` → `getrusage(RUSAGE_SELF, &now)`. Tyn had **no `getrusage(2)` handler
+(nr 98)**, so it returned `ENOSYS`; ERTS treats getrusage failure as **fatal** —
+`if (getrusage(...) != 0) erts_exit(ERTS_ABORT_EXIT, "getrusage(RUSAGE_SELF, _) failed: %d")` — so the
+node **exits** (`exit_group(127)`) mid-`gen_challenge`. The serial log during the call shows exactly
+that (`getrusage(RUSAGE_SELF, _) failed: 38` then `exit_group(127)`). **Fix:** a `getrusage` stub that
+returns a zeroed `struct rusage` (`src/syscall.rs`). After it, `statistics(runtime)` returns `{0,0}`,
+`gen_challenge` completes, and — re-running the tap — the acceptor now emits `send_challenge`, the
+handshake finishes (`send_challenge_reply` → `send_challenge_ack`), the dist controller takes over
+(Erlang term frames flow both ways), and `net_kernel:connect_node` returns **`true`** with `nodes()`
+populated in **96 ms**. The node stays healthy.
 
-**`erlang:statistics(wall_clock)` DEADLOCKS on Tyn — that single BIF is the entire distributed-Erlang
-wall.** It is the sixth line of `gen_challenge/0` (`{F,_} = erlang:statistics(wall_clock)`), so the
-acceptor hangs there, never sends the challenge, and the handshake times out at 7 s. Every *other* clock
-BIF returns fine and the wall clock itself **advances** (a read/sleep/read shows ~2 s deltas; it is just
-offset at 1970 + uptime), so this is not "the wall clock is broken" and not the epoch *offset*.
-
-*Correction (the −0x70 lesson, applied to my own inference):* an earlier draft called this a "busy-spin"
-— it is **not**. Two artifacts overturn that: (1) the OTP-27 source for `erts_wall_clock_elapsed_both`
-(what `statistics(wall_clock)` calls) is **straight-line, no loop** — structurally identical to the
-`runtime` branch that works; (2) QEMU CPU is **0.0 % during the hang** (idle, HLT), so the process is
-**blocked, not spinning**. It deadlocks inside `time_sup.r.o.get_time` / the time-correction path, which
-takes `erts_get_time_mtx` (a **futex-based mutex**) — a wait that never wakes. That points at Tyn's
-**futex / thread-progress** subsystem (the family behind the boot-stall saga and the `FUTEX_BLOCKING`
-valve), *not* the wall-clock offset. The node-wedge is the same deadlock: the time subsystem is needed
-by every scheduler/timer, so a block holding/awaiting its lock freezes the whole node (hence both Nitro
-shells froze too). **The C source does not explain *why* only `wall_clock` blocks** — and it is
-version-exact (`erl_time_sup.c` `VSN = 15.2.7.1` = Tyn's beam, so the version-skew trap is ruled out):
-`statistics(wall_clock)` and `erlang:monotonic_time` share the **same lockless `time_sup.r.o.get_time`
-pointer**, yet only the former hangs. So it is not a config mismatch (Rung-1 `system_info` is normal:
-`time_correction=true`, `multi_time_warp`, `parallel=yes`), not version skew, and not a lock the
-wall-clock C path uniquely takes. Localising it needs **kernel-side futex instrumentation** (which
-address blocks / whether a wake is lost) or a **beam disassembly** — a real diagnostic session, and the
-conscious checkpoint (below) where the hunt paused rather than grind on momentum. Blast radius beyond
-dist: any caller of `statistics(wall_clock)` (some scheduler/monitoring tools) deadlocks the same way;
-the stock demo doesn't call it, which is why it runs.
+> **Correction — a three-draft error, and how it was caught (the −0x70 lesson, hard).** Earlier drafts
+> of this row said "`statistics(wall_clock)` busy-spins," then "deadlocks on `erts_get_time_mtx`
+> (futex)," then tied it to the wall clock / `WALL_CLOCK.md`. **All wrong.** Two mistakes compounded:
+> (1) a capture bug — a bare `>> ` shell prompt was read as a *returned value*, so
+> `statistics(runtime)` (which actually died) was logged as "works," and the blame fell on
+> `statistics(wall_clock)` which is *next in `gen_challenge`*; health-gated re-testing showed
+> `statistics(wall_clock)` **works** (`>> 13797`) and `statistics(runtime)` is the one that dies.
+> (2) "0 % CPU + wedged" was read as a *deadlock* — but the serial log (never checked until the ladder
+> forced it) showed an `exit_group`: the node had **exited**, not blocked. The clock/futex/time-
+> correction analysis was a castle built on the misattribution. The fix is trivial (one syscall stub),
+> which is what the ladder's discipline predicted once the contradiction was chased instead of
+> concluded. Blast radius beyond dist: any caller of `statistics(runtime)` (schedulers/monitoring,
+> `:observer`, some telemetry) would have crashed the node the same way; the stock demo doesn't call
+> it, which is why it ran.
 
 **The cookie sub-wall (fully proven, and the reason for a kernel change).** Distribution wouldn't even
 *start* until the cookie was provided as a **boot arg**. Every file-based cookie path is structurally
@@ -339,24 +333,20 @@ in the shared kernel is auth-lite, not isolation; the SG rule on the dist port i
 via a ~30-line static `epmd_module` (`listen_port_please` → the port; `address_please` →
 `{ok, Addr, Port, 6}`), `-setcookie` boot arg, longnames with IP literals, and a security-group rule on
 the dist port for real isolation. `application:set_env(kernel, epmd_module, tyn_epmd)` before
-`net_kernel:start/2` (or a `-kernel` arg). This brings a node up distributed and binds the listener
-correctly — the config is *not* the blocker; the accept-side handshake is.
+`net_kernel:start/2` (or a `-kernel` arg). With the `getrusage` fix this recipe now takes a node all the
+way through the handshake — it was never the config that blocked, and the one kernel gap is closed.
 
-**Verdict for positioning: NEAR — the wall is one BIF, pinned to a deadlock in the ERTS time-correction
-lock.** FAR was the honest row while the cause was unknown; it is now pinned to
-`erlang:statistics(wall_clock)` **deadlocking** on `erts_get_time_mtx` (futex-based) in the
-time-correction path — not a missing subsystem, not the socket layer, not `dist_ctrl`, and not the
-wall-clock offset (the clock advances). The whole dist stack around it works: modules load, the node
-goes distributed, the listener binds, the transport is proven end-to-end, the handshake reaches step 2,
-and the wedge is the same deadlock. Resolving that one blocking wait should let the handshake complete
-and the wedge disappear together. It is **futex/thread-progress-adjacent** — the same subsystem family as
-the boot-stall/`FUTEX_BLOCKING` work, and a lost-wake there is historically a *bounded* fix once
-localised, which keeps NEAR credible. (It is **not** the `docs/WALL_CLOCK.md` kvmclock/RTC offset work —
-that would not touch this deadlock; corrected below.) Two honest caveats before calling the pitch
-shippable: (1) the exact futex/lock deadlock is not yet pinned — that is the next diagnostic session
-(kernel futex instrumentation or a build-matched ERTS source); (2) even after it, the later handshake
-rounds (challenge-reply, ack) and the `dist_ctrl` controller takeover are still unexercised — the tap
-cleared everything *up to* step 3, so re-run the two-node Nitro handshake once the BIF is fixed.
+**Verdict for positioning: BUILDABLE — native clustering works after a one-line kernel fix.** With the
+`getrusage` stub, a native OTP node and a Tyn node complete the *full* Erlang distribution handshake
+(`send_name` → `status` → `challenge` → `reply` → `ack`), the `dist_ctrl` controller takes over, term
+traffic flows both directions, `connect_node` → `true` (96 ms), and the node stays healthy — the exact
+back-half (challenge-reply/ack + controller takeover) that earlier looked "unexercised" now runs. The
+missing primitive was a single syscall, not a subsystem. **One honest caveat before the pitch is
+"shipped":** this is confirmed on a *single Tyn node* + a native-OTP peer over hostfwd; the last
+validation is **two Tyn nodes on Nitro** — `connect_node` both directions, `rpc:call`, a ~1 MB term
+hash-checked, and liveness across several `net_ticktime` cycles with `nodedown` on kill. That plus
+moving the cookie from the kernel `-setcookie` scaffolding to `boot.config` (per-image) is what turns
+"buildable, proven at the handshake" into "shippable native mesh."
 
 ## Synthesis — what to build next
 

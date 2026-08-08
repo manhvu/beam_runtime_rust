@@ -78,83 +78,68 @@ active-mode, passive recv, and acceptor send-flush all work in isolation. The ac
 **distribution controller** (`erlang:dist_ctrl_*`, the ERTS dist port driver that takes the socket over
 during handshake) — a genuinely Tyn-untested subsystem that plain `gen_tcp` can't reproduce.
 
-## PINNED (host-driven, one node — no Nitro needed after all)
+## RESOLVED — it was a missing syscall (`getrusage`), and native clustering now works
 
 A `{packet,2}` byte-level proxy tapped the handshake between a known-good native OTP initiator and
-Tyn's acceptor over hostfwd. The tap showed Tyn reaching **step 2** and hanging before **step 3**:
+Tyn's acceptor over hostfwd. The tap showed Tyn reaching **step 2** and dying before **step 3**:
 
 ```
 INIT→TYN  'N' send_name         ← initiator
 TYN→INIT  's' send_status "sok" ← Tyn consumes it and replies  ✅
-(silence for 7 s → initiator times out)
+(silence → initiator times out)
 ```
 
-Step 3 (`send_challenge`) is preceded by `auth:get_cookie/1` → `gen_challenge/0`. Calling each BIF
-`gen_challenge/0` uses, in isolation on a live node, pins it to exactly one:
+Step 3 (`send_challenge`) is preceded by `auth:get_cookie/1` → `gen_challenge/0`, which calls
+`erlang:statistics(runtime)` (line 5) then `erlang:statistics(wall_clock)` (line 6). Health-gated,
+per-BIF isolation (each call preceded by a `1+1 → 2` health check, full-output capture, timed) pins it:
 
-- ✅ `phash2`, `monotonic_time`, `unique_integer`, `statistics(reductions|gc|runtime)`,
-  `os:timestamp`, `erlang:timestamp`, `system_time`, `calendar:universal_time` — all return.
-- ❌ **`erlang:statistics(wall_clock)` — hangs, wedges the node.**
+- ✅ everything returns — including `statistics(wall_clock)` (`>> 13797`), `atomics:exchange`, etc.
+- ❌ **`erlang:statistics(runtime)` — kills the node.**
 
-**Root cause: `erlang:statistics(wall_clock)` DEADLOCKS on Tyn (not a spin).** It is the 6th line of
-`gen_challenge/0`, on the acceptor's critical path, so the handshake hangs there. The node-wedge is the
-**same deadlock**, not a separate bug.
+**Root cause: a missing `getrusage(2)` syscall.** `statistics(runtime)` → `erts_runtime_elapsed_both`
+→ `getrusage(RUSAGE_SELF, &now)`. Tyn had **no handler for nr 98**, so it returned `ENOSYS`, and ERTS
+treats getrusage failure as **fatal**: `if (getrusage(...) != 0) erts_exit(ERTS_ABORT_EXIT, ...)`. The
+serial log during the call is unambiguous — `getrusage(RUSAGE_SELF, _) failed: 38` then
+`exit_group(127)`: the node **exits**. Not a deadlock, not the clock, not the socket layer, not
+`dist_ctrl`.
 
-*Corrected characterisation (verify the artifact):* an earlier draft said "busy-spins." It does not.
-(1) The OTP-27 source for `erts_wall_clock_elapsed_both` is straight-line — no loop — structurally the
-same as the `runtime` branch that works. (2) **QEMU CPU is 0.0 % during the hang** (idle/HLT), so it is
-**blocked, not spinning**. It deadlocks inside `time_sup.r.o.get_time` / the time-correction path, which
-takes `erts_get_time_mtx` (a **futex-based mutex**) — a wait that never wakes. The wall clock *advances*
-(read/sleep/read → ~2 s deltas; just offset at 1970), so this is **not** the kvmclock offset. It is
-**futex / thread-progress** family — the same subsystem as the boot-stall/`FUTEX_BLOCKING` work.
+**Fix + confirmation.** A `getrusage` stub in `src/syscall.rs` (return `0`, zeroed `struct rusage`).
+Re-running the tap: the acceptor now emits `send_challenge`, the handshake completes
+(`send_challenge_reply` → `send_challenge_ack`), the dist controller takes over (Erlang term frames flow
+both directions), and `net_kernel:connect_node` → **`true`** (96 ms) with `nodes()` populated. The node
+stays healthy. The back-half that looked "unexercised" runs.
 
-## Step 1 (frozen vs advancing) — ANSWERED
+## The correction, kept honest (the −0x70 lesson, three drafts deep)
 
-Advancing from 1970 (~2 s deltas over a 2 s sleep; abs value ≈ uptime). So per the plan's own map, the
-subtler case — and the CPU-idle measurement sharpens it from "reads a value it doesn't expect" to
-"blocks on a lock that never releases." The kvmclock/RTC *offset* fix would not touch it.
+Earlier drafts of this doc said the wall was `statistics(wall_clock)` deadlocking on the ERTS
+time-correction futex (`erts_get_time_mtx`), tied it to the wall clock / `WALL_CLOCK.md`, and climbed a
+whole "cheapest-first" ladder (system_info config-normal; source version-exact; "deep futex interaction,
+checkpoint"). **All of it was a castle on a misattribution.** Two mistakes:
 
-## Ladder (WALLCLOCK_LADDER) — cheapest-first, and where it stopped
+1. **A capture bug.** A bare `>> ` shell prompt (no value) was read as a returned value, so
+   `statistics(runtime)` — which actually *died* — was logged "works," and blame fell on the *next*
+   call in `gen_challenge`, `statistics(wall_clock)`. A health-gated re-test (`1+1 → 2` first, full raw
+   output) showed `wall_clock` **works** and `runtime` is the one that dies.
+2. **"0 % CPU + wedged" ≠ deadlock.** It was the emulator having **exited** (`exit_group`), not a block.
+   Checking the *serial log* during the call — which the ladder's discipline finally forced — showed the
+   `getrusage` abort immediately. The whole time-correction/futex analysis dissolved.
 
-- **Rung 1 (`system_info`) — config is NORMAL, not a mismatch.** `time_correction=true`,
-  `time_warp_mode=multi_time_warp`, both sources `clock_gettime` (`CLOCK_REALTIME`/`CLOCK_MONOTONIC`) at
-  ns resolution, **`parallel=yes`** (reads meant to be lockless). Nothing a normal Linux ERTS wouldn't
-  report. So the deadlock is not a config/source mismatch — no cheap collapse.
-- **Deadlock vs crash — it's a deadlock.** After a `statistics(wall_clock)` call the serial log shows
-  **no** `exit_group`/crash/error (even accounting for quiet mode), and QEMU CPU is **0 %**. The
-  emulator is alive but frozen — a genuine block, not an abort.
-- **Rung 2 (source-diff) — version-EXACT, and it does NOT explain the block.** `erl_time_sup.c` in the
-  OTP-27.3.4.2 tag is `VSN = 15.2.7.1` = exactly Tyn's beam (no version skew — the trap the ladder
-  warned about is ruled out). In that source, `statistics(wall_clock)` → `erts_wall_clock_elapsed_both`
-  is **lockless straight-line** and calls the **same** `time_sup.r.o.get_time` pointer that
-  `erlang:monotonic_time` (via `erts_get_monotonic_time`) uses — and monotonic *works*. Both paths share
-  the one lockless getter; only `wall_clock` blocks. The C source therefore does **not** account for the
-  deadlock: it is neither a config mismatch, nor version skew, nor a lock the wall-clock C path uniquely
-  takes.
+The lesson the ladder encoded held: the contradiction ("identical code, different behaviour") meant the
+read had stopped too early — but the resolution was not deeper in ERTS's time machinery, it was that the
+premise ("`wall_clock` is the culprit") was itself a measurement artifact. Verify the artifact, then
+verify the *measurement*.
 
-**Checkpoint reached (per the ladder's "don't grind on momentum").** What remains is genuinely a deep
-runtime/futex interaction: the source says these two paths are identical below `get_time`, so the
-divergence is not visible at the C level — it needs **kernel-side futex instrumentation** (Rung 4: which
-futex address the `wall_clock` call blocks on and whether a wake is ever issued — the `ever=0`/lost-wake
-technique from the boot-stall work) or a **disassembly of the beam's `statistics` BIF**. That is a real
-diagnostic session, not a cheap rung. Decision deferred to the user: keep chasing (Rung 4) now, or bank
-this as a documented **NEAR** (deadlock pinned to `statistics(wall_clock)` on the dist critical path,
-root-cause not yet localised) and move the roadmap to tmpfs / TLS-sidecar.
+## What remains — the two-node Nitro confirmation
 
-*(Rung 3 — "is the correction updater running?" — is largely mooted by Rung 2: the shared getter is
-lockless and monotonic already reads corrected time fine, so a not-running updater would break monotonic
-too. Worth a glance during Rung 4 but not the leading hypothesis anymore.)*
-
-## Step 3/4 (after the fix)
-
-The tap cleared everything *up to* step 3; the later rounds (challenge-reply, ack) and the `dist_ctrl`
-controller takeover are still unexercised. Re-run the single-node tap, then the two-node Nitro handshake,
-once the deadlock is fixed.
+Confirmed on a single Tyn node + a native OTP peer (over hostfwd). The last validation is **two Tyn
+nodes on Nitro**: `connect_node` both directions, `rpc:call`, a ~1 MB term hash-checked, liveness across
+several `net_ticktime` cycles, `nodedown` on kill. Plus moving the cookie from the kernel `-setcookie`
+scaffolding to `boot.config` (per-image). That turns "buildable, handshake-proven" into "shippable mesh."
 
 ## Deliverable — DONE (this session)
 
-- Pinned round: hangs at step 3 (`gen_challenge` → `statistics(wall_clock)`).
-- Mechanism: a **deadlock** (CPU idle) in the ERTS time-correction lock, **not** a spin, **not** the
-  clock offset — futex/thread-progress family. Corrected from the earlier "busy-spin" claim.
-- Node-wedge: same root cause (the deadlock), resolved.
-- Probe 6 verdict: FAR → **NEAR** (bounded-if-a-lost-wake; futex/thread-progress-adjacent).
+- Real root cause: **missing `getrusage(2)` syscall** → `statistics(runtime)` → `erts_exit` → node exit,
+  on the dist handshake critical path. Not a deadlock, not the clock.
+- Fix: `getrusage` stub (`src/syscall.rs`); handshake completes end-to-end, nodes cluster, node healthy.
+- Probe 6 verdict: NEAR → **BUILDABLE** (pending the two-node Nitro back-half + cookie→boot.config).
+- Corrected the earlier `statistics(wall_clock)`/deadlock/futex misdiagnosis in Probe 6 and this doc.

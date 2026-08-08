@@ -534,6 +534,22 @@ fn syscall_dispatch_inner(
             }
             0
         }
+        98 => { // getrusage(who, struct rusage *usage)
+            // Tyn has no per-process CPU accounting, but ERTS treats a non-zero
+            // getrusage return as FATAL: erts_runtime_elapsed_both() does
+            //   if (getrusage(RUSAGE_SELF, &now) != 0) erts_exit(ABORT, ...)
+            // so returning -ENOSYS made `erlang:statistics(runtime)` abort the
+            // whole node (exit_group). Distributed Erlang's dist_util:gen_challenge/0
+            // calls statistics(runtime) on the acceptor's handshake path, so two
+            // nodes could never cluster — the node died mid-handshake. Return 0
+            // with a zeroed `struct rusage` (144 bytes on x86_64); ERTS reads only
+            // ru_utime/ru_stime, and 0 CPU time is harmless (statistics(runtime) is
+            // just an entropy input to the challenge). See directions/WALLCLOCK_*.md.
+            if a1 != 0 {
+                unsafe { core::ptr::write_bytes(a1 as *mut u8, 0, 144); }
+            }
+            0
+        }
         186 => (crate::sched::current_idx() + 1) as i64, // gettid
         270 => 0, // restart_syscall — no-op
         319 => -38i64, // memfd_create — ENOSYS, JIT falls back to mmap
