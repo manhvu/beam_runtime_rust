@@ -462,4 +462,6 @@ byte-exact incl. a real `Plug.Upload` multipart round-trip; tmpfs is pure in-ker
 hardware/timing coupling), so a QEMU/TCG boot is a faithful confirmation, identical on Nitro. Probe 6 (distributed Erlang) is boot-confirmed on 2× Nitro t3.small + a
 native OTP peer (now terminated; AMI/snapshot/S3 cleaned up) — it **corrected** the earlier
 source-predicted "dist modules absent" guess. Rows 3/4 remain prior-observed. DB target + toolchain
-remain standing on the build host for the follow-on probes.*
+remain standing on the build host for the follow-on probes — its out-of-band state (DB connection +
+`pg_hba` trust/scram paths, the `tyn` password change, the AWS-role cleanup gaps) is recorded in
+`docs/TEST_INFRA.md`.*
