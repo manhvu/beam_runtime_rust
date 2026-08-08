@@ -174,18 +174,18 @@ asymmetric crypto exists. The failure is graceful: the connection process dies, 
   crypto NIF, no in-guest clock dependency. RDS requires TLS *from its client*, and **RDS Proxy does
   not remove that** — the sidecar (the actual TLS originator) is what satisfies it. Documented in
   `docs/DEPLOY.md` → "Reach a TLS-required database through a sidecar".
-  **Nitro validation (partial) — the proxy CHOICE matters:** a Tyn instance reached an **stunnel**
-  (`protocol=pgsql`) sidecar in-VPC and stunnel originated real TLS to the DB (SCRAM bytes flowed both
-  ways over the interconnect), but the **auth handshake did not complete**: a transparent TLS wrapper
-  forwards the DB's `SCRAM-SHA-256-PLUS` (channel-binding) offer through to the plaintext-leg app,
-  which trips downgrade-protection (libpq refuses; Postgrex drops the connection). This is a
-  proxy/SCRAM composition issue, **not a Tyn limitation** (Tyn's symmetric shim covers SCRAM;
-  plaintext `[[42]]` works). **Identified fix (NOT yet verified): a protocol-aware proxy —
-  `pgbouncer` (`server_tls_sslmode`)** — which *should* re-auth to the DB so the `-PLUS` offer never
-  reaches the app (or an `md5`-auth user). This is a reasoned correction, not a proven recipe: **the
-  clean end-to-end `SELECT` through pgbouncer has not been run yet**, so TLS-to-DB-via-sidecar is
-  *pattern-identified, proof-pending*, not ✅. The in-VPC-only plaintext hop is a hard requirement
-  (`docs/DEPLOY.md`).
+  **Nitro validation — the proxy CHOICE matters, and the winner is `pgbouncer` (CONFIRMED):**
+  A first attempt with **stunnel** (`protocol=pgsql`) originated real TLS to the DB but the **auth
+  handshake did not complete** — a transparent TLS wrapper forwards the DB's `SCRAM-SHA-256-PLUS`
+  (channel-binding) offer through to the plaintext-leg app, which trips downgrade-protection (libpq
+  refuses; Postgrex drops the connection). Not a Tyn limitation (symmetric shim covers SCRAM; plaintext
+  `[[42]]` works) — a proxy/SCRAM composition issue. Switching to the protocol-aware proxy **pgbouncer**
+  (`auth_type=any` client-side, `server_tls_sslmode=require` upstream) fixed it: pgbouncer does the
+  DB-side SCRAM itself, so `-PLUS` never reaches the app. **Proven end-to-end on real Nitro:** a Tyn
+  app (no in-guest TLS) → pgbouncer sidecar → TLS → SCRAM-required managed Postgres → `select 42`
+  returned **42**, DB backend `ssl=true, TLSv1.3` (`pg_stat_ssl`). ✅ **TLS-to-DB via sidecar
+  CONFIRMED.** Hard requirement of the pattern: the app→proxy plaintext hop stays in-VPC only
+  (`docs/DEPLOY.md`). **Use pgbouncer, not stunnel.**
 
 **Path A's scope is now known** (the "held" question is answered). The masking `tyn-pack` bug is
 fixed, the shim loads, and the re-run shows the real gap is the **entire asymmetric crypto surface**,

@@ -219,13 +219,25 @@ CPIO=my_app.cpio ./build-disk.sh          # -> a bootable raw disk image
   reaches the app. (Alternatives: an `md5`-auth DB user, which sidesteps SCRAM entirely; or a client
   that both sends `channel_binding=disable` *and* is offered plain `SCRAM-SHA-256`.)
 
-  > ⚠️ **Status: identified fix, NOT yet validated end-to-end.** stunnel is *confirmed broken* for
-  > SCRAM (above). pgbouncer is the reasoned correction — it *should* re-auth to the DB so `-PLUS`
-  > never reaches the app — but a Tyn app has **not** yet completed a query through a pgbouncer sidecar
-  > against a real TLS-required Postgres. Treat this as the recommended pattern to try, not a proven
-  > recipe, until this note says "validated on Nitro (`[[42]]`)". (This project has been bitten before
-  > by fixes that obviously should work but didn't; see `docs/SEND_CORRUPTION.md`,
-  > `docs/INBOUND_THROUGHPUT.md`.)
+  > ✅ **Validated on Nitro.** A Tyn app (no in-guest TLS) connected through a pgbouncer sidecar
+  > (`auth_type=any` on the plaintext leg; `server_tls_sslmode=require` to the DB) to a SCRAM-required
+  > Postgres endpoint, ran `select 42` and got **42**, with the DB reporting the backend connection as
+  > **`ssl=true, TLSv1.3`** (`pg_stat_ssl`). pgbouncer performs the DB-side SCRAM itself, so the
+  > `-PLUS` offer never reaches the app. stunnel remains *confirmed broken* for this (SCRAM passthrough,
+  > above). **Use pgbouncer, not stunnel, for TLS-required Postgres from Tyn.**
+  >
+  > Minimal pgbouncer.ini that worked:
+  > ```ini
+  > [databases]
+  > mydb = host=DB_HOST port=5432 dbname=mydb user=APP_USER password=APP_PASSWORD
+  > [pgbouncer]
+  > listen_addr = 0.0.0.0            ; in-VPC only — lock down with a security group
+  > listen_port = 6432
+  > auth_type = any                  ; client leg is plaintext+trusted (in-VPC); pgbouncer auths upstream
+  > server_tls_sslmode = require     ; originate TLS to the DB
+  > pool_mode = session
+  > ```
+  > The app then uses `hostname: PGBOUNCER_HOST, port: 6432, ssl: false`.
 
   **RDS Proxy does not remove this requirement** — it still demands TLS from *its* clients, so the
   sidecar (the actual TLS originator) is what satisfies RDS, not RDS Proxy. This keeps all crypto out
