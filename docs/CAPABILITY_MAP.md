@@ -18,7 +18,8 @@ actually booted and hit the wall.
 |---|---|---|---|---|---|---|---|
 | 5a | **Ecto + Postgres, plaintext TCP** | yes | **DB: YES — raw Postgrex *and* standard eager Ecto Repo** | two walls, both packaging — **RESOLVED in the shipped build** | stale base-image artifacts (missing `elixir.app`; stale `tyn_boot.beam`) — now fixed by `build-rootfs.sh` | none kernel-side; base-image packaging fixes (landed) | **CONFIRMED — Postgrex on Nitro; eager Ecto on the shipped build path (cpio `d30fb612`)** |
 | 5b | **Ecto/Postgrex, TLS** (managed PG) | yes | **no — shim is symmetric-only (node survives)** | `:ssl.opt_signature_algs/3` `MatchError` — `:crypto.supports` returns `public_keys: []`, `curves: []` | Tyn's crypto shim implements only **symmetric** crypto (SHA/HMAC/AEAD/PBKDF2, for Phoenix cookies); it has **no asymmetric surface** (RSA/ECDSA/ECDHE/curves), which TLS requires — `:ssl` can't build a signature-alg set. (Cert/clock Wall 2 still further in, unreached.) | the full public-key crypto surface (≈ static OpenSSL) **or** a TLS-terminating sidecar; wall clock a further prereq for *in-guest* TLS | **CONFIRMED — local boot vs TLS-enabled PG** |
-| 2 | **Phoenix + file write** (temp files, uploads) | yes | **no — degrades gracefully (node survives)** | `System.tmp_dir/0` → `nil`, then every write path errors | read-only cpio VFS: `sys_open` ignores `O_CREAT` (→ `ENOENT`), `sys_write` else-arm (→ `EBADF`), `mkdir`/`unlink`/`rename` unhandled (→ `ENOSYS`) | writable filesystem (tmpfs) | **CONFIRMED — local boot** |
+| 2 | **Phoenix + file write** (temp files, uploads) | yes | **YES (scratch/temp files) — in-memory tmpfs at `/tmp` + `/dev/shm`; *large* HTTP uploads gated by a SEPARATE multipart wall (row 2b)** | *(was)* `System.tmp_dir/0` → `nil`, every write path errored | added `src/tmpfs.rs`: a `BTreeMap`-backed writable FS beside the read-only cpio VFS, routed by path (`/tmp`, `/dev/shm`) and by fd membership. `stat("/tmp")`→`S_IFDIR` unblocks `tmp_dir`. Syscalls: `open`(O_CREAT/EXCL/TRUNC/APPEND)`/write/pwrite/read/pread/lseek/ftruncate/fstat/stat/close/unlink/rename/mkdir/rmdir/getdents64/access`. Volatile; 4 MiB cap (of the 16 MiB heap) → `ENOSPC`; one coarse lock | — (shipped: `src/tmpfs.rs`) | **CONFIRMED (mechanism) — self-test all byte-exact (write/read/rename/mkdir/rm, 2 MiB file, 8× concurrent; over-cap→`ENOSPC`, node alive) + real `Plug.Upload` multipart byte-exact ≤256 KiB. ≥~1 MiB multipart → HTTP 400 in the Plug multipart parser, *before any tmpfs write* — a separate wall (2b), NOT tmpfs** |
+| 2b | **Large multipart upload** (≥~1 MiB) | yes | **no — HTTP 400 in the Plug multipart parser** | multipart part >~256 KiB → `Plug.Parsers` returns **400** (`dl=0`, no tmpfs write reached) | **discriminator verdict:** raw inbound body (`read_body`) is byte-exact to **3 MiB** (socket/HTTP-body path fine); tmpfs stores a **2 MiB** file + 8 concurrent writers byte-exact (tmpfs fine); only the **multipart parser** path fails >~256 KiB. Root cause unpinned — Plug/Bandit multipart chunked-part reader on Tyn, its own subsystem | pin the multipart chunk/boundary handling (own session) | **traced — not tmpfs, not the socket layer; isolated to the multipart path** |
 | 3 | NIF-bearing dep (bcrypt/argon2) | fails `load_nif` | no | `load_nif` → "Dynamic loading not supported" | static-musl beam, no dynamic loading; `tyn-pack` wires only the crypto shim, not user NIFs | per-user-NIF static-link packaging | prior-observed (exact error seen) |
 | 4 | Shells out (`System.cmd`, `os_mon`) | os_mon degraded; `cmd` fails | partial | `execve` → UNHANDLED/ENOSYS | no fork/exec; `erl_child_setup` can't spawn (see `inet_gethost`, below) | subprocess/exec | prior-observed |
 | 6 | **Distributed Erlang** (native clustering) | yes | **YES — after a one-line kernel fix (missing `getrusage`)** | *(was)* `dist_util:gen_challenge/0` calls `erlang:statistics(runtime)` → `getrusage(RUSAGE_SELF)` → Tyn returned `ENOSYS` → ERTS treats getrusage failure as **fatal** (`erts_exit`) → node **exits** mid-handshake | Tyn was **missing the `getrusage(2)` syscall (nr 98)**. Not a deadlock, not the clock, not `dist_ctrl` — a missing syscall that ERTS aborts on. Added a zeroed-`rusage` stub → `statistics(runtime)` returns, `gen_challenge` completes | — (fixed: `getrusage` stub). *Adjacent bug: `erlang:md5` intermittently non-deterministic on large binaries* | **CONFIRMED — 2× Nitro `t3.small`: `connect_node`→`true` both ways, rpc both ways, msg round-trip, 6+ tick-cycle liveness, `nodedown` on kill, 1 MB term byte-exact (`=:=`)** |
@@ -175,51 +176,77 @@ build, plus the wall clock (`docs/WALL_CLOCK.md`). That is a genuine, sizeable i
 (sidecar) remains the near-term answer**, and Path A is justified only when in-guest crypto breadth
 (TLS *and* bcrypt/argon2-style NIF deps, row 3) is worth an OpenSSL integration on its own.
 
-## Probe 2 — file write, in detail (CONFIRMED on a local boot)
+## Probe 2 — file write, in detail (RESOLVED — in-memory tmpfs shipped)
 
-Artifact: kernel = shipped valve `1cac02f` (`tyn-kernel-fix2`), cpio = a minimal app whose only
-job is to attempt filesystem writes several ways and report the raw result. FS behavior is pure kernel
-VFS (the read-only cpio) — identical local vs Nitro — so a local QEMU boot is a faithful confirmation;
-no Nitro run is needed for this row. Serial output (`node_alive` is `Process.alive?` at the end):
+**Before (read-only cpio VFS).** A minimal app that attempted writes several ways reported every path
+failing, and — the load-bearing find — the *first* wall was `System.tmp_dir/0` returning `nil`, not any
+individual write: Elixir probes `$TMPDIR`/`$TEMP`/`$TMP`/`/tmp` for a *writable* directory, finds none,
+and gives up before any `open`. `Plug.Upload` (which calls `System.tmp_dir`) therefore had no
+destination at all. Every failure was a catchable `{:error, _}` (node survived), but nothing could
+write: `O_CREAT` ignored → `ENOENT`; write to a cpio file opened "for write" → `EBADF`;
+`mkdir`/`rename`/`unlink`/`ftruncate` unhandled → `ENOSYS`.
+
+**Fix: `src/tmpfs.rs`** — a small, volatile, in-memory filesystem mounted at `/tmp` and `/dev/shm`,
+living *beside* the read-only cpio VFS. A single `BTreeMap<path, Node>` under one coarse
+`spin::Mutex` (correct-and-coarse; see `docs/FUTEX_HISTORY.md` for why we distrust clever locking
+here). fds come from a private base (`4000+`) and route by *membership*, never a range check — the
+discipline `vfs.rs` uses. The syscall layer routes `/tmp`+`/dev/shm` paths (and tmpfs fds) into it:
+`open`(O_CREAT/EXCL/TRUNC/APPEND) `read`/`pread` `write`/`pwrite` (partial-write-honest — never
+discards already-written bytes) `lseek` `ftruncate` `fstat`/`stat`/`newfstatat` `close` `unlink`
+`rename` `mkdir` `rmdir` `getdents64` `access`. The keystone is `stat("/tmp") → S_IFDIR`: that alone
+makes `System.tmp_dir/0` resolve to `"/tmp"`.
+
+**Bounds (deliberate scope).** Volatile (empty every boot, no persistence); `/` is *not* writable; a
+4 MiB total cap (`CAP`, carved from the 16 MiB kernel heap shared with sockets/scheduler) → an
+over-cap write returns `ENOSPC` (partial count first, then `-ENOSPC` when nothing more fits) and
+**never** panics or OOMs the shared heap. No hardlinks/symlinks/xattrs/perm-enforcement (mode bits are
+stored and reported but not checked) — added only if a target app needs them.
+
+**After — boot self-test, every line byte-exact (`==`, not the flaky `erlang:md5`):**
 
 ```
-PB tmp_dir: nil
-PB File.write /tmp/pb.txt:                {:error, :enoent}
-PB File.open /tmp/pb.txt [:write]:        {:error, :enoent}
-PB raw open+write /tmp/upload.tmp:        {:error, :enoent}     % Plug.Upload's write path
-PB File.mkdir /tmp/pbdir:                 {:error, :enosys}
-PB raw open+write existing ./boot.config: {:opened_then_write, {:error, :ebadf}}  % open OK, write fails
-PB File.rename:                           {:error, :enosys}
-PB File.rm /tmp/pb.txt:                   {:error, :enosys}
-PB_END node_alive=true
+[tmpfs] mounted /tmp and /dev/shm (cap 4096 KiB)
+PB tmp_dir: "/tmp"                    % first wall gone
+PB ls_empty_at_boot: []              % volatile
+PB write_read_exact: true            % small write→read
+PB large_file_exact: {true, 2097152} % 2 MiB, content + size
+PB rename_pattern: {true, true}      % write temp → rename → read exact, source gone (upload pattern)
+PB mkdir_ls: ["f.txt"]                % mkdir + write into subdir + ls
+PB rm_gone: false                    % File.exists? == false after rm
+PB concurrent_hash: "8/8"            % 8 concurrent distinct hash-checked writes
+PB enospc_clean: {:error, :enospc}   % 6 MiB write > 4 MiB cap → ENOSPC
+PB node_alive_after_enospc: true     % node survives the ENOSPC
 ```
 
-**The BEAM-side errno returns are one-to-one with the read-only VFS (source-verified in `src/syscall.rs`):**
+**After — real `Plug.Upload` multipart over HTTP** (Bandit + `Plug.Parsers` multipart → the parser
+writes each part to a temp file `Plug.Upload.random_file!/1` creates in `System.tmp_dir`; the handler
+reads it back and returns its `sha256`, compared client-side):
 
-| Operation | Kernel path | Returns | BEAM sees |
-|---|---|---|---|
-| Create a new file (`O_CREAT` ignored) | `sys_open` flags ignored → lookup miss | `-2 ENOENT` | `{:error, :enoent}` |
-| Write to an existing cpio file opened "for write" | `vfs::open` hands back a **read** fd; `sys_write` else-arm | `-9 EBADF` | open succeeds, then `{:error, :ebadf}` |
-| `mkdir` / `rename` / `unlink` / `ftruncate` | no dispatch arm → `UNHANDLED` | `-38 ENOSYS` | `{:error, :enosys}` |
+```
+UPLOAD small  4 KiB     BYTE_EXACT=YES
+UPLOAD conc1..6 128 KiB BYTE_EXACT=YES   % 6 concurrent
+UPLOAD 256 KiB          BYTE_EXACT=YES
+UPLOAD ≥1 MiB           HTTP 400          % ← the wall a real large upload hits (row 2b)
+```
 
-Two things the source read alone would have missed:
+**The honest boundary (why this is *two* rows).** The mechanism is done, but a *real large upload*
+hits a wall the syscall self-test does not: multipart parts ≥~1 MiB return **HTTP 400** from
+`Plug.Parsers`, *before any tmpfs write*. A three-way discriminator localizes it and clears tmpfs:
 
-- **The first wall is `System.tmp_dir/0` returning `nil`, not the write itself.** Elixir probes
-  `$TMPDIR`/`$TEMP`/`$TMP`/`/tmp` for a *writable* directory, finds none, and returns `nil`. So a real
-  upload/temp-file library hits the wall at **tmp-dir resolution**, before any `open`: `Plug.Upload`
-  calls `System.tmp_dir` and has no destination, and `System.tmp_dir!/0` *raises* `RuntimeError`. The
-  missing primitive is a writable path that tmp-dir probing accepts.
-- **The wall degrades; it does not crash the node.** `node_alive=true` — every failure is a catchable
-  `{:error, _}` tuple, so an app faults only in whatever process attempted the write (its own
-  supervision decides what happens). This is materially different from Wall B's `inet_gethost`, which
-  takes the whole node down (`exit_group(1)`). *A file-write wall is survivable; a native-resolver
-  wall is fatal.* (Aside: `mremap` (nr 25) is also unhandled → `ENOSYS`; ERTS normally tolerates it,
-  but it triggered one transient `{load_failed,[erl_lint]}` boot abort under TCG before a clean retry —
-  a latent sharp edge, not part of the FS story.)
+| Path (1–3 MiB) | Touches tmpfs? | Result |
+|---|---|---|
+| raw inbound body (`read_body`, `application/octet-stream`) | no | **HTTP 200, sha256 byte-exact to 3 MiB** — socket/HTTP-body path is fine |
+| direct `File.write!` of a 2 MiB file (self-test) | yes | **byte-exact** — tmpfs stores multi-MiB files fine |
+| **multipart** (Plug parser → tmpfs temp file) | yes | **256 KiB OK; ≥1 MiB → HTTP 400** |
 
-*Missing primitive: a small writable tmpfs mounted at `/tmp` (plus `mkdir`/`unlink`/`rename`/
-`ftruncate` syscalls and a create path in `sys_open`/`sys_write`). Scope is bounded — enough for
-`System.tmp_dir` to resolve and for temp-file/upload writes to land.*
+So the large-upload wall is **neither the socket layer nor tmpfs's storage** — it is isolated to the
+**Plug/Bandit multipart parser path** (chunked-part reading / boundary handling across reads). Root
+cause unpinned; it is its own subsystem and its own session (row 2b). tmpfs stands CONFIRMED for
+scratch/temp files and small uploads; the large end-to-end upload user-story is **not** yet closed.
+
+*Regression fixture: `tests/tmpfs/` (self-test app + upload router + driver + expected output). The
+`ENOSPC` cap (4 MiB) is a one-line constant; a larger cap trades kernel-heap headroom, and truly
+large/persistent files want a real block+FS backend, out of this scope.*
 
 ## Probe 6 — Distributed Erlang, in detail (CONFIRMED on 2× Nitro + a native OTP peer)
 
@@ -378,10 +405,12 @@ they unblock:
    kernel work**; **Path A** (static-OpenSSL-class crypto) is a sizeable investment and **must be
    sequenced with the wall-clock (kvmclock/RTC) work** or it fails cert dates. Clock is a *named*
    prerequisite (`docs/WALL_CLOCK.md`).
-3. **Writable tmpfs** — breadth (any disk touch), independent of the DB story. **Probe B (row 2) is
-   now boot-confirmed:** the wall is graceful (`{:error, _}`, node survives) and surfaces first at
-   `System.tmp_dir/0 → nil`. A small writable `/tmp` (create path in `sys_open`/`sys_write` +
-   `mkdir`/`unlink`/`rename`) unblocks temp files and uploads without a full disk stack.
+3. **Writable tmpfs** — breadth (any disk touch), independent of the DB story. **RESOLVED (row 2).**
+   Shipped `src/tmpfs.rs`: a small volatile in-memory FS at `/tmp` + `/dev/shm` behind the read-only
+   cpio VFS. `stat("/tmp")→S_IFDIR` makes `System.tmp_dir/0` resolve to `"/tmp"`; the create/write/
+   read/rename/mkdir/unlink/getdents syscalls back temp files and uploads. Boot-confirmed byte-exact
+   (incl. a real `Plug.Upload` multipart round-trip) with an `ENOSPC` ceiling that never crashes the
+   node. No full disk stack needed.
 
 The one-sentence version: **stateful DB-backed apps are reachable on Tyn today — raw Postgrex over
 plaintext TCP is Nitro-confirmed, and the *standard eager Ecto Repo* now works on the committed build
@@ -389,8 +418,9 @@ path (`elixir.app` + from-source `tyn_boot.beam` via `build-rootfs.sh`, `[[42]]`
 remaining walls are all boot-confirmed and specific — TLS-to-DB works symmetrically but lacks the
 *asymmetric* half of `:crypto` (`public_keys`/`curves` empty → `:ssl.opt_signature_algs` fails), still
 upstream of the epoch-clock cert wall, and is unblockable now via a TLS sidecar or later via
-static-OpenSSL-plus-clock; and a file-write wall degrades gracefully, surfacing first at
-`System.tmp_dir/0 → nil` — none of it is the database plumbing or the ORM.**
+static-OpenSSL-plus-clock; and file writes/uploads now work on a shipped in-memory tmpfs at `/tmp`
+(`System.tmp_dir/0 → "/tmp"`, real `Plug.Upload` multipart byte-exact) — none of it is the database
+plumbing or the ORM.**
 
 ---
 
@@ -409,8 +439,9 @@ so row 5a is unaffected). **TLS is now a permanent fixture on the standing DB** 
 both plaintext (5a) and TLS (5b) probes need it, so it stays on. Reaching row 5b's real wall required
 fixing a `tyn-pack` bug (shim path resolved from CWD, not the script), which had let stock crypto
 shadow the shim; with the shim applied, `:crypto` loads symmetrically and the wall is the missing
-asymmetric surface (`:ssl.opt_signature_algs`). Probe 2 (file write) is boot-confirmed on a local boot (FS behavior is pure kernel VFS,
-identical local vs Nitro). Probe 6 (distributed Erlang) is boot-confirmed on 2× Nitro t3.small + a
+asymmetric surface (`:ssl.opt_signature_algs`). Probe 2 (file write) is **RESOLVED** — `src/tmpfs.rs` (in-memory `/tmp`) is boot-confirmed
+byte-exact incl. a real `Plug.Upload` multipart round-trip; tmpfs is pure in-kernel memory (no
+hardware/timing coupling), so a QEMU/TCG boot is a faithful confirmation, identical on Nitro. Probe 6 (distributed Erlang) is boot-confirmed on 2× Nitro t3.small + a
 native OTP peer (now terminated; AMI/snapshot/S3 cleaned up) — it **corrected** the earlier
 source-predicted "dist modules absent" guess. Rows 3/4 remain prior-observed. DB target + toolchain
 remain standing on the build host for the follow-on probes.*

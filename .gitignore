@@ -18,6 +18,7 @@ tests/*
 !tests/liveview_check.py
 !tests/setup-test-app.sh
 !tests/README.md
+!tests/tmpfs/
 CONTEXT.md
 REVIEW.md
 .DS_Store

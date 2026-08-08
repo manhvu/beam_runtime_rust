@@ -233,6 +233,9 @@ extern "C" fn main(mbi: *const u8) -> ! {
     // (Module and embedded cpio are byte-identical in production, so only the
     // sentinel distinguishes them during the 1b provenance test.)
     tyn_kernel::vfs::init();
+    // Mount the volatile in-memory tmpfs at /tmp and /dev/shm. The heap
+    // allocator is already live (init_static above), which tmpfs requires.
+    tyn_kernel::tmpfs::init();
     if tyn_kernel::vfs::exists(b"TYN_MODULE_SENTINEL") {
         serial_println!("[vfs] source=MODULE (sentinel present)");
     } else {

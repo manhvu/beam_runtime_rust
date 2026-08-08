@@ -447,13 +447,14 @@ fn syscall_dispatch_inner(
         SYS_SCHED_GETAFFINITY => sys_sched_getaffinity(a1 as usize, a2 as *mut u8),
         SYS_CLOCK_GETRES => sys_clock_getres(a1 as *mut u64),
         SYS_PRLIMIT64 => sys_prlimit64(a2 as *const u8, a3 as *mut u8),
-        SYS_OPEN | SYS_OPENAT => sys_open(a0, a1, nr),
+        SYS_OPEN | SYS_OPENAT => sys_open(a0, a1, a2, a3, nr),
         SYS_CLOSE => {
             let fd = a0 as i32;
             // Drop any epoll registrations BEFORE closing the fd so
             // any concurrent epoll_wait can't observe an entry whose
             // socket has been torn down.
             epoll_drop_fd(fd);
+            crate::tmpfs::close(fd);
             crate::vfs::close(fd);
             crate::vfs::close_dir(fd);
             crate::pipe::close(fd);
@@ -466,14 +467,38 @@ fn syscall_dispatch_inner(
         SYS_NEWFSTATAT => sys_newfstatat(
             a0 as i32, a1 as *const u8, a2 as *mut u8, a3 as i32),
         SYS_LSEEK => {
-            if crate::vfs::is_vfs_fd(a0 as i32) {
+            if crate::tmpfs::is_tmpfs_fd(a0 as i32) {
+                crate::tmpfs::lseek(a0 as i32, a1 as i64, a2 as i32)
+            } else if crate::vfs::is_vfs_fd(a0 as i32) {
                 crate::vfs::lseek(a0 as i32, a1 as i64, a2 as i32)
             } else {
                 0
             }
         }
         SYS_FCNTL => sys_fcntl(a0 as i32, a1 as i32, a2),
-        SYS_ACCESS => -2, // -ENOENT
+        SYS_ACCESS => {
+            // access(path, mode). Only tmpfs paths can exist-and-be-writable
+            // here; everything else keeps the historical ENOENT.
+            let mut pb = [0u8; 256];
+            let n = unsafe { copy_path(a0 as *const u8, &mut pb) };
+            let path = &pb[..n];
+            if crate::tmpfs::owns_path(path) {
+                crate::tmpfs::access(path)
+            } else {
+                -2 // -ENOENT
+            }
+        }
+        269 => {
+            // faccessat(dirfd, path, mode, flags) — ignore dirfd (absolute paths).
+            let mut pb = [0u8; 256];
+            let n = unsafe { copy_path(a1 as *const u8, &mut pb) };
+            let path = &pb[..n];
+            if crate::tmpfs::owns_path(path) {
+                crate::tmpfs::access(path)
+            } else {
+                -2 // -ENOENT
+            }
+        }
         SYS_READLINK => sys_readlink(a0 as *const u8, a1 as *mut u8, a2 as usize),
         267 => sys_readlink(a1 as *const u8, a2 as *mut u8, a3 as usize), // readlinkat (ignore dirfd)
         SYS_GETDENTS64 => sys_getdents64(a0 as i32, a1 as *mut u8, a2 as usize),
@@ -490,11 +515,21 @@ fn syscall_dispatch_inner(
         SYS_SIGALTSTACK => 0,
         SYS_IOCTL => -25, // -ENOTTY
         SYS_PREAD64 => {
-            if crate::vfs::is_vfs_fd(a0 as i32) {
+            if crate::tmpfs::is_tmpfs_fd(a0 as i32) {
+                unsafe { crate::tmpfs::pread(a0 as i32, a1 as *mut u8, a2 as usize, a3 as usize) }
+            } else if crate::vfs::is_vfs_fd(a0 as i32) {
                 // pread64(fd, buf, count, offset) — atomic seek+read
                 crate::vfs::pread(a0 as i32, a1 as *mut u8, a2 as usize, a3 as usize)
             } else {
                 0
+            }
+        }
+        18 => {
+            // pwrite64(fd, buf, count, offset) — only tmpfs fds are writable here.
+            if crate::tmpfs::is_tmpfs_fd(a0 as i32) {
+                unsafe { crate::tmpfs::pwrite(a0 as i32, a1 as *const u8, a2 as usize, a3 as usize) }
+            } else {
+                -9 // -EBADF
             }
         }
         SYS_CLOCK_GETTIME => sys_clock_gettime(a0 as i32, a1 as *mut u64),
@@ -688,6 +723,117 @@ fn syscall_dispatch_inner(
         52 => crate::net::socket::sys_getpeername(a0 as i32, a1 as *mut u8, a2 as *mut u32),
         54 => crate::net::socket::sys_setsockopt(a0 as i32, a1 as i32, a2 as i32, a3 as *const u8, _a4 as u32),
         55 => crate::net::socket::sys_getsockopt(a0 as i32, a1 as i32, a2 as i32, a3 as *mut u8, _a4 as *mut u32),
+        // ---- tmpfs writable-FS path/fd operations ----
+        76 => {
+            // truncate(path, length)
+            let mut pb = [0u8; 256];
+            let n = unsafe { copy_path(a0 as *const u8, &mut pb) };
+            let path = &pb[..n];
+            if crate::tmpfs::owns_path(path) {
+                crate::tmpfs::truncate(path, a1 as usize)
+            } else {
+                -13 // -EACCES (read-only cpio)
+            }
+        }
+        77 => crate::tmpfs::ftruncate(a0 as i32, a1 as usize), // returns EBADF if not tmpfs
+        82 => {
+            // rename(oldpath, newpath)
+            let mut ob = [0u8; 256];
+            let ol = unsafe { copy_path(a0 as *const u8, &mut ob) };
+            let mut nb = [0u8; 256];
+            let nl = unsafe { copy_path(a1 as *const u8, &mut nb) };
+            let (old, new) = (&ob[..ol], &nb[..nl]);
+            if crate::tmpfs::owns_path(old) && crate::tmpfs::owns_path(new) {
+                crate::tmpfs::rename(old, new)
+            } else {
+                -18 // -EXDEV (cross-device: tmpfs <-> read-only cpio not supported)
+            }
+        }
+        264 => {
+            // renameat(olddirfd, oldpath, newdirfd, newpath) — ignore dirfds.
+            let mut ob = [0u8; 256];
+            let ol = unsafe { copy_path(a1 as *const u8, &mut ob) };
+            let mut nb = [0u8; 256];
+            let nl = unsafe { copy_path(a3 as *const u8, &mut nb) };
+            let (old, new) = (&ob[..ol], &nb[..nl]);
+            if crate::tmpfs::owns_path(old) && crate::tmpfs::owns_path(new) {
+                crate::tmpfs::rename(old, new)
+            } else {
+                -18 // -EXDEV
+            }
+        }
+        316 => {
+            // renameat2(olddirfd, oldpath, newdirfd, newpath, flags) — flags ignored.
+            let mut ob = [0u8; 256];
+            let ol = unsafe { copy_path(a1 as *const u8, &mut ob) };
+            let mut nb = [0u8; 256];
+            let nl = unsafe { copy_path(a3 as *const u8, &mut nb) };
+            let (old, new) = (&ob[..ol], &nb[..nl]);
+            if crate::tmpfs::owns_path(old) && crate::tmpfs::owns_path(new) {
+                crate::tmpfs::rename(old, new)
+            } else {
+                -18 // -EXDEV
+            }
+        }
+        83 => {
+            // mkdir(path, mode)
+            let mut pb = [0u8; 256];
+            let n = unsafe { copy_path(a0 as *const u8, &mut pb) };
+            let path = &pb[..n];
+            if crate::tmpfs::owns_path(path) {
+                crate::tmpfs::mkdir(path, a1)
+            } else {
+                -13 // -EACCES
+            }
+        }
+        258 => {
+            // mkdirat(dirfd, path, mode) — ignore dirfd (absolute paths).
+            let mut pb = [0u8; 256];
+            let n = unsafe { copy_path(a1 as *const u8, &mut pb) };
+            let path = &pb[..n];
+            if crate::tmpfs::owns_path(path) {
+                crate::tmpfs::mkdir(path, a2)
+            } else {
+                -13 // -EACCES
+            }
+        }
+        84 => {
+            // rmdir(path)
+            let mut pb = [0u8; 256];
+            let n = unsafe { copy_path(a0 as *const u8, &mut pb) };
+            let path = &pb[..n];
+            if crate::tmpfs::owns_path(path) {
+                crate::tmpfs::rmdir(path)
+            } else {
+                -13 // -EACCES
+            }
+        }
+        87 => {
+            // unlink(path)
+            let mut pb = [0u8; 256];
+            let n = unsafe { copy_path(a0 as *const u8, &mut pb) };
+            let path = &pb[..n];
+            if crate::tmpfs::owns_path(path) {
+                crate::tmpfs::unlink(path)
+            } else {
+                -13 // -EACCES (read-only cpio)
+            }
+        }
+        263 => {
+            // unlinkat(dirfd, path, flags). AT_REMOVEDIR (0x200) => rmdir.
+            let mut pb = [0u8; 256];
+            let n = unsafe { copy_path(a1 as *const u8, &mut pb) };
+            let path = &pb[..n];
+            if crate::tmpfs::owns_path(path) {
+                if a2 & 0x200 != 0 {
+                    crate::tmpfs::rmdir(path)
+                } else {
+                    crate::tmpfs::unlink(path)
+                }
+            } else {
+                -13 // -EACCES
+            }
+        }
         _ => {
             serial_println!("[syscall] UNHANDLED nr={}", nr);
             -38 // -ENOSYS
@@ -698,6 +844,10 @@ fn syscall_dispatch_inner(
 // ---------- Implementations ----------
 
 fn sys_write(fd: i32, buf: *const u8, count: usize) -> i64 {
+    if crate::tmpfs::is_tmpfs_fd(fd) {
+        // SAFETY: buf points to `count` bytes of identity-mapped user memory.
+        return unsafe { crate::tmpfs::write(fd, buf, count) };
+    }
     if fd == 1 || fd == 2 {
         for i in 0..count {
             // SAFETY: buf is in identity-mapped user memory.
@@ -788,6 +938,10 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> i64 {
     // stdin: read from COM1 serial port
     if fd == 0 {
         return sys_read_stdin(buf, count);
+    }
+    if crate::tmpfs::is_tmpfs_fd(fd) {
+        // SAFETY: buf points to `count` bytes of identity-mapped user memory.
+        return unsafe { crate::tmpfs::read(fd, buf, count) };
     }
     if crate::vfs::is_vfs_fd(fd) {
         return crate::vfs::read(fd, buf, count);
@@ -1195,10 +1349,30 @@ const FD_RESOLV_CONF: i64 = 104; // synthetic /tyn/resolv.conf from DHCP nameser
 static RESOLV: spin::Mutex<(alloc::vec::Vec<u8>, usize)> =
     spin::Mutex::new((alloc::vec::Vec::new(), 0));
 
-fn sys_open(a0: u64, a1: u64, nr: u64) -> i64 {
-    // For SYS_OPENAT, the filename is in a1 (a0 is dirfd).
-    // For SYS_OPEN, the filename is in a0.
-    let path_ptr = if nr == SYS_OPENAT { a1 } else { a0 } as *const u8;
+/// Copy a NUL-terminated user path into `buf`, returning its length (capped at
+/// 255). Shared by the tmpfs path-based syscall arms (unlink/rename/mkdir/...).
+///
+/// # Safety
+/// `ptr` must point to a NUL-terminated string in identity-mapped user memory.
+unsafe fn copy_path(ptr: *const u8, buf: &mut [u8; 256]) -> usize {
+    let mut len = 0;
+    while len < 255 {
+        let b = *ptr.add(len);
+        if b == 0 { break; }
+        buf[len] = b;
+        len += 1;
+    }
+    len
+}
+
+fn sys_open(a0: u64, a1: u64, a2: u64, a3: u64, nr: u64) -> i64 {
+    // For SYS_OPENAT(dirfd, path, flags, mode), path=a1 flags=a2 mode=a3.
+    // For SYS_OPEN(path, flags, mode),           path=a0 flags=a1 mode=a2.
+    let (path_ptr, flags, mode) = if nr == SYS_OPENAT {
+        (a1 as *const u8, a2, a3)
+    } else {
+        (a0 as *const u8, a1, a2)
+    };
 
     // Read path as a byte slice (up to 256 bytes).
     let mut path_buf = [0u8; 256];
@@ -1260,6 +1434,13 @@ fn sys_open(a0: u64, a1: u64, nr: u64) -> i64 {
         return FD_SYNTH_DIR;
     }
 
+    // tmpfs owns /tmp and /dev/shm entirely (never in the cpio). Route every
+    // open of those paths — including O_CREAT of new files — to the writable
+    // in-memory FS. This is what backs System.tmp_dir writes and Plug.Upload.
+    if crate::tmpfs::owns_path(path) {
+        return crate::tmpfs::open(path, flags, mode);
+    }
+
     // Try the VFS (cpio archive)
     let vfs_fd = crate::vfs::open(path);
     if vfs_fd >= 0 {
@@ -1301,6 +1482,10 @@ fn sys_getdents64(fd: i32, buf: *mut u8, count: usize) -> i64 {
         let _ = (buf, count);
         return 0;
     }
+    if crate::tmpfs::is_tmpfs_fd(fd) {
+        // SAFETY: buf points to `count` writable bytes of user memory.
+        return unsafe { crate::tmpfs::getdents64(fd, buf, count) };
+    }
     crate::vfs::getdents64(fd, buf, count)
 }
 
@@ -1317,6 +1502,13 @@ fn sys_stat(path_ptr: *const u8, buf: *mut u8) -> i64 {
         }
     }
     let path = &path_buf[..path_len];
+
+    // tmpfs owns /tmp and /dev/shm. This is the first wall for System.tmp_dir:
+    // Elixir stats "/tmp" and only writes there if it stats as a directory.
+    if crate::tmpfs::owns_path(path) {
+        // SAFETY: buf is null or a 144-byte struct stat; tmpfs::stat zeroes it.
+        return unsafe { crate::tmpfs::stat(path, buf) };
+    }
 
     // Check if it's a VFS path (directory or file)
     if !buf.is_null() {
@@ -1386,6 +1578,10 @@ fn sys_stat(path_ptr: *const u8, buf: *mut u8) -> i64 {
 }
 
 fn sys_fstat(fd: i32, buf: *mut u8) -> i64 {
+    if crate::tmpfs::is_tmpfs_fd(fd) {
+        // SAFETY: buf is null or a 144-byte struct stat; tmpfs::fstat zeroes it.
+        return unsafe { crate::tmpfs::fstat(fd, buf) };
+    }
     if !buf.is_null() {
         // SAFETY: buf points to user struct stat (144 bytes on x86_64).
         unsafe {
