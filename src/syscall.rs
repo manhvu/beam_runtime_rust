@@ -535,18 +535,29 @@ fn syscall_dispatch_inner(
             0
         }
         98 => { // getrusage(who, struct rusage *usage)
-            // Tyn has no per-process CPU accounting, but ERTS treats a non-zero
-            // getrusage return as FATAL: erts_runtime_elapsed_both() does
+            // ⚠️ APPROXIMATE STUB — Tyn has no per-process CPU accounting. ERTS treats
+            // a non-zero getrusage return as FATAL: erts_runtime_elapsed_both() does
             //   if (getrusage(RUSAGE_SELF, &now) != 0) erts_exit(ABORT, ...)
-            // so returning -ENOSYS made `erlang:statistics(runtime)` abort the
-            // whole node (exit_group). Distributed Erlang's dist_util:gen_challenge/0
-            // calls statistics(runtime) on the acceptor's handshake path, so two
-            // nodes could never cluster — the node died mid-handshake. Return 0
-            // with a zeroed `struct rusage` (144 bytes on x86_64); ERTS reads only
-            // ru_utime/ru_stime, and 0 CPU time is harmless (statistics(runtime) is
-            // just an entropy input to the challenge). See directions/WALLCLOCK_*.md.
+            // and `erlang:statistics(runtime)` sits on distributed Erlang's handshake
+            // path (dist_util:gen_challenge/0), so returning -ENOSYS crashed the node
+            // mid-handshake (exit_group) and two nodes could never cluster.
+            //
+            // We return 0 with a best-effort `struct rusage` (144 bytes on x86_64:
+            // ru_utime{tv_sec,tv_usec} at off 0, ru_stime at off 16, then longs).
+            // ru_utime is set to the monotonic uptime: a COARSE but monotonically
+            // ADVANCING CPU-time proxy. A hard {0,0} would make statistics(runtime)
+            // report a constant zero delta — a lie ERTS/observer/load code may
+            // believe; an advancing counter is safer. Trade-off: this OVERSTATES CPU
+            // time (reports ~100% busy since uptime==cputime here). If you are here
+            // debugging "why is reported CPU time ~= uptime / always 100%", THIS stub
+            // is why — real accounting needs per-thread CPU time from the scheduler.
             if a1 != 0 {
-                unsafe { core::ptr::write_bytes(a1 as *mut u8, 0, 144); }
+                let ns = monotonic_ns();
+                unsafe {
+                    core::ptr::write_bytes(a1 as *mut u8, 0, 144);
+                    *(a1 as *mut u64) = ns / 1_000_000_000;            // ru_utime.tv_sec
+                    *((a1 + 8) as *mut u64) = (ns / 1000) % 1_000_000; // ru_utime.tv_usec
+                }
             }
             0
         }

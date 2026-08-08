@@ -21,7 +21,7 @@ actually booted and hit the wall.
 | 2 | **Phoenix + file write** (temp files, uploads) | yes | **no — degrades gracefully (node survives)** | `System.tmp_dir/0` → `nil`, then every write path errors | read-only cpio VFS: `sys_open` ignores `O_CREAT` (→ `ENOENT`), `sys_write` else-arm (→ `EBADF`), `mkdir`/`unlink`/`rename` unhandled (→ `ENOSYS`) | writable filesystem (tmpfs) | **CONFIRMED — local boot** |
 | 3 | NIF-bearing dep (bcrypt/argon2) | fails `load_nif` | no | `load_nif` → "Dynamic loading not supported" | static-musl beam, no dynamic loading; `tyn-pack` wires only the crypto shim, not user NIFs | per-user-NIF static-link packaging | prior-observed (exact error seen) |
 | 4 | Shells out (`System.cmd`, `os_mon`) | os_mon degraded; `cmd` fails | partial | `execve` → UNHANDLED/ENOSYS | no fork/exec; `erl_child_setup` can't spawn (see `inet_gethost`, below) | subprocess/exec | prior-observed |
-| 6 | **Distributed Erlang** (native clustering) | yes | **YES — after a one-line kernel fix (missing `getrusage`)** | *(was)* `dist_util:gen_challenge/0` calls `erlang:statistics(runtime)` → `getrusage(RUSAGE_SELF)` → Tyn returned `ENOSYS` → ERTS treats getrusage failure as **fatal** (`erts_exit`) → node **exits** mid-handshake | Tyn was **missing the `getrusage(2)` syscall (nr 98)**. Not a deadlock, not the clock, not `dist_ctrl` — a missing syscall that ERTS aborts on. Added a zeroed-`rusage` stub → `statistics(runtime)` returns, `gen_challenge` completes | — (fixed: `getrusage` stub in `sys_syscall`) | **CONFIRMED — handshake completes end-to-end, nodes cluster (`connect_node`→`true`), traffic flows, node survives; single-node tap + native OTP peer** |
+| 6 | **Distributed Erlang** (native clustering) | yes | **YES — after a one-line kernel fix (missing `getrusage`)** | *(was)* `dist_util:gen_challenge/0` calls `erlang:statistics(runtime)` → `getrusage(RUSAGE_SELF)` → Tyn returned `ENOSYS` → ERTS treats getrusage failure as **fatal** (`erts_exit`) → node **exits** mid-handshake | Tyn was **missing the `getrusage(2)` syscall (nr 98)**. Not a deadlock, not the clock, not `dist_ctrl` — a missing syscall that ERTS aborts on. Added a zeroed-`rusage` stub → `statistics(runtime)` returns, `gen_challenge` completes | — (fixed: `getrusage` stub). *Adjacent bug: `erlang:md5` intermittently non-deterministic on large binaries* | **CONFIRMED — 2× Nitro `t3.small`: `connect_node`→`true` both ways, rpc both ways, msg round-trip, 6+ tick-cycle liveness, `nodedown` on kill, 1 MB term byte-exact (`=:=`)** |
 | 1 | Plain Plug (no Phoenix) | yes | yes | — (floor) | — | — | follows from working Phoenix demo |
 
 ---
@@ -336,17 +336,24 @@ the dist port for real isolation. `application:set_env(kernel, epmd_module, tyn_
 `net_kernel:start/2` (or a `-kernel` arg). With the `getrusage` fix this recipe now takes a node all the
 way through the handshake — it was never the config that blocked, and the one kernel gap is closed.
 
-**Verdict for positioning: BUILDABLE — native clustering works after a one-line kernel fix.** With the
-`getrusage` stub, a native OTP node and a Tyn node complete the *full* Erlang distribution handshake
-(`send_name` → `status` → `challenge` → `reply` → `ack`), the `dist_ctrl` controller takes over, term
-traffic flows both directions, `connect_node` → `true` (96 ms), and the node stays healthy — the exact
-back-half (challenge-reply/ack + controller takeover) that earlier looked "unexercised" now runs. The
-missing primitive was a single syscall, not a subsystem. **One honest caveat before the pitch is
-"shipped":** this is confirmed on a *single Tyn node* + a native-OTP peer over hostfwd; the last
-validation is **two Tyn nodes on Nitro** — `connect_node` both directions, `rpc:call`, a ~1 MB term
-hash-checked, and liveness across several `net_ticktime` cycles with `nodedown` on kill. That plus
-moving the cookie from the kernel `-setcookie` scaffolding to `boot.config` (per-image) is what turns
-"buildable, proven at the handshake" into "shippable native mesh."
+**Verdict for positioning: CONFIRMED — two Tyn nodes cluster natively over real ENA.** With the
+`getrusage` stub, **two `t3.small` Tyn instances on Nitro** were driven end-to-end:
+`net_kernel:connect_node` → `true` with `nodes()` = the peer on **both** sides; `rpc:call` **both
+directions**; a registered-process message round-trip; **liveness across 6+ `net_ticktime` cycles**
+(ticktime set to 8 s, still connected after 50 s); **`nodedown` detected** on kill (`nodes()` → `[]`);
+and a **~1 MB term transferred byte-exact** (verified with `=:=`, size 1048580). The whole native-mesh
+claim — handshake, interconnect, heartbeat, disconnect — holds on the real target. The missing
+primitive was a single syscall, not a subsystem.
+
+*Adjacent bug found while validating (separate from dist):* the large-term check first "failed" because
+**`erlang:md5` is intermittently non-deterministic for large binaries** on Tyn (~256 KB+) — the same
+1 MB binary md5-hashed twice on one node gives different answers, flaky by size (300 KB unstable,
+600 KB/1 MB sometimes stable). That is a race in the md5 BIF's yield/trap continuation, **not** a dist
+problem (the `=:=` byte comparison proved the transfer exact). It affects any large-binary `erlang:md5`
+caller and deserves its own fix — filed as a note here. Remaining for "shipped mesh": move the cookie
+from the kernel `-setcookie` scaffolding to `boot.config` (per-image). *(Two `t3.small` in-VPC + the
+AMI/snapshot/S3 were torn down after; the intermittent bad-boot transient recurred on a couple of node
+launches and cleared on relaunch.)*
 
 ## Synthesis — what to build next
 

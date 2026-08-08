@@ -129,17 +129,29 @@ read had stopped too early — but the resolution was not deeper in ERTS's time 
 premise ("`wall_clock` is the culprit") was itself a measurement artifact. Verify the artifact, then
 verify the *measurement*.
 
-## What remains — the two-node Nitro confirmation
+## Two-node Nitro — CONFIRMED
 
-Confirmed on a single Tyn node + a native OTP peer (over hostfwd). The last validation is **two Tyn
-nodes on Nitro**: `connect_node` both directions, `rpc:call`, a ~1 MB term hash-checked, liveness across
-several `net_ticktime` cycles, `nodedown` on kill. Plus moving the cookie from the kernel `-setcookie`
-scaffolding to `boot.config` (per-image). That turns "buildable, handshake-proven" into "shippable mesh."
+Two `t3.small` Tyn instances on Nitro, driven over real ENA:
+- `net_kernel:connect_node` → `true`; `nodes()` = the peer on **both** sides.
+- `rpc:call` **both directions**; a registered-process message round-trip.
+- **Liveness**: ticktime set to 8 s, still connected after ~50 s (6+ tick cycles) — heartbeat survives.
+- **`nodedown`** detected on kill (`nodes()` → `[]` after the peer halts).
+- **~1 MB term byte-exact** across the interconnect, verified with `=:=` (size 1048580).
 
-## Deliverable — DONE (this session)
+*Adjacent bug found here (not dist):* the 1 MB check first "failed" on an md5 mismatch — but `erlang:md5`
+is **intermittently non-deterministic for large binaries** on Tyn (~256 KB+): the same binary hashed
+twice on one node gives different answers, flaky by size. A race in the md5 BIF's yield/trap
+continuation. The `=:=` byte comparison proved the *transfer* exact; the md5 was a broken instrument.
+Filed as a separate finding (affects any large-binary `erlang:md5` caller). — This is the session's own
+"the artifact you tested must be the artifact you claim" lesson: the *measurement* was broken.
+
+## Deliverable — DONE
 
 - Real root cause: **missing `getrusage(2)` syscall** → `statistics(runtime)` → `erts_exit` → node exit,
   on the dist handshake critical path. Not a deadlock, not the clock.
-- Fix: `getrusage` stub (`src/syscall.rs`); handshake completes end-to-end, nodes cluster, node healthy.
-- Probe 6 verdict: NEAR → **BUILDABLE** (pending the two-node Nitro back-half + cookie→boot.config).
+- Fix: `getrusage` stub (`src/syscall.rs`); handshake completes end-to-end.
+- **Confirmed on two Nitro nodes**: connect both ways, rpc both ways, msg round-trip, 6+ tick-cycle
+  liveness, nodedown on kill, 1 MB term byte-exact. Probe 6 verdict: NEAR → **CONFIRMED**.
+- Adjacent bug: `erlang:md5` intermittently wrong on large binaries — needs its own fix.
+- Remaining for "shipped mesh": move the cookie from the kernel `-setcookie` scaffolding to `boot.config`.
 - Corrected the earlier `statistics(wall_clock)`/deadlock/futex misdiagnosis in Probe 6 and this doc.
