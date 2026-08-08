@@ -180,11 +180,52 @@ CPIO=my_app.cpio ./build-disk.sh          # -> a bootable raw disk image
   originates TLS to the database and validates its certificate with a real clock:
 
   ```elixir
-  # runtime.exs — point Ecto at the local TLS-terminating sidecar, not the DB directly
+  # runtime.exs — point Ecto at the TLS-terminating sidecar, not the DB directly
   config :my_app, MyApp.Repo,
-    hostname: "127.0.0.1", port: 6432,   # the stunnel/pgbouncer listener
+    hostname: "10.0.x.y", port: 6432,     # the stunnel/pgbouncer listener (in-VPC)
     ssl: false                            # plaintext hop to the sidecar; sidecar does TLS upstream
   ```
+
+  **Hard requirement — the plaintext hop must never leave the VPC/trust boundary.** The app→proxy leg
+  is unencrypted Postgres; it is safe *only* because it stays inside the private network (co-located
+  sidecar, or a proxy on a private subnet with a security group that admits only the app's subnet).
+  Never point `ssl: false` at a proxy across the public internet. This is the same trust model as
+  inbound "terminate TLS at the LB": ciphertext on the public leg, plaintext only inside the boundary.
+
+  **stunnel config** (client mode, Postgres-aware — Postgres TLS is an `SSLRequest` negotiation, *not*
+  raw TLS, so `protocol = pgsql` is required; a plain `socat OPENSSL`/raw-TLS proxy will not handshake):
+
+  ```ini
+  [pg-sidecar]
+  client = yes
+  accept = 0.0.0.0:6432                    ; plaintext, from the in-VPC app only (lock down via SG)
+  connect = your-db-host:5432              ; the real TLS-required Postgres
+  protocol = pgsql
+  ```
+
+  **⚠️ SCRAM + a *dumb* TLS wrapper (stunnel/socat) do not compose — use pgbouncer.** When the
+  proxy→DB leg is TLS, Postgres offers `SCRAM-SHA-256-PLUS` (channel binding). A transparent TLS
+  wrapper (stunnel `protocol=pgsql`, socat) forwards that `-PLUS` offer *through* to the app, whose own
+  leg is plaintext — which looks exactly like a TLS-stripping downgrade attack. `libpq`/`psql` refuse
+  outright ("server offered SCRAM-SHA-256-PLUS authentication over a non-SSL connection", even with
+  `channel_binding=disable`); Postgrex's connection is dropped. **Verified on Nitro:** a Tyn instance
+  reached an stunnel sidecar in-VPC and stunnel originated TLS to the DB (SCRAM bytes flowed both
+  ways), but the auth handshake did not complete for this reason — a proxy/SCRAM issue, *not* a Tyn
+  limitation (Tyn's symmetric crypto shim covers SCRAM; plaintext-direct `[[42]]` is confirmed).
+
+  The robust sidecar for SCRAM-authenticated Postgres is a **protocol-aware** proxy — **pgbouncer**
+  with `server_tls_sslmode=require`: pgbouncer speaks the Postgres wire protocol on both sides, auths
+  the app on its own (plaintext) leg and re-auths to the DB itself, so the DB's `-PLUS` offer never
+  reaches the app. (Alternatives: an `md5`-auth DB user, which sidesteps SCRAM entirely; or a client
+  that both sends `channel_binding=disable` *and* is offered plain `SCRAM-SHA-256`.)
+
+  > ⚠️ **Status: identified fix, NOT yet validated end-to-end.** stunnel is *confirmed broken* for
+  > SCRAM (above). pgbouncer is the reasoned correction — it *should* re-auth to the DB so `-PLUS`
+  > never reaches the app — but a Tyn app has **not** yet completed a query through a pgbouncer sidecar
+  > against a real TLS-required Postgres. Treat this as the recommended pattern to try, not a proven
+  > recipe, until this note says "validated on Nitro (`[[42]]`)". (This project has been bitten before
+  > by fixes that obviously should work but didn't; see `docs/SEND_CORRUPTION.md`,
+  > `docs/INBOUND_THROUGHPUT.md`.)
 
   **RDS Proxy does not remove this requirement** — it still demands TLS from *its* clients, so the
   sidecar (the actual TLS originator) is what satisfies RDS, not RDS Proxy. This keeps all crypto out

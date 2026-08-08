@@ -64,3 +64,37 @@ monotonic source for `CLOCK_MONOTONIC`:
   the monotonic source.
 - Reference from: `docs/CAPABILITY_MAP.md` (Probe 5b, synthesis item 2) and `docs/DEPLOY.md`
   (Limitations — "epoch wall clock").
+
+## Sizing & recommendation (TLS_SIDECAR.md Part 2 — verified against the source, not built)
+
+**Current wiring, confirmed in `src/syscall.rs`:** `sys_clock_gettime` (nr 228) *ignores* its
+`_clk_id` and returns `monotonic_ns()` for every clock; `gettimeofday` (nr 96) does the same.
+`monotonic_ns()` is `raw_tsc * 1000 / freq_mhz` — TSC-since-boot, never seeded with absolute time.
+That single fact is the whole "1970" bug: there is exactly one place wall-time is produced, and it has
+no real base. **No RTC/CMOS read exists anywhere in the tree** (grep-confirmed).
+
+**Bounded fix = RTC/CMOS boot-seed. Rough size ≈ 70–90 lines, one file + two call sites.** Leading
+candidate over kvmclock:
+
+| Option | Size | Notes |
+|---|---|---|
+| **RTC/CMOS (ports 0x70/0x71)** | ~60 LOC read + ~10 LOC wiring | one-shot at boot: poll the UIP bit, read sec/min/hr/day/mon/yr, BCD→binary, days-since-1970→Unix secs. Works on QEMU *and* Nitro (KVM exposes the emulated RTC in UTC). **Recommended first.** |
+| kvmclock | ~120–150 LOC | MSR `MSR_KVM_WALL_CLOCK_NEW` + a shared page; higher precision, the "right" VM answer, but more surface. A later precision upgrade, not needed for correctness. |
+| network time (HTTP `Date`/NTP) | — | fallback only; don't ship as primary. |
+
+**Mechanism (no rework of the monotonic source):** at boot, `WALL_OFFSET_NS = rtc_unix_ns -
+monotonic_ns()`; store it. Then split the `clk_id` that `sys_clock_gettime` currently ignores:
+`CLOCK_REALTIME (0)` → `monotonic_ns() + WALL_OFFSET_NS`; `CLOCK_MONOTONIC (1)` → `monotonic_ns()`
+unchanged. Same `+WALL_OFFSET_NS` in `gettimeofday`. That's the entire change.
+
+**Benefits — verified, not assumed (one fix, many payoffs):** because *all* wall-time in the guest
+flows through exactly those two syscalls, seeding `CLOCK_REALTIME` fixes **every** absolute-time
+consumer at once — `DateTime.utc_now/0`, `System.system_time/0`, `:os.system_time/1`, Logger/telemetry
+timestamps, cookie/JWT absolute expiry, and (once the crypto NIF exists) TLS cert-date validation.
+`erlang:monotonic_time` is untouched (still `CLOCK_MONOTONIC`), so scheduling/timeouts/the futex path
+are unaffected.
+
+**Not this session's build** (per the directions: size, don't necessarily build). It is small and
+high-value, but it needs its own Nitro acceptance run (`DateTime.utc_now` returns real UTC ±seconds and
+advances) — a bounded, separable piece of work. Distinct from the retracted `statistics(runtime)`/
+`getrusage` item above: that was a missing-syscall crash; this is boot-time seeding.

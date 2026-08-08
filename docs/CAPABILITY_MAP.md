@@ -159,15 +159,33 @@ asymmetric crypto exists. The failure is graceful: the connection process dies, 
   without a real wall clock, cert validation fails even once crypto works (`verify: :verify_none`
   sidesteps it per-connection but is not a real managed-DB posture). Upside: unlocks in-guest crypto
   broadly (TLS, and NIF-crypto deps like bcrypt/argon2), not just DB TLS.
+  **The decisive cost — TCB, stated plainly:** OpenSSL is ~500K lines of C. Linking it into an
+  ~8K-line guest is the single largest erosion of Tyn's small-attack-surface thesis — a >60× blowup of
+  the trusted computing base to serve one outbound-TLS use case that the sidecar already covers. For a
+  minimal-TCB unikernel, *keeping TLS out of the guest is arguably the correct architecture*, not a
+  compromise. **So Path A is explicitly deferred, not scheduled.** A Rust TLS stack (rustls) is a
+  smaller-TCB alternative to OpenSSL but still reopens the crypto-NIF coexistence question and still
+  needs the clock. **Revisit trigger:** a concrete use case that genuinely cannot use the sidecar —
+  e.g. TLS required on a path where no in-VPC proxy can be placed. Absent that, Path B is the answer.
 - **Path B — TLS-terminating sidecar (offload, like inbound) — CHOSEN as the near-term pattern.**
-  Inbound TLS is already terminated at an ALB/NLB; the outbound-to-DB analogue is a small in-VPC proxy
-  (stunnel / pgbouncer-with-TLS-upstream): Tyn speaks **plaintext** to the proxy (already proven,
-  `[[42]]`), the proxy originates TLS to the managed DB and validates the cert with its own real clock.
-  *Cost/risk: low* — no ERTS rebuild, no crypto NIF, no in-guest clock dependency. Operational cost:
-  run the proxy next to each instance. RDS requires TLS *from its client*, and **RDS Proxy does not
-  remove that** — the sidecar (the actual TLS originator) is what satisfies it. This is now documented
-  as a deployment pattern (`docs/DEPLOY.md` → "Reach a TLS-required database through a sidecar"),
-  parallel to inbound LB termination.
+  Inbound TLS is already terminated at an ALB/NLB; the outbound-to-DB analogue is a small in-VPC proxy:
+  Tyn speaks **plaintext** to the proxy (already proven, `[[42]]`), the proxy originates TLS to the
+  managed DB and validates the cert with its own real clock. *Cost/risk: low* — no ERTS rebuild, no
+  crypto NIF, no in-guest clock dependency. RDS requires TLS *from its client*, and **RDS Proxy does
+  not remove that** — the sidecar (the actual TLS originator) is what satisfies it. Documented in
+  `docs/DEPLOY.md` → "Reach a TLS-required database through a sidecar".
+  **Nitro validation (partial) — the proxy CHOICE matters:** a Tyn instance reached an **stunnel**
+  (`protocol=pgsql`) sidecar in-VPC and stunnel originated real TLS to the DB (SCRAM bytes flowed both
+  ways over the interconnect), but the **auth handshake did not complete**: a transparent TLS wrapper
+  forwards the DB's `SCRAM-SHA-256-PLUS` (channel-binding) offer through to the plaintext-leg app,
+  which trips downgrade-protection (libpq refuses; Postgrex drops the connection). This is a
+  proxy/SCRAM composition issue, **not a Tyn limitation** (Tyn's symmetric shim covers SCRAM;
+  plaintext `[[42]]` works). **Identified fix (NOT yet verified): a protocol-aware proxy —
+  `pgbouncer` (`server_tls_sslmode`)** — which *should* re-auth to the DB so the `-PLUS` offer never
+  reaches the app (or an `md5`-auth user). This is a reasoned correction, not a proven recipe: **the
+  clean end-to-end `SELECT` through pgbouncer has not been run yet**, so TLS-to-DB-via-sidecar is
+  *pattern-identified, proof-pending*, not ✅. The in-VPC-only plaintext hop is a hard requirement
+  (`docs/DEPLOY.md`).
 
 **Path A's scope is now known** (the "held" question is answered). The masking `tyn-pack` bug is
 fixed, the shim loads, and the re-run shows the real gap is the **entire asymmetric crypto surface**,
