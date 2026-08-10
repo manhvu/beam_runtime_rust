@@ -10,15 +10,25 @@ build-iso.sh
 limine.cfg
 limine.conf
 /run.sh
-# Track the committed capability suite; ignore scratch/artifacts + the old
-# no_std kernel integration tests that were never tracked.
-tests/*
-!tests/run.sh
-!tests/fixtures.env
-!tests/liveview_check.py
-!tests/setup-test-app.sh
-!tests/README.md
-!tests/tmpfs/
+# The tests/ tree is the regression suite (probes, drivers, harnesses) and grows
+# with new dirs (unit / resiliency / fuzz / soak). Track sources BY DEFAULT; ignore
+# only build artifacts, wherever they appear — so a new test dir is never
+# re-swallowed. (The old "tests/* + per-dir !exceptions" pattern re-ignored every
+# future dir by default: the .cargo/config.toml lesson, half-learned.)
+tests/**/_build/
+tests/**/target/
+tests/**/*.beam
+tests/**/*.raw
+tests/**/*.cpio
+tests/**/*.log
+tests/**/*.smp
+tests/**/*.o
+# Legacy blog-OS no_std integration tests — deliberately untracked (superseded by
+# the capability + preemption suites). Not artifacts, but not maintained.
+tests/basic_boot.rs
+tests/heap_allocation.rs
+tests/should_panic.rs
+tests/stack_overflow.rs
 CONTEXT.md
 REVIEW.md
 .DS_Store
