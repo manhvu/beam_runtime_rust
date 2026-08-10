@@ -127,8 +127,19 @@ test.
 ## BUG-5 — current `main` no longer serves on Nitro (regressed since Aug-8)
 
 **Severity:** high (blocks all real-hardware validation, incl. BUG-1's Nitro residual).
-**Status:** open, **measured but not bisected.** Surfaced while trying to Nitro-validate
-BUG-1. The Aug-8 known-good deploy (stock kernel + `clock2.cpio`) served at
+**Status:** open — **strong prime suspect identified (uncommitted canary-beam swap), Nitro
+re-test pending.** Surfaced while trying to Nitro-validate BUG-1.
+
+**PRIME SUSPECT (measured, not yet Nitro-confirmed): the embedded beam, not a source
+commit.** Making the build host a real git clone (CLEAR_DECK Step 1) exposed that
+`src/beam.smp.elf` on the host was **`c5461aee` = `beam_canary.smp`, a red-zone-hunt
+probe beam left embedded**, while git tracks the production beam **`a9048ee0`
+(`beam-crypto.smp`, backed up on the host as `beam.smp.elf.orig`)**. The swap-in date
+(`beam.smp.elf.orig` created **Aug-9 01:14**) draws a clean boundary: **Aug-8 deploy
+served → production beam; every Aug-9-01:14-onward deploy no-serve → canary beam.** So
+the regression is very likely the *uncommitted probe-beam swap*, and the clean clone
+(which restores `a9048ee0`) may fix it outright — no commit-bisect needed. **Test the
+clean-clone kernel (production beam) on c5.large first;** only bisect if it still fails. The Aug-8 known-good deploy (stock kernel + `clock2.cpio`) served at
 `18.206.85.142:8080`. **Now, the same pipeline (`deploy-ami.sh` → `build-disk.sh` →
 import-snapshot → `register-image --boot-mode legacy-bios` → `run-instances`, c5.large)
 produces NO-SERVE for the stock kernel** (`tyn-kernel-unfix` = current-main-minus-Path-A)
@@ -142,9 +153,10 @@ window (RTC clock, tmpfs, dist, sendfile, and pipeline edits all landed there).
 HTTP on :8080. Next-session plan: **bisect** the Aug-8→now commits (deploy the Aug-8
 kernel binary as a positive control first to prove the pipeline/env still works, then
 walk forward), or diff the security-group / `build-disk.sh` / `deploy-ami.sh` against
-their Aug-8 state. **Prerequisite (blocking):** the build host `~/kernel` is not a git
-clone, so `git checkout <commit>` → build → test — the whole bisect mechanic — is
-impossible until it's made one. See `docs/PAYDOWN.md` (★ priority item); do that first. Do this on **c5.large** (cheap) with the leak-proof terminate-on-exit
+their Aug-8 state. **Prerequisite (RESOLVED):** the build host `~/kernel` is now a real
+clone of origin/main (CLEAR_DECK Step 1), so `git bisect` → build → test is possible —
+but likely unnecessary given the beam suspect above. `deploy-ami.sh` now gates on a clean
+tree + logs the built HEAD SHA, so any bisect deploy is traceable to its commit. Do this on **c5.large** (cheap) with the leak-proof terminate-on-exit
 trap + `Instance:`-anchored id extraction (a prior regex bug leaked a c5.metal once).
 
 ## BUG-2 — `tyn_boot` crashes `exit_group(127)` on a config env value of `"0"`

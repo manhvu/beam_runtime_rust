@@ -5,6 +5,30 @@
 # build host with the toolchain + AWS access (see directions/PRODUCTION_READY.md).
 set -euo pipefail
 
+# --- Provenance gate: every deployed artifact must trace to a git commit. ---
+# The build host is a real clone (see docs/PAYDOWN.md — the non-git-build-host
+# blocker). Refuse to build from a dirty tree (that's how an untracked beam or a
+# hand-edit silently ships), and record the built HEAD SHA so the deploy log ties
+# the artifact to a commit. Override for a deliberate experiment with
+# PROVENANCE_ALLOW_DIRTY=1 (it still logs, loudly).
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    BUILD_SHA=$(git rev-parse HEAD)
+    BUILD_DIRTY=$(git status --porcelain)
+    BEAM_SHA=$(sha256sum src/beam.smp.elf 2>/dev/null | cut -c1-16)
+    echo "=== Provenance ===  HEAD=$BUILD_SHA  beam=$BEAM_SHA  tree=$([ -z "$BUILD_DIRTY" ] && echo clean || echo DIRTY)"
+    if [ -n "$BUILD_DIRTY" ]; then
+        echo "$BUILD_DIRTY" | sed 's/^/    /'
+        if [ "${PROVENANCE_ALLOW_DIRTY:-0}" != "1" ]; then
+            echo "ERROR: refusing to deploy from a dirty tree (artifact would not trace to a commit)." >&2
+            echo "       commit the change, or set PROVENANCE_ALLOW_DIRTY=1 to override." >&2
+            exit 1
+        fi
+        echo "WARNING: PROVENANCE_ALLOW_DIRTY=1 — deploying an untracked tree state."
+    fi
+else
+    echo "WARNING: not a git repo — cannot record build provenance (see docs/PAYDOWN.md)."
+fi
+
 REGION="${AWS_REGION:-us-east-1}"
 BUCKET="tyn-images-$(aws sts get-caller-identity --query Account --output text)"
 INSTANCE_TYPE="${INSTANCE_TYPE:-c5.large}"

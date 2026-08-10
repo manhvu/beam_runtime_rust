@@ -9,24 +9,21 @@ overlap. Not ranked; each notes what it is, why it bites, and the fix if known.
 
 ## Config / deploy drift (the highest-bite class)
 
-- **★ PRIORITY — the build host `~/kernel` is NOT a git clone.** It's a mutable,
-  hand-synced source tree with no `.git`. This **silently breaks the
-  artifact-matches-git guarantee that all validation rests on**: a binary that
-  passes acceptance was built from *whatever bytes were in that tree at build time*,
-  with nothing tying them to a commit. This session it held only because Path A's two
-  files hashed **byte-identical** to the commit when checked by hand (SHA-256 match) —
-  a manual check that happened to pass, not a structural guarantee, and one nobody
-  will remember to run every time. **Third recurrence of this class** — kin to the
-  `.cargo/config.toml` showstopper and the `tests/*` gitignore (an untracked thing
-  quietly severing source↔build correspondence). Do not wave it off again.
-  **Blocks BUG-5's bisect directly:** a bisect *is* `git checkout <commit>` → build →
-  test, per step; you cannot do that on a tree with no history, and building "the
-  Aug-8 kernel" or walking commits forward is impossible without it. *Fix (do before
-  BUG-5):* make `~/kernel` a real clone of `github-personal:tyn-os/kernel` (or a fresh
-  clone beside it that `deploy-ami.sh` builds from), verify `git status` clean +
-  `HEAD` == the commit under test, and have the deploy log record the built `HEAD` SHA
-  so every artifact is traceable to a commit. Non-source build inputs that live only
-  on the host (embedded `beam.smp`, `clock2.cpio`) need the same provenance discipline.
+- **✅ RESOLVED (Aug-10) — the build host `~/kernel` is now a real git clone.**
+  It was a mutable hand-synced tree with no `.git`, which **silently broke the
+  artifact-matches-git guarantee all validation rests on** — third recurrence of the
+  class (kin: `.cargo/config.toml` showstopper, `tests/*` gitignore). CLEAR_DECK
+  Step 1 replaced it with a clean clone of origin/main (old tree kept as
+  `~/kernel-prev`), and `deploy-ami.sh` now **gates on a clean tree + logs the built
+  HEAD SHA + beam hash** (override: `PROVENANCE_ALLOW_DIRTY=1`). **What the gap had
+  been hiding:** the host's embedded `src/beam.smp.elf` was `c5461aee` = a red-zone
+  probe beam (`beam_canary.smp`) left in place, not git's production `a9048ee0` — i.e.
+  every recent deploy shipped an untracked probe beam. That is now the **prime suspect
+  for BUG-5** (Nitro no-serve). *Residual discipline (still owed):* host-only build
+  inputs (`clock2.cpio`, the probe beams in `beam-build/`, and `beam.smp.elf` itself
+  when rebuilt) should be reproducible-from-repo or hash-and-recorded — ideally make
+  `beam.smp` buildable from `beam-build/` and commit rebuilt beams, so "which beam did
+  this deploy with" can never drift untracked again.
 - **Nitro serve regressed since Aug-8 (BUG-5).** The stock kernel + `clock2.cpio`
   served on Nitro Aug-8 but the same pipeline NO-SERVEs now — measured, stock kernel,
   so **not** Path A. Blocks *all* real-hardware validation (incl. BUG-1's Nitro
