@@ -427,11 +427,20 @@ pub fn spawn(
         return 0;
     }
 
-    // Allocate kernel stack
+    // Allocate kernel stack. BUG-1 Path A: reserve PREEMPT_REGION_SIZE ABOVE each
+    // stack (bump the allocator by it) so the timer trampoline's per-thread preempt
+    // region [kstack_top .. +SIZE] doesn't overlap the next thread's stack base.
+    // This is the contiguous-bump path the naive red-zone fix underflowed; the
+    // usable stack stays 16 KiB, the region lives in the reserved slack above it.
+    // (thread 0 uses syscall_stack_0 whose region is free above it — the dead
+    // syscall_stack_1 — so only this allocator needs the bump. See
+    // docs/STACK_ALLOCATOR_INVENTORY.md.)
+    const KSTACK_USABLE: u64 = 16384;
     static KSTACK_NEXT: core::sync::atomic::AtomicU64 =
         core::sync::atomic::AtomicU64::new(0x0700_0000);
-    let kstack_base = KSTACK_NEXT.fetch_add(16384, Ordering::Relaxed);
-    let kstack_top = kstack_base + 16384;
+    let kstack_base = KSTACK_NEXT.fetch_add(
+        KSTACK_USABLE + crate::interrupts::PREEMPT_REGION_SIZE, Ordering::Relaxed);
+    let kstack_top = kstack_base + KSTACK_USABLE;
 
     // Build a kernel stack frame for the child that mirrors the syscall
     // exit path. When context-switched to, the child "returns" from the

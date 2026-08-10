@@ -9,6 +9,13 @@ overlap. Not ranked; each notes what it is, why it bites, and the fix if known.
 
 ## Config / deploy drift (the highest-bite class)
 
+- **Nitro serve regressed since Aug-8 (BUG-5).** The stock kernel + `clock2.cpio`
+  served on Nitro Aug-8 but the same pipeline NO-SERVEs now — measured, stock kernel,
+  so **not** Path A. Blocks *all* real-hardware validation (incl. BUG-1's Nitro
+  residual). *Fix:* bisect the Aug-8→now commits (deploy the Aug-8 kernel as a
+  positive control first), or diff SG/`build-disk.sh`/`deploy-ami.sh` vs Aug-8.
+  Hampered by Tyn serial not reaching EC2 console (HTTP :8080 is the only signal).
+  `BUGS.md` → BUG-5.
 - **`-setcookie` baked into `main.rs`.** The Erlang dist cookie is hardcoded in the
   kernel argv scaffolding (uncommitted in-tree). Should move to **boot.config
   (per-image)** so it's not a kernel constant and doesn't leak/collide across

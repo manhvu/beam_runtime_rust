@@ -113,22 +113,48 @@ extern "x86-interrupt" fn timer_handler(mut frame: InterruptStackFrame) {
     let ip = frame.instruction_pointer.as_u64();
     let is_user = ip < KERNEL_BASE || (ip >= MMAP_BASE && ip < MMAP_END);
     if is_user {
-        // User-mode code interrupted. Push the original RIP onto the user
-        // stack and redirect IRET to a trampoline that does sched_yield.
-        // The trampoline does `syscall(sched_yield); ret` — the ret pops
-        // the original RIP and resumes user code. check_resched at the
+        // User (JIT/beam.smp) code interrupted. Redirect IRET to a trampoline that
+        // does sched_yield, then resumes the interrupted code. check_resched at the
         // syscall exit performs the actual yield.
         crate::sched::timer_tick();
 
         extern "C" { fn sched_yield_trampoline(); }
         unsafe {
+            // BUG-1 fix (Path A): the trampoline's context goes in a per-thread
+            // PREEMPT REGION reserved ABOVE the kernel-stack top (gs:[0]), NOT on
+            // the user stack — the interrupted thread's SysV red zone
+            // [user_rsp-1..-128] is never touched (the old bug wrote its return
+            // frame there and clobbered BeamAsm leaf spills → wrong md5/bincopy).
+            // The region is reserved by the two live kstack allocators
+            // (syscall_stack_0's dead-neighbor space; sched.rs KSTACK_NEXT's
+            // +PREEMPT_REGION_SIZE bump — see docs/STACK_ALLOCATOR_INVENTORY.md),
+            // and located here via gs:[0] (the current thread's kstack top).
+            //
+            // The trampoline runs with IF=0 (we clear IF in the frame we iretq into
+            // it), so no nested timer preemption → a single per-thread frame
+            // suffices. It ends in `iretq`, atomically restoring orig RIP + user_rsp
+            // + the interrupted RFLAGS (IF=1). The syscall's `mov rsp, gs:[0]` uses
+            // the kernel stack BELOW gs:[0], never the region above it.
+            let kstack_top: u64;
+            core::arch::asm!("mov {}, gs:[0]", out(reg) kstack_top,
+                             options(nostack, preserves_flags));
+            let region_top = kstack_top + PREEMPT_REGION_SIZE;
+            let orig_rflags = frame.cpu_flags;      // IF=1 (interrupted code)
+            let cs = frame.code_segment;
+            let ss = frame.stack_segment;
             let user_rsp = frame.stack_pointer.as_u64();
-            let new_rsp = user_rsp - 8;
-            // Push original RIP onto user stack
-            *(new_rsp as *mut u64) = ip;
-            frame.as_mut().update(|f| {
-                f.instruction_pointer = x86_64::VirtAddr::new(sched_yield_trampoline as u64);
-                f.stack_pointer = x86_64::VirtAddr::new(new_rsp);
+            // iretq frame at [region_top-40 .. region_top]:
+            //   [rsp]=orig_rip, +8=cs, +16=rflags, +24=user_rsp, +32=ss
+            let f = (region_top - 40) as *mut u64;
+            *f.add(0) = ip;            // orig RIP
+            *f.add(1) = cs;
+            *f.add(2) = orig_rflags;   // resume with interrupts enabled
+            *f.add(3) = user_rsp;
+            *f.add(4) = ss;
+            frame.as_mut().update(|fr| {
+                fr.instruction_pointer = x86_64::VirtAddr::new(sched_yield_trampoline as u64);
+                fr.stack_pointer = x86_64::VirtAddr::new(region_top - 40);
+                fr.cpu_flags = orig_rflags & !(1u64 << 9); // clear IF → trampoline runs IF=0
             });
         }
     } else {
@@ -136,15 +162,23 @@ extern "x86-interrupt" fn timer_handler(mut frame: InterruptStackFrame) {
     }
 }
 
+/// Per-thread preemption-context region reserved ABOVE each kernel-stack top
+/// (gs:[0]). BUG-1 Path A builds its iretq frame + syscall-clobbered-reg saves
+/// here (64 B used; rest is headroom/alignment). Must be reserved by EVERY live
+/// kernel-stack allocator — see docs/STACK_ALLOCATOR_INVENTORY.md.
+pub const PREEMPT_REGION_SIZE: u64 = 256;
+
 core::arch::global_asm!(
     ".section .text",
     ".global sched_yield_trampoline",
     "sched_yield_trampoline:",
-    // Original RIP is at [rsp] (pushed by timer handler).
-    // Save the regs the `syscall` instruction itself clobbers
-    // (rax/rcx/r11). The other caller-saved GPRs (rdx/rsi/rdi/r8-r10)
-    // are saved and restored by syscall_entry in src/syscall.rs — see
-    // BOOT_RELIABILITY.md for the full stack-layout trace.
+    // BUG-1 fix (Path A): entered by the timer handler with rsp pointing at an
+    // iretq frame [orig_rip, cs, rflags(IF=1), user_rsp, ss] in the per-thread
+    // PREEMPT REGION (above gs:[0]), and IF=0 (no nested preemption). Save the regs
+    // the `syscall` instruction clobbers (rax/rcx/r11) BELOW that frame — the other
+    // caller-saved GPRs (rdx/rsi/rdi/r8-r10) are handled by syscall_entry. The
+    // syscall's `mov rsp, gs:[0]` switches to the kernel stack BELOW the region, so
+    // neither the region nor the user red zone is touched.
     "push rax",
     "push rcx",
     "push r11",
@@ -153,7 +187,9 @@ core::arch::global_asm!(
     "pop r11",
     "pop rcx",
     "pop rax",
-    "ret",               // pops original RIP → resumes user code
+    // iretq atomically restores orig_rip + user_rsp + interrupted RFLAGS(IF=1),
+    // resuming the interrupted code exactly where it was — user stack untouched.
+    "iretq",
 );
 
 extern "x86-interrupt" fn page_fault_handler(

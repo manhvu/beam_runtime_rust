@@ -22,7 +22,9 @@ would have made this class debuggable." Feed into the hardening backlog.
 
 **Severity:** high (silent wrong results — `:erlang.md5`/`binary.copy` return wrong
 values under preemption; the "md5 large-binary flakiness" from the dist work).
-**Status:** **root cause found and measured; correct fix pending** (Path A, below).
+**Status:** **RESOLVED** — Path A fix landed (`src/interrupts.rs` + `src/sched.rs`),
+measured acceptance below. Nitro re-validation of the corruption fix is the one
+residual (blocked on a *separate* pre-existing regression — see BUG-5).
 
 **Root cause:** `sched_yield_trampoline` (`src/interrupts.rs`) redirects a preempted
 thread to `syscall(sched_yield)` by writing the saved RIP + rax/rcx/r11 to
@@ -51,15 +53,34 @@ per-preemption timing, not a persistent memory clobber.
   below a small dirty/aux thread's rsp underflows into adjacent heap (see systemic
   hazard) → `bad tag`. Fix direction correct, **naive implementation reverted.**
 
-**Correct fix (pending — Path A, `directions/REDZONE_FIX_RIGHT.md`):** move the saved
-context off the user stack entirely — build an `iretq` frame on a per-thread
-kernel/preempt area and resume via `iretq` (restores orig RIP + user_rsp + RFLAGS
-atomically), with an **interrupts-disabled (IF=0) trampoline** so no nested
-preemption (the IF=0 window — `check_resched`→`process_rescues`+`yield_current`→
-`context_switch` — was verified bounded & non-blocking). Red zone never touched →
-red-zone clobber AND small-stack underflow both structurally impossible. Deferred to
-a post-audit session (needs the verified-complete kernel-stack-allocator inventory —
-there are several across Tyn's two thread systems).
+**Fix (Path A — landed):** the trampoline's context moved off the user stack
+entirely. The timer handler reads the current thread's kernel-stack top via
+`gs:[0]`, builds an `iretq` frame in a **per-thread PREEMPT REGION reserved ABOVE
+that top** (`PREEMPT_REGION_SIZE = 256`), and `iretq`s into the trampoline with
+**IF=0** (frame's IF cleared) so no nested preemption → one per-thread frame
+suffices. The trampoline saves the syscall-clobbered regs (rax/rcx/r11) *below* that
+frame, calls `sched_yield`, and ends in `iretq` — restoring orig RIP + user_rsp +
+interrupted RFLAGS (IF=1) atomically. The red zone is **never touched**, so both the
+original clobber AND the naive-fix's small-stack underflow are structurally
+impossible. The region is reserved by every live kernel-stack allocator: `sched.rs`
+`KSTACK_NEXT` bumps by `+PREEMPT_REGION_SIZE`; thread 0's `syscall_stack_0` has free
+dead-neighbor space above it (see `docs/STACK_ALLOCATOR_INVENTORY.md`). The IF=0
+window (`check_resched`→`process_rescues`+`yield_current`→`context_switch`) was
+verified bounded & non-blocking before committing to a single-frame region.
+
+**Measured acceptance (TCG, `-cpu max -accel tcg`, full preemption + 16-worker dose):**
+- amplifier **`large_md5=0` 16/16** and **`crash=0` 16/16** (fix works AND the
+  naive-fix crash regression stays dead — dual acceptance PASS);
+- **`redzone_probe bad=0` 3/3** — the sentinel that named the corruptor now comes
+  back clean, i.e. the mechanism is gone, not just the symptom. `redzone_probe`
+  stays the **standing guard** for any future regression.
+
+**Nitro residual (the one open item):** the corruption fix is validated on TCG, not
+yet under real-Nitro timing. This is **blocked on BUG-5, not on Path A** — measured:
+the *stock* kernel (`tyn-kernel-unfix` = current-main-minus-Path-A) also fails to
+serve on Nitro right now, so Path A is **exonerated** as a Nitro-boot regression.
+The matrix: {Path A, stock} × {demo, clock2} all NO-SERVE now; stock+clock2 *served*
+on Aug-8. Nitro md5-timing re-validation waits on fixing BUG-5.
 
 **Three earlier wrong turns (each caught by a refutable probe — recorded so they
 don't recur):**
@@ -77,15 +98,17 @@ don't recur):**
 Reproducers/probes: `tests/simd/` (amplifier + probe runners) +
 `beam-build/nifs/{fsbase_probe,xmm_probe,canary}.c`.
 
-## Unification (BUG-1 / BUG-4 / #72) — UNPROVEN, not merged
+## Unification (BUG-1 / BUG-4 / #72) — TESTED → **kept separate** (no merge)
 
 BUG-1, BUG-4 (boot `#PF`), and GP_HUNT #72 (tmpfs `#GP`) share a **plausible** cause
 (red-zone clobber is a general memory corruptor → a beam pointer spilled to the red
-zone and clobbered would fault wild). **Plausible ≠ measured.** They stay **separate**
-until the Path-A fix's unification test runs: does the fix also kill the wild-pointer
-faults? Gone → merge by measured shared cause; persist → separate. Do **NOT** merge on
-the `0x100000000` 4-GiB-address coincidence (that coincidence already correctly *split*
-BUG-1 from BUG-4 once).
+zone and clobbered would fault wild). The Path-A unification test ran a pointer-heavy
+(tmpfs) workload on both trees: **wild-pointer-fault boots = 0/8 unfixed AND 0/8
+Path A.** The wild-pointer fault did **not reproduce on either tree**, so the fix
+neither confirmably kills it nor is refuted — **absence proves nothing.** Verdict:
+**keep separate, no merge** (merging on an unreproduced coincidence is exactly the
+`0x100000000` trap that already once correctly *split* BUG-1 from BUG-4). If BUG-4/#72
+resurface with a live reproducer, re-run the test then.
 
 ## BUG-4 — boot `#PF` at `cr2=0x100000000` (beam.smp reads a wild ~4 GiB pointer)
 
@@ -100,6 +123,27 @@ across the corpus (not a fixed fingerprint — just the map wall). Not reproduce
 current shipped tree (0/16 boots incl. amplifier); the reliable historical faults were
 on experimental (FXSAVE/futex-valve) builds. Left open pending the BUG-1 unification
 test.
+
+## BUG-5 — current `main` no longer serves on Nitro (regressed since Aug-8)
+
+**Severity:** high (blocks all real-hardware validation, incl. BUG-1's Nitro residual).
+**Status:** open, **measured but not bisected.** Surfaced while trying to Nitro-validate
+BUG-1. The Aug-8 known-good deploy (stock kernel + `clock2.cpio`) served at
+`18.206.85.142:8080`. **Now, the same pipeline (`deploy-ami.sh` → `build-disk.sh` →
+import-snapshot → `register-image --boot-mode legacy-bios` → `run-instances`, c5.large)
+produces NO-SERVE for the stock kernel** (`tyn-kernel-unfix` = current-main-minus-Path-A)
+with the *same* `clock2.cpio`. Full matrix, all NO-SERVE now: {Path A, stock} ×
+{demo-rootfs, clock2}. Because **stock also fails**, this is **not** Path A — it's a
+regression in committed `main` (or the pipeline/EC2 env) somewhere in the Aug-8→now
+window (RTC clock, tmpfs, dist, sendfile, and pipeline edits all landed there).
+
+**Constraint that makes this hard:** Tyn's serial console does **not** reach EC2
+`get-console-output`, so a NO-SERVE gives no boot log — the only Nitro observability is
+HTTP on :8080. Next-session plan: **bisect** the Aug-8→now commits (deploy the Aug-8
+kernel binary as a positive control first to prove the pipeline/env still works, then
+walk forward), or diff the security-group / `build-disk.sh` / `deploy-ami.sh` against
+their Aug-8 state. Do this on **c5.large** (cheap) with the leak-proof terminate-on-exit
+trap + `Instance:`-anchored id extraction (a prior regex bug leaked a c5.metal once).
 
 ## BUG-2 — `tyn_boot` crashes `exit_group(127)` on a config env value of `"0"`
 
