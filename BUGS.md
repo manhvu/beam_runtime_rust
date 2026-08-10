@@ -142,7 +142,9 @@ window (RTC clock, tmpfs, dist, sendfile, and pipeline edits all landed there).
 HTTP on :8080. Next-session plan: **bisect** the Aug-8→now commits (deploy the Aug-8
 kernel binary as a positive control first to prove the pipeline/env still works, then
 walk forward), or diff the security-group / `build-disk.sh` / `deploy-ami.sh` against
-their Aug-8 state. Do this on **c5.large** (cheap) with the leak-proof terminate-on-exit
+their Aug-8 state. **Prerequisite (blocking):** the build host `~/kernel` is not a git
+clone, so `git checkout <commit>` → build → test — the whole bisect mechanic — is
+impossible until it's made one. See `docs/PAYDOWN.md` (★ priority item); do that first. Do this on **c5.large** (cheap) with the leak-proof terminate-on-exit
 trap + `Instance:`-anchored id extraction (a prior regex bug leaked a c5.metal once).
 
 ## BUG-2 — `tyn_boot` crashes `exit_group(127)` on a config env value of `"0"`
