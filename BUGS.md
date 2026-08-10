@@ -126,11 +126,15 @@ test.
 
 ## BUG-5 — current `main` no longer serves on Nitro (regressed since Aug-8)
 
-**Severity:** high (blocks all real-hardware validation, incl. BUG-1's Nitro residual).
-**Status:** open — **strong prime suspect identified (uncommitted canary-beam swap), Nitro
-re-test pending.** Surfaced while trying to Nitro-validate BUG-1.
+**Severity:** high (blocked all real-hardware validation, incl. BUG-1's Nitro residual).
+**Status:** **RESOLVED** — the regression was the uncommitted canary-beam swap, not a
+source commit. Confirmed on Nitro (2026-08-10): the clean-clone kernel with the
+**production beam `a9048ee0`** + `clock2.cpio` **served `/health` in ~8s** on c5.large
+(`HEAD=39e9959`, tree clean, logged by the new provenance gate). No bisect needed —
+CLEAR_DECK Step 1 (real git clone → restores the production beam) resolved it. The
+`deploy-ami.sh` provenance gate now prevents an untracked beam from shipping again.
 
-**PRIME SUSPECT (measured, not yet Nitro-confirmed): the embedded beam, not a source
+**Root cause (was the prime suspect, now confirmed): the embedded beam, not a source
 commit.** Making the build host a real git clone (CLEAR_DECK Step 1) exposed that
 `src/beam.smp.elf` on the host was **`c5461aee` = `beam_canary.smp`, a red-zone-hunt
 probe beam left embedded**, while git tracks the production beam **`a9048ee0`
