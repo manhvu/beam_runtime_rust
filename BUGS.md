@@ -22,9 +22,16 @@ would have made this class debuggable." Feed into the hardening backlog.
 
 **Severity:** high (silent wrong results — `:erlang.md5`/`binary.copy` return wrong
 values under preemption; the "md5 large-binary flakiness" from the dist work).
-**Status:** **RESOLVED** — Path A fix landed (`src/interrupts.rs` + `src/sched.rs`),
-measured acceptance below. Nitro re-validation of the corruption fix is the one
-residual (blocked on a *separate* pre-existing regression — see BUG-5).
+**Status:** **REOPENED — Path A is a strong PARTIAL mitigation, not a complete fix.**
+It landed (`src/interrupts.rs` + `src/sched.rs`) and passed UP acceptance (16/16, TCG
+`-smp 1`), and it **eliminates the crash mode**. But the first-ever **SMP** test (real
+Nitro, c5.large = 2 schedulers; 2026-08-10) measured a **residual md5 corruption**:
+`large_md5` climbed 0→4 over 240 s / 52 k iters (monotonic, no crash), read by the
+teeth-tested `ampweb` HTTP amplifier (which reads exactly 0 on this same kernel under
+UP). **Every prior Path A validation was UP (`-smp 1`), so the SMP path was never
+exercised** — and the original "md5 large-binary flakiness" was itself an SMP (Nitro
+dist) symptom. Net: red-zone clobber fixed for UP; an **SMP-specific corruption
+residual remains**. Do NOT treat BUG-1 as closed.
 
 **Root cause:** `sched_yield_trampoline` (`src/interrupts.rs`) redirects a preempted
 thread to `syscall(sched_yield)` by writing the saved RIP + rax/rcx/r11 to
@@ -68,19 +75,43 @@ dead-neighbor space above it (see `docs/STACK_ALLOCATOR_INVENTORY.md`). The IF=0
 window (`check_resched`→`process_rescues`+`yield_current`→`context_switch`) was
 verified bounded & non-blocking before committing to a single-frame region.
 
-**Measured acceptance (TCG, `-cpu max -accel tcg`, full preemption + 16-worker dose):**
-- amplifier **`large_md5=0` 16/16** and **`crash=0` 16/16** (fix works AND the
-  naive-fix crash regression stays dead — dual acceptance PASS);
-- **`redzone_probe bad=0` 3/3** — the sentinel that named the corruptor now comes
-  back clean, i.e. the mechanism is gone, not just the symptom. `redzone_probe`
-  stays the **standing guard** for any future regression.
+**Measured UP acceptance (TCG, `-cpu max -accel tcg`, `-smp 1`, 16-worker dose):**
+- amplifier **`large_md5=0` 16/16** and **`crash=0` 16/16** (dual acceptance PASS);
+- **`redzone_probe bad=0` 3/3** — the sentinel that named the corruptor comes back
+  clean. `redzone_probe` stays the **standing UP guard**.
+- **Caveat now understood:** all of this was `-smp 1`. It proves the UP red-zone path
+  is fixed; it says **nothing about SMP** (see the SMP residual).
 
-**Nitro residual (the one open item):** the corruption fix is validated on TCG, not
-yet under real-Nitro timing. This is **blocked on BUG-5, not on Path A** — measured:
-the *stock* kernel (`tyn-kernel-unfix` = current-main-minus-Path-A) also fails to
-serve on Nitro right now, so Path A is **exonerated** as a Nitro-boot regression.
-The matrix: {Path A, stock} × {demo, clock2} all NO-SERVE now; stock+clock2 *served*
-on Aug-8. Nitro md5-timing re-validation waits on fixing BUG-5.
+**SMP residual (REOPENS the bug — measured 2026-08-10, real Nitro c5.large):** Path A
+kernel (production beam `a9048ee0`, HEAD `922bd5f`, provenance-gated) + the
+teeth-tested `ampweb` amplifier under ~4 min sustained load:
+- **`large_md5` 0→4** (monotonic: first nonzero at ~t+120 s / 26 k iters, reaching 4
+  by 52 k iters), `small_md5=0`, **no crash** (`/health` 200 throughout).
+- The instrument is trustworthy here because it was **teeth-tested**: same `ampweb`
+  reads **`large_md5=0`** on this exact Path A kernel under UP TCG (110 s, 14 k iters),
+  and reads **`large_md5=5` + a node crash** on the unfixed kernel (`0b258c3`, same
+  production beam) — so it fires on both BUG-1 failure modes and is silent on the UP
+  fix. The Nitro `4` is therefore a **real, timing/SMP-dependent residual UP hid.**
+- **SMP confirmed as the defect zone (measured, same kernel + disk, only `-smp`
+  differs):** UP `-smp 1` TCG = **clean** (14 k iters, no crash, no corruption);
+  `-smp 2` TCG = **crashes in ~30 s at ~89 iters**; Nitro 2-CPU = **corrupts**
+  (`large_md5=4`) over 4 min, no crash. UP clean + both SMP configs broken ⇒ a real
+  Path A SMP defect.
+- **`-smp 2` TCG symptom ≠ Nitro symptom, and is NOT yet a corruption reproducer:**
+  it dies at ~89 iters, **far below the ~26 k-iter threshold** where the Nitro
+  corruption first appears — the crash preempts the corruption measurement. So it's a
+  **fast free local SMP-*crash* signal**, possibly the same race in a fatal (TCG
+  ordering) vs non-fatal (real-HW) window, possibly a distinct SMP bug. Don't assume
+  same root cause — measure.
+- **Next (free first):** (a) does a *simple* app (clock2) also crash on `-smp 2` TCG?
+  → separates "Tyn SMP broadly unstable / TCG-MTTCG artifact" from "preemption-load
+  triggers it"; (b) fix/understand the `-smp 2` crash, then re-check whether the Nitro
+  corruption survives. Suspects to measure, not assume: the omitted trampoline
+  FXSAVE/`gs:[48]` SIMD scaffolding (task #74, dropped as UP-dead) needed under SMP;
+  per-CPU vs per-thread preempt-region assumptions; `context_switch` under 2
+  schedulers; AP APIC-timer preemption on the region path.
+- Reproducer/instrument: `tests/simd/ampweb/` (HTTP `/chk` `large_md5`, `/health`);
+  `-smp 2` local crash repro in `~/work/smp2_repro.sh` on the build host.
 
 **Three earlier wrong turns (each caught by a refutable probe — recorded so they
 don't recur):**
