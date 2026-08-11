@@ -97,21 +97,27 @@ teeth-tested `ampweb` amplifier under ~4 min sustained load:
   `-smp 2` TCG = **crashes in ~30 s at ~89 iters**; Nitro 2-CPU = **corrupts**
   (`large_md5=4`) over 4 min, no crash. UP clean + both SMP configs broken ⇒ a real
   Path A SMP defect.
-- **`-smp 2` TCG symptom ≠ Nitro symptom, and is NOT yet a corruption reproducer:**
-  it dies at ~89 iters, **far below the ~26 k-iter threshold** where the Nitro
-  corruption first appears — the crash preempts the corruption measurement. So it's a
-  **fast free local SMP-*crash* signal**, possibly the same race in a fatal (TCG
-  ordering) vs non-fatal (real-HW) window, possibly a distinct SMP bug. Don't assume
-  same root cause — measure.
-- **Next (free first):** (a) does a *simple* app (clock2) also crash on `-smp 2` TCG?
-  → separates "Tyn SMP broadly unstable / TCG-MTTCG artifact" from "preemption-load
-  triggers it"; (b) fix/understand the `-smp 2` crash, then re-check whether the Nitro
-  corruption survives. Suspects to measure, not assume: the omitted trampoline
-  FXSAVE/`gs:[48]` SIMD scaffolding (task #74, dropped as UP-dead) needed under SMP;
-  per-CPU vs per-thread preempt-region assumptions; `context_switch` under 2
-  schedulers; AP APIC-timer preemption on the region path.
-- Reproducer/instrument: `tests/simd/ampweb/` (HTTP `/chk` `large_md5`, `/health`);
-  `-smp 2` local crash repro in `~/work/smp2_repro.sh` on the build host.
+- **`-smp 2 -accel tcg` is a DEAD END (MTTCG artifact) — measured, don't reuse it.**
+  It crashes *any* app in ~20–30 s under load: Path A + ampweb died at ~89 iters, and
+  a *simple* app (clock2, no amplifier) crashed by ~t+20 s under mere HTTP load. But
+  **real Nitro SMP ran the far heavier ampweb for 4 min without crashing** (it
+  corrupted, stayed alive). Light-app-crashes-emulated vs heavy-app-survives-real ⇒
+  the `-smp 2` TCG crash is TCG's own multi-core emulation being unfaithful, **not** a
+  Tyn SMP bug and **nothing to do with Path A or the corruption**. Filed as its own
+  note; do not use `-smp 2 -accel tcg` for SMP validation.
+- **Consequence: there is NO free local reproducer of the SMP corruption.** UP `-smp 1`
+  TCG is clean (can't see it); `-smp 2` TCG is an artifact (crashes before it can
+  measure); the build host (m7i.large, a Nitro VM) can't nest KVM for faithful local
+  SMP. **The Path A SMP corruption residual is Nitro-only-observable** → the hunt is a
+  (paid) Nitro hunt. Make it cheaper by sharpening the amplifier so the corruption
+  appears in seconds not ~2 min (it first showed at ~26 k iters), and/or a corruption
+  detector that trips faster.
+- **Suspects (measure, don't assume):** the omitted trampoline FXSAVE/`gs:[48]` SIMD
+  scaffolding (task #74, dropped as UP-dead) needed under SMP; per-CPU vs per-thread
+  preempt-region assumptions; `context_switch` under 2 schedulers; AP APIC-timer
+  preemption on the region path.
+- Reproducer/instrument: `tests/simd/ampweb/` (HTTP `/chk` `large_md5`, `/health`) —
+  the proven detector; deploy Path A + it to Nitro to read the residual.
 
 **Three earlier wrong turns (each caught by a refutable probe — recorded so they
 don't recur):**
